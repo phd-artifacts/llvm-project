@@ -2,6 +2,8 @@
 
 // REQUIRES: libc
 
+// UNSUPPORTED: nvptx64-nvidia-cuda-mpi
+
 #include <assert.h>
 #include <omp.h>
 #include <stdio.h>
