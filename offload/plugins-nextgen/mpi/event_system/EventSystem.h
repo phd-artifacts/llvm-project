@@ -99,6 +99,8 @@ enum class EventTypeTy : unsigned int {
   EXIT // Stops the event system execution at the remote process.
 };
 
+std::string EventTypeToString(EventTypeTy eventType);
+
 /// Coroutine events
 ///
 /// Return object for the event system coroutines. This class works as an
@@ -115,6 +117,9 @@ struct EventTy {
 
   /// Polling rate period (us) used by event handlers.
   IntEnvar EventPollingRate;
+
+  /// EventType
+  EventTypeTy EventType;
 
   /// Internal (and required) promise type. Allows for customization of the
   /// coroutines behavior and to store custom data inside the coroutine itself.
@@ -162,7 +167,7 @@ struct EventTy {
                                   assert(HandlePtr);
                                   CoHandleTy::from_address(HandlePtr).destroy();
                                 }),
-          IntEnvar("OMPTARGET_EVENT_POLLING_RATE", 1)};
+          IntEnvar("OMPTARGET_EVENT_POLLING_RATE", 1), EventTypeTy::SYNC};
     }
   };
 
@@ -171,12 +176,27 @@ struct EventTy {
     return CoHandleTy::from_address(HandlePtr.get());
   }
 
+  /// Set Event Type
+  void setEventType(EventTypeTy EType) {
+    EventType = EType;
+  }
+
+  /// Get the Event Type
+  EventTypeTy getEventType() const {
+    return EventType;
+  }
+
   /// Execution handling.
   /// Resume the coroutine execution up until the next suspension point.
   void resume();
 
   /// Blocks the caller thread until the coroutine is completed.
   void wait();
+
+  /// Advance the coroutine execution up until the next suspension point
+  /// and make the caller thread wait for `EVENT_POLLING_RATE`us for the next
+  /// Check
+  void advance();
 
   /// Checks if the coroutine is completed or not.
   bool done() const;
@@ -243,12 +263,14 @@ public:
   /// Target device in OtherRank
   int DeviceId;
 
+  int EventType;
+
   MPIRequestManagerTy(MPI_Comm Comm, int Tag, int OtherRank, int DeviceId,
                       llvm::SmallVector<MPI_Request> InitialRequests =
                           {}) // TODO: Change to initializer_list
       : Comm(Comm), Tag(Tag), Requests(InitialRequests),
         MPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6),
-        OtherRank(OtherRank), DeviceId(DeviceId) {}
+        OtherRank(OtherRank), DeviceId(DeviceId), EventType(-1) {}
 
   /// This class should not be copied.
   MPIRequestManagerTy(const MPIRequestManagerTy &) = delete;
@@ -257,7 +279,7 @@ public:
   MPIRequestManagerTy(MPIRequestManagerTy &&Other) noexcept
       : Comm(Other.Comm), Tag(Other.Tag), Requests(Other.Requests),
         MPIFragmentSize(Other.MPIFragmentSize), OtherRank(Other.OtherRank),
-        DeviceId(Other.DeviceId) {
+        DeviceId(Other.DeviceId), EventType(Other.EventType) {
     Other.Requests = {};
   }
 
@@ -480,6 +502,11 @@ public:
   bool is_initialized();
   bool deinitialize();
 
+  template <class EventFuncTy, typename... ArgsTy>
+    requires std::invocable<EventFuncTy, MPIRequestManagerTy, ArgsTy...>
+  EventTy NotificationEvent(EventFuncTy EventFunc, EventTypeTy EventType,
+                                    int DstDeviceID, ArgsTy... Args);
+
   /// Creates a new event.
   ///
   /// Creates a new event of 'EventClass' type targeting the 'DestRank'. The
@@ -522,7 +549,7 @@ public:
 
 template <class EventFuncTy, typename... ArgsTy>
   requires std::invocable<EventFuncTy, MPIRequestManagerTy, ArgsTy...>
-EventTy EventSystemTy::createEvent(EventFuncTy EventFunc, EventTypeTy EventType,
+EventTy EventSystemTy::NotificationEvent(EventFuncTy EventFunc, EventTypeTy EventType,
                                    int DstDeviceID, ArgsTy... Args) {
   // Create event MPI request manager.
   const int EventTag = createNewEventTag();
@@ -537,20 +564,36 @@ EventTy EventSystemTy::createEvent(EventFuncTy EventFunc, EventTypeTy EventType,
 
   // Send new event notification.
   int EventNotificationInfo[] = {static_cast<int>(EventType), EventTag,
-                                 RemoteDeviceId};
+                                RemoteDeviceId};
   MPI_Request NotificationRequest = MPI_REQUEST_NULL;
   int MPIError = MPI_Isend(EventNotificationInfo, 3, MPI_INT, RemoteRank,
-                           static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                           GateThreadComm, &NotificationRequest);
+                          static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                          GateThreadComm, &NotificationRequest);
 
   if (MPIError != MPI_SUCCESS)
     co_return createError("MPI failed during event notification with error %d",
                           MPIError);
 
   MPIRequestManagerTy RequestManager(EventComm, EventTag, RemoteRank,
-                                     RemoteDeviceId, {NotificationRequest});
+                                    RemoteDeviceId, {NotificationRequest});
 
-  co_return (co_await EventFunc(std::move(RequestManager), Args...));
+  RequestManager.EventType = EventNotificationInfo[0];
+
+  auto Event = EventFunc(std::move(RequestManager), Args...);
+  Event.setEventType(EventType);
+
+  co_return (co_await Event);
+
+}
+
+
+template <class EventFuncTy, typename... ArgsTy>
+  requires std::invocable<EventFuncTy, MPIRequestManagerTy, ArgsTy...>
+EventTy EventSystemTy::createEvent(EventFuncTy EventFunc, EventTypeTy EventType,
+                                   int DstDeviceID, ArgsTy... Args) {
+  auto NEvent = NotificationEvent(EventFunc, EventType, DstDeviceID, Args...);
+  NEvent.setEventType(EventType);
+  return NEvent;
 }
 
 #endif // _MPI_PROXY_EVENT_SYSTEM_H_

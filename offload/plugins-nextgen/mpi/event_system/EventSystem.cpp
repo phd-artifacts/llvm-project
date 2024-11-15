@@ -42,6 +42,40 @@
     return false;                                                              \
   }
 
+std::string EventTypeToString(EventTypeTy eventType) {
+  switch (eventType) {
+    case EventTypeTy::RETRIEVE_NUM_DEVICES: return "RETRIEVE_NUM_DEVICES";
+    case EventTypeTy::INIT_DEVICE: return "INIT_DEVICE";
+    case EventTypeTy::INIT_RECORD_REPLAY: return "INIT_RECORD_REPLAY";
+    case EventTypeTy::IS_PLUGIN_COMPATIBLE: return "IS_PLUGIN_COMPATIBLE";
+    case EventTypeTy::IS_DEVICE_COMPATIBLE: return "IS_DEVICE_COMPATIBLE";
+    case EventTypeTy::IS_DATA_EXCHANGABLE: return "IS_DATA_EXCHANGABLE";
+    case EventTypeTy::LOAD_BINARY: return "LOAD_BINARY";
+    case EventTypeTy::GET_GLOBAL: return "GET_GLOBAL";
+    case EventTypeTy::GET_FUNCTION: return "GET_FUNCTION";
+    case EventTypeTy::SYNCHRONIZE: return "SYNCHRONIZE";
+    case EventTypeTy::INIT_ASYNC_INFO: return "INIT_ASYNC_INFO";
+    case EventTypeTy::INIT_DEVICE_INFO: return "INIT_DEVICE_INFO";
+    case EventTypeTy::QUERY_ASYNC: return "QUERY_ASYNC";
+    case EventTypeTy::PRINT_DEVICE_INFO: return "PRINT_DEVICE_INFO";
+    case EventTypeTy::DATA_LOCK: return "DATA_LOCK";
+    case EventTypeTy::DATA_UNLOCK: return "DATA_UNLOCK";
+    case EventTypeTy::DATA_NOTIFY_MAPPED: return "DATA_NOTIFY_MAPPED";
+    case EventTypeTy::DATA_NOTIFY_UNMAPPED: return "DATA_NOTIFY_UNMAPPED";
+    case EventTypeTy::ALLOC: return "ALLOC";
+    case EventTypeTy::DELETE: return "DELETE";
+    case EventTypeTy::SUBMIT: return "SUBMIT";
+    case EventTypeTy::RETRIEVE: return "RETRIEVE";
+    case EventTypeTy::LOCAL_EXCHANGE: return "LOCAL_EXCHANGE";
+    case EventTypeTy::EXCHANGE_SRC: return "EXCHANGE_SRC";
+    case EventTypeTy::EXCHANGE_DST: return "EXCHANGE_DST";
+    case EventTypeTy::LAUNCH_KERNEL: return "LAUNCH_KERNEL";
+    case EventTypeTy::SYNC: return "SYNC";
+    case EventTypeTy::EXIT: return "EXIT";
+    default: return "UNKNOWN_EVENT_TYPE";
+  }
+}
+
 /// Resumes the most recent incomplete coroutine in the list.
 void EventTy::resume() {
   // Acquire first handle not done.
@@ -62,11 +96,15 @@ void EventTy::resume() {
 void EventTy::wait() {
   // Advance the event progress until it is completed.
   while (!done()) {
-    resume();
-
-    std::this_thread::sleep_for(
-        std::chrono::microseconds(EventPollingRate.get()));
+    advance();
   }
+}
+
+/// Advance the event to the next suspension point and wait a while
+void EventTy::advance() {
+  resume();
+  std::this_thread::sleep_for(
+      std::chrono::microseconds(EventPollingRate.get()));
 }
 
 /// Check if the event has completed.

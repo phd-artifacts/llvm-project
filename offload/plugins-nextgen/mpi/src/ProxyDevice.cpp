@@ -35,11 +35,13 @@ struct PluginDataHandle {
     Device = DeviceId;
     Plugin = PluginId;
     PM = PluginManager;
-    HstPtr = PM->Plugins[Plugin]->data_alloc(Device, Size, nullptr,
-                                             TARGET_ALLOC_HOST);
+    // HstPtr = PM->Plugins[Plugin]->data_alloc(Device, Size, nullptr,
+    //                                          TARGET_ALLOC_HOST);
+    HstPtr = malloc(Size);
   }
   ~PluginDataHandle() {
-    PM->Plugins[Plugin]->data_delete(Device, HstPtr, TARGET_ALLOC_HOST);
+    // PM->Plugins[Plugin]->data_delete(Device, HstPtr, TARGET_ALLOC_HOST);
+    free(HstPtr);
   }
 };
 

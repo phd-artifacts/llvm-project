@@ -1010,6 +1010,43 @@ struct MPIPluginTy : public GenericPluginTy {
 
     Queue->push_back(Event);
 
+    // Place data transfer events in dedicated queues to progress independent
+    // events simultaneously
+    MPIEventQueue SubmitEventQueue;
+    MPIEventQueue RetrieveEventQueue;
+
+    for (auto EventIt = Queue->begin(); EventIt != Queue->end();) {
+      if (EventIt->getEventType() == EventTypeTy::SUBMIT) {
+        SubmitEventQueue.push_back(*EventIt);
+        EventIt = Queue->erase(EventIt);
+      } else if (EventIt->getEventType() == EventTypeTy::RETRIEVE) {
+        RetrieveEventQueue.push_back(*EventIt);
+        EventIt = Queue->erase(EventIt);
+      } else {
+        ++EventIt;
+      }
+    }
+
+    // Progress data submit events concurrently
+    while (!SubmitEventQueue.empty()) {
+      auto &Event = SubmitEventQueue.front();
+      Event.resume();
+
+      if (!Event.done()) {
+        SubmitEventQueue.push_back(Event);
+        SubmitEventQueue.pop_front();
+        continue;
+      }
+
+      if (auto Error = Event.getError(); Error) {
+        REPORT("Event failed during synchronization. %s\n",
+               toString(std::move(Error)).c_str());
+        return OFFLOAD_FAIL;
+      }
+
+      SubmitEventQueue.pop_front();
+    }
+
     for (auto &Event : *Queue) {
       Event.wait();
 
@@ -1018,6 +1055,26 @@ struct MPIPluginTy : public GenericPluginTy {
                toString(std::move(Error)).c_str());
         return OFFLOAD_FAIL;
       }
+    }
+
+    // Progress data retrieve events concurrently
+    while (!RetrieveEventQueue.empty()) {
+      auto &Event = RetrieveEventQueue.front();
+      Event.resume();
+
+      if (!Event.done()) {
+        RetrieveEventQueue.push_back(Event);
+        RetrieveEventQueue.pop_front();
+        continue;
+      }
+
+      if (auto Error = Event.getError(); Error) {
+        REPORT("Event failed during synchronization. %s\n",
+               toString(std::move(Error)).c_str());
+        return OFFLOAD_FAIL;
+      }
+
+      RetrieveEventQueue.pop_front();
     }
 
     // Once the queue is synchronized, return it to the pool and reset the
@@ -1037,23 +1094,37 @@ struct MPIPluginTy : public GenericPluginTy {
                       __tgt_async_info *AsyncInfoPtr) override {
     auto *Queue = reinterpret_cast<MPIEventQueue *>(AsyncInfoPtr->Queue);
 
+    EventTypeTy CurrentEventType;
+
     // Returns success when there are pending operations in AsyncInfo, moving
     // forward through the events on the queue until it is fully completed.
-    while (!Queue->empty()) {
-      auto &Event = Queue->front();
-
-      Event.resume();
-
-      if (!Event.done())
+    for (auto EventIt = Queue->begin(); EventIt != Queue->end();) {
+      CurrentEventType = EventIt->getEventType();
+      EventIt->resume();
+      auto NextEventIt = std::next(EventIt);
+      if (!EventIt->done() &&
+          ((CurrentEventType != EventTypeTy::SUBMIT &&
+            CurrentEventType != EventTypeTy::RETRIEVE) ||
+           (NextEventIt != Queue->end() &&
+            NextEventIt->getEventType() != CurrentEventType))) {
         return OFFLOAD_SUCCESS;
-
-      if (auto Error = Event.getError(); Error) {
-        REPORT("Event failed during query. %s\n",
-               toString(std::move(Error)).c_str());
-        return OFFLOAD_FAIL;
       }
-      Queue->pop_front();
+
+      if (EventIt->done()) {
+        if (auto Error = EventIt->getError(); Error) {
+          REPORT("Event failed during query. %s\n",
+                 toString(std::move(Error)).c_str());
+          return OFFLOAD_FAIL;
+        }
+        EventIt = Queue->erase(EventIt);
+      }
+
+      else
+        ++EventIt;
     }
+
+    if (!Queue->empty())
+      return OFFLOAD_SUCCESS;
 
     // Once the queue is synchronized, return it to the pool and reset the
     // AsyncInfo. This is to make sure that the synchronization only works
