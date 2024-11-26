@@ -871,15 +871,9 @@ struct MPIPluginTy : public GenericPluginTy {
       return OFFLOAD_FAIL;
     }
 
-    // Copy HstData to a buffer with event-managed lifetime.
-    memAllocHost(Size);
-    void *SubmitBuffer = memAllocHost(Size);
-    std::memcpy(SubmitBuffer, HstPtr, Size);
-    EventDataHandleTy DataHandle(SubmitBuffer, &memFreeHost);
-
-    EventTy Event = EventSystem.createEvent(
-        OriginEvents::submit, EventTypeTy::SUBMIT, DeviceId, TgtPtr, DataHandle,
-        Size, AsyncInfoPtr);
+    EventTy Event =
+        EventSystem.createEvent(OriginEvents::submit, EventTypeTy::SUBMIT,
+                                DeviceId, TgtPtr, HstPtr, Size, AsyncInfoPtr);
 
     if (Event.empty()) {
       REPORT("Failed to create dataSubmit event from %p HstPtr to %p TgtPtr\n",

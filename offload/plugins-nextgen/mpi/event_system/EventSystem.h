@@ -341,7 +341,7 @@ EventTy allocateBuffer(MPIRequestManagerTy RequestManager, int64_t Size,
 EventTy deleteBuffer(MPIRequestManagerTy RequestManager, void *Buffer,
                      int32_t Kind);
 EventTy submit(MPIRequestManagerTy RequestManager, void *TgtPtr,
-               EventDataHandleTy HstPtr, int64_t Size,
+               void *HstPtr, int64_t Size,
                __tgt_async_info *AsyncInfoPtr);
 EventTy retrieve(MPIRequestManagerTy RequestManager, int64_t Size, void *HstPtr,
                  void *TgtPtr, __tgt_async_info *AsyncInfoPtr);

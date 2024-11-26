@@ -314,14 +314,14 @@ EventTy deleteBuffer(MPIRequestManagerTy RequestManager, void *Buffer,
 }
 
 EventTy submit(MPIRequestManagerTy RequestManager, void *TgtPtr,
-               EventDataHandleTy HstPtr, int64_t Size,
+               void *HstPtr, int64_t Size,
                __tgt_async_info *AsyncInfoPtr) {
   RequestManager.send(&AsyncInfoPtr, sizeof(void *), MPI_BYTE);
 
   RequestManager.send(&TgtPtr, sizeof(void *), MPI_BYTE);
   RequestManager.send(&Size, 1, MPI_INT64_T);
 
-  RequestManager.sendInBatchs(HstPtr.get(), Size);
+  RequestManager.sendInBatchs(HstPtr, Size);
 
   // Event completion notification
   RequestManager.receive(nullptr, 0, MPI_BYTE);
