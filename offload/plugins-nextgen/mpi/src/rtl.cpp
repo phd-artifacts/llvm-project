@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -1010,71 +1011,42 @@ struct MPIPluginTy : public GenericPluginTy {
 
     Queue->push_back(Event);
 
-    // Place data transfer events in dedicated queues to progress independent
-    // events simultaneously
-    MPIEventQueue SubmitEventQueue;
-    MPIEventQueue RetrieveEventQueue;
+    auto EventIt = Queue->begin();
+    EventTypeTy CurrentEventType;
 
-    for (auto EventIt = Queue->begin(); EventIt != Queue->end();) {
-      if (EventIt->getEventType() == EventTypeTy::SUBMIT) {
-        SubmitEventQueue.push_back(*EventIt);
-        EventIt = Queue->erase(EventIt);
-      } else if (EventIt->getEventType() == EventTypeTy::RETRIEVE) {
-        RetrieveEventQueue.push_back(*EventIt);
-        EventIt = Queue->erase(EventIt);
-      } else {
-        ++EventIt;
-      }
-    }
+    while (EventIt != Queue->end()) {
+      CurrentEventType = EventIt->getEventType();
 
-    // Progress data submit events concurrently
-    while (!SubmitEventQueue.empty()) {
-      auto &Event = SubmitEventQueue.front();
-      Event.resume();
+      // Find the first event that differs in type from the current Event
+      auto EventRangeEnd = std::find_if(
+          EventIt, Queue->end(), [CurrentEventType](const EventTy &Event) {
+            return Event.getEventType() != CurrentEventType;
+          });
 
-      if (!Event.done()) {
-        SubmitEventQueue.push_back(Event);
-        SubmitEventQueue.pop_front();
-        continue;
+      std::list<MPIEventQueue::iterator> PendingEvents;
+      for (auto It = EventIt; It != EventRangeEnd; ++It) {
+        PendingEvents.push_back(It);
       }
 
-      if (auto Error = Event.getError(); Error) {
-        REPORT("Event failed during synchronization. %s\n",
-               toString(std::move(Error)).c_str());
-        return OFFLOAD_FAIL;
+      // Progress all the events in the range simultaneously
+      while (!PendingEvents.empty()) {
+        auto Event = PendingEvents.front();
+        PendingEvents.pop_front();
+        Event->resume();
+
+        if (!Event->done()) {
+          PendingEvents.push_back(Event);
+          continue;
+        }
+
+        if (auto Error = Event->getError(); Error) {
+          REPORT("Event failed during synchronization. %s\n",
+                 toString(std::move(Error)).c_str());
+          return OFFLOAD_FAIL;
+        }
       }
 
-      SubmitEventQueue.pop_front();
-    }
-
-    for (auto &Event : *Queue) {
-      Event.wait();
-
-      if (auto Error = Event.getError(); Error) {
-        REPORT("Event failed during synchronization. %s\n",
-               toString(std::move(Error)).c_str());
-        return OFFLOAD_FAIL;
-      }
-    }
-
-    // Progress data retrieve events concurrently
-    while (!RetrieveEventQueue.empty()) {
-      auto &Event = RetrieveEventQueue.front();
-      Event.resume();
-
-      if (!Event.done()) {
-        RetrieveEventQueue.push_back(Event);
-        RetrieveEventQueue.pop_front();
-        continue;
-      }
-
-      if (auto Error = Event.getError(); Error) {
-        REPORT("Event failed during synchronization. %s\n",
-               toString(std::move(Error)).c_str());
-        return OFFLOAD_FAIL;
-      }
-
-      RetrieveEventQueue.pop_front();
+      EventIt = EventRangeEnd;
     }
 
     // Once the queue is synchronized, return it to the pool and reset the
@@ -1117,10 +1089,10 @@ struct MPIPluginTy : public GenericPluginTy {
           return OFFLOAD_FAIL;
         }
         EventIt = Queue->erase(EventIt);
+        continue;
       }
 
-      else
-        ++EventIt;
+      ++EventIt;
     }
 
     if (!Queue->empty())
