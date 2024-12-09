@@ -45,6 +45,16 @@ struct PluginDataHandle {
   }
 };
 
+struct AsyncInfoHandle {
+  std::unique_ptr<__tgt_async_info> AsyncInfoPtr;
+  std::mutex AsyncInfoMutex;
+  AsyncInfoHandle() { AsyncInfoPtr = std::make_unique<__tgt_async_info>(); }
+  AsyncInfoHandle(AsyncInfoHandle &&Other) {
+    AsyncInfoPtr = std::move(Other.AsyncInfoPtr);
+    Other.AsyncInfoPtr = nullptr;
+  }
+};
+
 /// Event Implementations on Device side.
 struct ProxyDevice {
   ProxyDevice()
@@ -74,25 +84,23 @@ struct ProxyDevice {
     }
   }
 
-  __tgt_async_info *MapAsyncInfo(void *HostAsyncInfoPtr) {
+  AsyncInfoHandle *MapAsyncInfo(void *HostAsyncInfoPtr) {
     const std::lock_guard<std::mutex> Lock(TableMutex);
-    __tgt_async_info *TgtAsyncInfoPtr = nullptr;
+    AsyncInfoHandle *AsyncInfoHandlerPtr = nullptr;
+
     if (AsyncInfoTable[HostAsyncInfoPtr])
-      TgtAsyncInfoPtr =
-          static_cast<__tgt_async_info *>(AsyncInfoTable[HostAsyncInfoPtr]);
+      AsyncInfoHandlerPtr = AsyncInfoTable[HostAsyncInfoPtr];
     else {
-      std::unique_ptr<__tgt_async_info> newEntry =
-          std::make_unique<__tgt_async_info>();
-      TgtAsyncInfoPtr = AsyncInfoList.emplace_back(std::move(newEntry)).get();
-      AsyncInfoTable[HostAsyncInfoPtr] = static_cast<void *>(TgtAsyncInfoPtr);
+      AsyncInfoHandlerPtr = &AsyncInfoList.emplace_back();
+      AsyncInfoTable[HostAsyncInfoPtr] = AsyncInfoHandlerPtr;
     }
 
-    return TgtAsyncInfoPtr;
+    return AsyncInfoHandlerPtr;
   }
 
   EventTy waitAsyncOpEnd(int32_t PluginId, int32_t DeviceId,
                          void *AsyncInfoPtr) {
-    auto *TgtAsyncInfo = MapAsyncInfo(AsyncInfoPtr);
+    auto *TgtAsyncInfo = MapAsyncInfo(AsyncInfoPtr)->AsyncInfoPtr.get();
     auto *RPCServer =
         PluginManager.Plugins[PluginId]->getDevice(DeviceId).getRPCServer();
 
@@ -308,8 +316,6 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
-
     RequestManager.receive(&TgtPtr, sizeof(void *), MPI_BYTE);
     RequestManager.receive(&Size, 1, MPI_INT64_T);
 
@@ -327,8 +333,17 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    PluginManager.Plugins[PluginId]->data_submit_async(
-        DeviceId, TgtPtr, DataHandler.HstPtr, Size, TgtAsyncInfo);
+    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
+
+    // Issues data transfer on the device
+    // Only one call at a time to avoid the
+    // risk of overwriting device queues
+    {
+      std::lock_guard<std::mutex> Lock(TgtAsyncInfo->AsyncInfoMutex);
+      PluginManager.Plugins[PluginId]->data_submit_async(
+          DeviceId, TgtPtr, DataHandler.HstPtr, Size,
+          TgtAsyncInfo->AsyncInfoPtr.get());
+    }
 
     // Event completion notification
     RequestManager.send(nullptr, 0, MPI_BYTE);
@@ -346,7 +361,6 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
     RequestManager.receive(&TgtPtr, sizeof(void *), MPI_BYTE);
     RequestManager.receive(&Size, 1, MPI_INT64_T);
 
@@ -360,8 +374,14 @@ struct ProxyDevice {
 
     PluginDataHandle DataHandler(&PluginManager, PluginId, DeviceId, Size);
 
-    PluginManager.Plugins[PluginId]->data_retrieve_async(
-        DeviceId, DataHandler.HstPtr, TgtPtr, Size, TgtAsyncInfo);
+    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
+
+    {
+      std::lock_guard<std::mutex> Lock(TgtAsyncInfo->AsyncInfoMutex);
+      PluginManager.Plugins[PluginId]->data_retrieve_async(
+          DeviceId, DataHandler.HstPtr, TgtPtr, Size,
+          TgtAsyncInfo->AsyncInfoPtr.get());
+    }
 
     if (auto Error =
             co_await waitAsyncOpEnd(PluginId, DeviceId, HstAsyncInfoPtr);
@@ -397,15 +417,19 @@ struct ProxyDevice {
     if (auto Err = co_await RequestManager; Err)
       co_return Err;
 
-    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
-
     int32_t PluginId, SrcDeviceId;
 
     std::tie(PluginId, SrcDeviceId) =
         EventSystem.mapDeviceId(RequestManager.DeviceId);
 
-    PluginManager.Plugins[PluginId]->data_exchange_async(
-        SrcDeviceId, SrcPtr, DstDeviceId, DstPtr, Size, TgtAsyncInfo);
+    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
+
+    {
+      std::lock_guard<std::mutex> Lock(TgtAsyncInfo->AsyncInfoMutex);
+      PluginManager.Plugins[PluginId]->data_exchange_async(
+          SrcDeviceId, SrcPtr, DstDeviceId, DstPtr, Size,
+          TgtAsyncInfo->AsyncInfoPtr.get());
+    }
 
     RequestManager.send(nullptr, 0, MPI_BYTE);
 
@@ -428,8 +452,6 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
-
     int32_t PluginId, DeviceId;
 
     std::tie(PluginId, DeviceId) =
@@ -437,8 +459,14 @@ struct ProxyDevice {
 
     PluginDataHandle DataHandler(&PluginManager, PluginId, DeviceId, Size);
 
-    PluginManager.Plugins[PluginId]->data_retrieve_async(
-        DeviceId, DataHandler.HstPtr, SrcBuffer, Size, TgtAsyncInfo);
+    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
+
+    {
+      std::lock_guard<std::mutex> Lock(TgtAsyncInfo->AsyncInfoMutex);
+      PluginManager.Plugins[PluginId]->data_retrieve_async(
+          DeviceId, DataHandler.HstPtr, SrcBuffer, Size,
+          TgtAsyncInfo->AsyncInfoPtr.get());
+    }
 
     if (auto Error =
             co_await waitAsyncOpEnd(PluginId, DeviceId, HstAsyncInfoPtr);
@@ -477,8 +505,6 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
-
     int32_t PluginId, DeviceId;
 
     std::tie(PluginId, DeviceId) =
@@ -495,8 +521,14 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    PluginManager.Plugins[PluginId]->data_submit_async(
-        DeviceId, DstBuffer, DataHandler.HstPtr, Size, TgtAsyncInfo);
+    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
+
+    {
+      std::lock_guard<std::mutex> Lock(TgtAsyncInfo->AsyncInfoMutex);
+      PluginManager.Plugins[PluginId]->data_submit_async(
+          DeviceId, DstBuffer, DataHandler.HstPtr, Size,
+          TgtAsyncInfo->AsyncInfoPtr.get());
+    }
 
     if (auto Error =
             co_await waitAsyncOpEnd(PluginId, DeviceId, HstAsyncInfoPtr);
@@ -527,8 +559,6 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    auto *TgtAsyncInfo = MapAsyncInfo(HostAsyncInfoPtr);
-
     TgtArgs.resize(NumArgs);
     TgtOffsets.resize(NumArgs);
 
@@ -546,6 +576,8 @@ struct ProxyDevice {
 
     std::tie(PluginId, DeviceId) =
         EventSystem.mapDeviceId(RequestManager.DeviceId);
+
+    auto *TgtAsyncInfo = MapAsyncInfo(HostAsyncInfoPtr)->AsyncInfoPtr.get();
 
     PluginManager.Plugins[PluginId]->launch_kernel(
         DeviceId, TgtEntryPtr, TgtArgs.data(), TgtOffsets.data(), &KernelArgs,
@@ -576,7 +608,10 @@ struct ProxyDevice {
 
     // Create the device name with the appropriate sizes and receive its
     // content.
-    DeviceImage *Image = &RemoteImages.emplace_back(ImageSize, EntryCount);
+    DeviceImage *Image =
+        RemoteImages
+            .emplace_back(std::make_unique<DeviceImage>(ImageSize, EntryCount))
+            .get();
 
     Image->setImageEntries(EntryNameSizes);
 
@@ -750,12 +785,12 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr);
-
     int32_t PluginId, DeviceId;
 
     std::tie(PluginId, DeviceId) =
         EventSystem.mapDeviceId(RequestManager.DeviceId);
+
+    auto *TgtAsyncInfo = MapAsyncInfo(HstAsyncInfoPtr)->AsyncInfoPtr.get();
 
     PluginManager.Plugins[PluginId]->query_async(DeviceId, TgtAsyncInfo);
 
@@ -1050,9 +1085,9 @@ struct ProxyDevice {
   }
 
 private:
-  llvm::SmallVector<std::unique_ptr<__tgt_async_info>, 16> AsyncInfoList;
-  llvm::SmallVector<DeviceImage, 1> RemoteImages;
-  llvm::DenseMap<void *, void *> AsyncInfoTable;
+  llvm::SmallVector<AsyncInfoHandle> AsyncInfoList;
+  llvm::SmallVector<std::unique_ptr<DeviceImage>> RemoteImages;
+  llvm::DenseMap<void *, AsyncInfoHandle *> AsyncInfoTable;
   RemotePluginManager PluginManager;
   EventSystemTy EventSystem;
   /// Number of execute event handlers to spawn.
@@ -1061,7 +1096,6 @@ private:
   IntEnvar NumDataEventHandlers;
   /// Polling rate period (us) used by event handlers.
   IntEnvar EventPollingRate;
-
   // Mutex for AsyncInfoTable
   std::mutex TableMutex;
 };
