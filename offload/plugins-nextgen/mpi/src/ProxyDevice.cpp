@@ -91,7 +91,8 @@ struct ProxyDevice {
     if (AsyncInfoTable[HostAsyncInfoPtr])
       AsyncInfoHandlerPtr = AsyncInfoTable[HostAsyncInfoPtr];
     else {
-      AsyncInfoHandlerPtr = &AsyncInfoList.emplace_back();
+      AsyncInfoHandlerPtr =
+          AsyncInfoList.emplace_back(std::make_unique<AsyncInfoHandle>()).get();
       AsyncInfoTable[HostAsyncInfoPtr] = AsyncInfoHandlerPtr;
     }
 
@@ -1085,7 +1086,7 @@ struct ProxyDevice {
   }
 
 private:
-  llvm::SmallVector<AsyncInfoHandle> AsyncInfoList;
+  llvm::SmallVector<std::unique_ptr<AsyncInfoHandle>> AsyncInfoList;
   llvm::SmallVector<std::unique_ptr<DeviceImage>> RemoteImages;
   llvm::DenseMap<void *, AsyncInfoHandle *> AsyncInfoTable;
   RemotePluginManager PluginManager;
