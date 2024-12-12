@@ -510,7 +510,7 @@ struct MPIPluginTy : public GenericPluginTy {
 
     EventTy Event = EventSystem.createEvent(
         OriginEvents::isDataExchangable, EventTypeTy::IS_DATA_EXCHANGABLE,
-        SrcDeviceId, DstDeviceId, &QueryResult);
+        SrcDeviceId, DstDevId, &QueryResult);
 
     if (Event.empty()) {
       DP("Failed to create isDataExchangeble event in %d SrcDevice\n",
@@ -931,7 +931,7 @@ struct MPIPluginTy : public GenericPluginTy {
     if (SrcRank == DstRank) {
       Event = EventSystem.createEvent(
           OriginEvents::localExchange, EventTypeTy::LOCAL_EXCHANGE, SrcDeviceId,
-          SrcPtr, DstDeviceId, DstPtr, Size, AsyncInfo);
+          SrcPtr, DstDevId, DstPtr, Size, AsyncInfo);
     }
 
     else {
