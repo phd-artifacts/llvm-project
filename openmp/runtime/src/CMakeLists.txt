@@ -78,6 +78,7 @@ else()
     kmp_atomic.cpp
     kmp_csupport.cpp
     kmp_debug.cpp
+    kmp_file.cpp
     kmp_itt.cpp
     kmp_environment.cpp
     kmp_error.cpp

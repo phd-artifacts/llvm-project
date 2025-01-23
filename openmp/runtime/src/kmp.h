@@ -4055,6 +4055,8 @@ KMP_EXPORT void *kmpc_calloc(size_t nelem, size_t elsize);
 KMP_EXPORT void *kmpc_realloc(void *ptr, size_t size);
 KMP_EXPORT void kmpc_free(void *ptr);
 
+KMP_EXPORT int omp_get_file_support(void);
+
 /* declarations for internal use */
 
 extern int __kmp_barrier(enum barrier_type bt, int gtid, int is_split,
