@@ -4056,6 +4056,7 @@ KMP_EXPORT void *kmpc_realloc(void *ptr, size_t size);
 KMP_EXPORT void kmpc_free(void *ptr);
 
 KMP_EXPORT int omp_get_file_support(void);
+KMP_EXPORT int omp_file_open(char const *filename, int mode);
 
 /* declarations for internal use */
 
