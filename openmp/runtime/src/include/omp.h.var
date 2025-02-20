@@ -66,6 +66,8 @@
     extern int omp_file_open(char const * ,int);
     extern int    __KAI_KMPC_CONVENTION omp_get_file_support(void);
     extern int    __KAI_KMPC_CONVENTION  omp_file_open(char const* ,int);
+    extern int    __KAI_KMPC_CONVENTION  omp_file_initialize();
+    extern int    __KAI_KMPC_CONVENTION  omp_file_finalize();
     extern int    __KAI_KMPC_CONVENTION  omp_get_num_threads  (void);
     extern int    __KAI_KMPC_CONVENTION  omp_get_dynamic      (void);
     extern int    __KAI_KMPC_CONVENTION  omp_get_nested       (void);

@@ -122,6 +122,10 @@ else()
   get_clang_resource_dir(LIBOMP_HEADERS_INSTALL_PATH SUBDIR include)
 endif()
 
+
+# Compile the libompfile lirary and get its headers
+add_subdirectory(libompfile)
+
 # Build host runtime library, after LIBOMPTARGET variables are set since they are needed
 # to enable time profiling support in the OpenMP runtime.
 add_subdirectory(runtime)

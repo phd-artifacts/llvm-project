@@ -204,8 +204,7 @@ if(${LIBOMP_USE_HWLOC})
   )
 endif()
 
-find_package(MPI REQUIRED)
-target_link_libraries(omp PRIVATE MPI::MPI_CXX)
+target_link_libraries(omp PRIVATE ompfile) 
 
 if(OPENMP_MSVC_NAME_SCHEME)
   if(uppercase_CMAKE_BUILD_TYPE STREQUAL "DEBUG")
