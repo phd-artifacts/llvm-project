@@ -89,7 +89,6 @@ else()
     kmp_atomic.cpp
     kmp_csupport.cpp
     kmp_debug.cpp
-    kmp_file.cpp
     kmp_itt.cpp
     kmp_environment.cpp
     kmp_error.cpp
@@ -203,8 +202,6 @@ if(${LIBOMP_USE_HWLOC})
 			     "$<INSTALL_INTERFACE:${LIBOMP_HWLOC_INCLUDE_DIR}>"
   )
 endif()
-
-target_link_libraries(omp PRIVATE ompfile) 
 
 if(OPENMP_MSVC_NAME_SCHEME)
   if(uppercase_CMAKE_BUILD_TYPE STREQUAL "DEBUG")

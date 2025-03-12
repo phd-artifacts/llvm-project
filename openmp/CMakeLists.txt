@@ -123,12 +123,12 @@ else()
 endif()
 
 
-# Compile the libompfile lirary and get its headers
-add_subdirectory(libompfile)
-
 # Build host runtime library, after LIBOMPTARGET variables are set since they are needed
 # to enable time profiling support in the OpenMP runtime.
 add_subdirectory(runtime)
+
+# Compile the libompfile lirary and get its headers
+add_subdirectory(libompfile)
 
 set(ENABLE_OMPT_TOOLS ON)
 # Currently tools are not tested well on Windows or MacOS X.

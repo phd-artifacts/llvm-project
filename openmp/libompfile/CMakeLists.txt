@@ -1,5 +1,5 @@
 add_library(
-    ompfile STATIC
+    ompfile SHARED
     src/file_interface.cpp
 )
 target_include_directories(ompfile PUBLIC include)

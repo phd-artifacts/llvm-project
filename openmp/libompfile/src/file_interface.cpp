@@ -5,8 +5,6 @@ class OmpFileContext {
 private:
   MPI_Comm file_comm;
 
-  static OmpFileContext *instance;
-
 public:
   /* Eventually I will change this to be an agnostic interface
   that can call the underlying backend
@@ -34,8 +32,11 @@ public:
 
   void openFile() { printf("Opening file...\n"); }
 
-  static void initialize() {
-  }
+  // static void initialize() {
+  //   if (instance == nullptr) {
+  //     instance = new OmpFileContext();
+  //   }
+  // }
 
   static void finalize() {
   }
@@ -44,6 +45,19 @@ public:
 extern "C" {
 
   int agnostic_file_close(int fh) {
+    return 0;
+  }
+
+  int agnostic_file_open(const char *filename, int flags, int *fh) {
+    return 0;
+
+  }
+
+  int agnostic_file_read(int fh, void *buf, size_t count) {
+    return 0;
+  }
+
+  int agnostic_file_write(int fh, const void *buf, size_t count) {
     return 0;
   }
 
