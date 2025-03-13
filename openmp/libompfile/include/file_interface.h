@@ -1,18 +1,21 @@
+#ifndef FILE_INTERFACE_H
+#define FILE_INTERFACE_H
+
 #ifdef __cplusplus
-
-#include <stddef.h>
-
 extern "C" {
 #endif
 
-int agnostic_file_close(int fh);
+// Example function to open a file
+int omp_file_open(const char* filename);
 
-int agnostic_file_open(const char *filename, int flags, int *fh);
+// Example function to write data
+int omp_file_write(const void* data, size_t size);
 
-int agnostic_file_read(int fh, void *buf, size_t count);
-
-int agnostic_file_write(int fh, const void *buf, size_t count);
+// Example function to close
+int omp_file_close();
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif // FILE_INTERFACE_H

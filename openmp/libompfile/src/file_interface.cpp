@@ -44,21 +44,13 @@ public:
 
 extern "C" {
 
-  int agnostic_file_close(int fh) {
-    return 0;
-  }
-
-  int agnostic_file_open(const char *filename, int flags, int *fh) {
-    return 0;
-
-  }
-
-  int agnostic_file_read(int fh, void *buf, size_t count) {
-    return 0;
-  }
-
-  int agnostic_file_write(int fh, const void *buf, size_t count) {
-    return 0;
-  }
-
+int omp_file_open(const char* filename) {
 }
+
+int omp_file_write(const void* data, size_t size) {
+}
+
+int omp_file_close() {
+}
+
+} // extern "C"

@@ -1,20 +1,60 @@
-add_library(
-    ompfile SHARED
+cmake_minimum_required(VERSION 3.13)
+project(libompfile CXX)
+
+add_library(ompfile SHARED
     src/file_interface.cpp
 )
-target_include_directories(ompfile PUBLIC include)
 
+target_link_libraries(ompfile PUBLIC omp)
+
+# Let the library's include/ directory be available as a public include path
 target_include_directories(ompfile
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
 )
 
-find_package(MPI REQUIRED)
-target_link_libraries(ompfile PRIVATE MPI::MPI_CXX)
+set_target_properties(ompfile PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    POSITION_INDEPENDENT_CODE ON
+)
 
-# Add these lines to export ompfile
+# Install the library itself
 install(TARGETS ompfile
-  EXPORT LLVMExports  # Match the export name used by LLVM/OpenMP
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
+    EXPORT ompfileTargets
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
 )
+
+# Install the public header
+install(FILES
+    include/file_interface.h
+    DESTINATION include
+)
+
+# Optionally export the CMake targets if you want a config file 
+# for third-party projects to `find_package(ompfile)`
+install(EXPORT ompfileTargets
+    FILE ompfileConfig.cmake
+    NAMESPACE ompfile::
+    DESTINATION lib/cmake/ompfile
+)
+
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include")
+
+# so that I can run from the build folder without having to install
+add_custom_command(
+    OUTPUT "${CMAKE_BINARY_DIR}/include/file_interface.h"
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/file_interface.h"
+            "${CMAKE_BINARY_DIR}/include/file_interface.h"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/file_interface.h"
+    COMMENT "Copying file_interface.h to build folder"
+)
+
+add_custom_target(copy_ompfile_headers ALL
+    DEPENDS "${CMAKE_BINARY_DIR}/include/file_interface.h"
+)
+
