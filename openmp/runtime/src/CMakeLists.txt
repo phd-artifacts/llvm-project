@@ -82,7 +82,7 @@ set(LIBOMP_GNUASMFILES)
 if(STUBS_LIBRARY)
   set(LIBOMP_CXXFILES kmp_stub.cpp)
 else()
-  message(STATUS "Building KMP+file library.")
+  message(STATUS "Building KMP on the OMP-IO fork.")
   # Get C++ files
   set(LIBOMP_CXXFILES
     kmp_alloc.cpp
