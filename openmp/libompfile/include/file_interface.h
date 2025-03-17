@@ -6,10 +6,10 @@ extern "C" {
 #endif
 
 // Example function to open a file
-int omp_file_open(const char* filename);
+int omp_file_open(const char *filename);
 
 // Example function to write data
-int omp_file_write(const void* data, size_t size);
+int omp_file_write(const void *data, size_t size);
 
 // Example function to close
 int omp_file_close();

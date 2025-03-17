@@ -1,14 +1,19 @@
 #include "mpi.h"
+#include <atomic>
 #include <unordered_map>
 
 class OmpFileContext {
+
 private:
+  static OmpFileContext *instance;
   MPI_Comm file_comm;
+  std::unordered_map<int, MPI_File> file_handle_map;
+  std::atomic<int> next_file_handle;
 
 public:
   /* Eventually I will change this to be an agnostic interface
   that can call the underlying backend
-  that will be important because I want to use libdtc++ and we cannot
+  that will be important because I want to use libsdtc++ and we cannot
   link omp to the standard lib*/
   OmpFileContext() {
     int provided = 0;
@@ -20,9 +25,6 @@ public:
 
     // Optional: check what level of thread support was granted
     printf("MPI_Init_thread provided = %d\n", provided);
-
-    // Initialize the file handle map
-    auto file_handles = std::unordered_map<int, MPI_File>();
   }
 
   ~OmpFileContext() {
@@ -30,27 +32,55 @@ public:
     MPI_Finalize();
   }
 
-  void openFile() { printf("Opening file...\n"); }
+  static OmpFileContext& getInstance() {
+    if (instance == nullptr) {
+      fprintf(stderr, "[omp-io] Creating new instance of OmpFileContext\n");
+      instance = new OmpFileContext();
+    }
 
-  // static void initialize() {
-  //   if (instance == nullptr) {
-  //     instance = new OmpFileContext();
-  //   }
-  // }
+    return *instance;
+  }
 
   static void finalize() {
+    if (instance != nullptr) {
+      fprintf(stderr, "[omp-io] Finalizing OmpFileContext\n");
+      delete instance;
+    }
+  }
+
+  int openFile(const char *filename) {
+    int file_id = getNextFileHandle();
+    MPI_File file_handle;
+    int ret = MPI_File_open(file_comm, filename, MPI_MODE_RDWR, MPI_INFO_NULL,
+                            &file_handle);
+    if (ret != MPI_SUCCESS) {
+      fprintf(stderr, "Error: Could not open file %s\n", filename);
+      return -1;
+    }
+    file_handle_map[file_id] = file_handle;
+    return file_id;
+  }
+
+private:
+  int getNextFileHandle() {
+    return next_file_handle.fetch_add(1, std::memory_order_relaxed);
   }
 };
 
+OmpFileContext* OmpFileContext::instance = nullptr;
+
 extern "C" {
 
-int omp_file_open(const char* filename) {
+int omp_file_open(const char *filename) { 
+
+  auto& ctx = OmpFileContext::getInstance();
+  auto file_id = ctx.openFile(filename);
+  return file_id;
+
 }
 
-int omp_file_write(const void* data, size_t size) {
-}
+int omp_file_write(const void *data, size_t size) { return 0; }
 
-int omp_file_close() {
-}
+int omp_file_close() { return 0; }
 
 } // extern "C"

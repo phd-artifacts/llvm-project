@@ -5,6 +5,9 @@ add_library(ompfile SHARED
     src/file_interface.cpp
 )
 
+find_package(MPI REQUIRED)
+target_link_libraries(ompfile PRIVATE MPI::MPI_CXX)
+
 target_link_libraries(ompfile PUBLIC omp)
 
 # Let the library's include/ directory be available as a public include path
