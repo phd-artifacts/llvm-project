@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.13)
 project(libompfile CXX)
 
+# enable debug logs as default for now
+# -DOMP_IO_DEBUG
+message(STATUS "OpenMP I/O debug logs enabled.")
+add_compile_definitions(OMP_IO_DEBUG)
+
 add_library(ompfile SHARED
     src/file_interface.cpp
 )

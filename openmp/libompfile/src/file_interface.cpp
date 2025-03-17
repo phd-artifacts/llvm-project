@@ -1,4 +1,5 @@
 #include "mpi.h"
+#include "debug_log.h"
 #include <atomic>
 #include <unordered_map>
 
@@ -24,7 +25,7 @@ public:
     MPI_Comm_dup(MPI_COMM_WORLD, &file_comm);
 
     // Optional: check what level of thread support was granted
-    printf("MPI_Init_thread provided = %d\n", provided);
+    io_log("MPI_Init_thread provided = %d\n", provided);
   }
 
   ~OmpFileContext() {
@@ -34,7 +35,7 @@ public:
 
   static OmpFileContext& getInstance() {
     if (instance == nullptr) {
-      fprintf(stderr, "[omp-io] Creating new instance of OmpFileContext\n");
+      io_log("Creating new instance of OmpFileContext\n");
       instance = new OmpFileContext();
     }
 
@@ -43,7 +44,7 @@ public:
 
   static void finalize() {
     if (instance != nullptr) {
-      fprintf(stderr, "[omp-io] Finalizing OmpFileContext\n");
+      io_log("Finalizing OmpFileContext\n");
       delete instance;
     }
   }
@@ -54,7 +55,7 @@ public:
     int ret = MPI_File_open(file_comm, filename, MPI_MODE_RDWR, MPI_INFO_NULL,
                             &file_handle);
     if (ret != MPI_SUCCESS) {
-      fprintf(stderr, "Error: Could not open file %s\n", filename);
+      io_log("Error: Could not open file %s\n", filename);
       return -1;
     }
     file_handle_map[file_id] = file_handle;
