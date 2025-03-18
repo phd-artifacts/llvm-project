@@ -88,6 +88,28 @@ public:
     return 0;
   }
 
+  int closeFile(int file_id) {
+    if (file_handle_map.find(file_id) == file_handle_map.end()) {
+      io_log("Error: Invalid file handle %d\n", file_id);
+      return -1;
+    }
+
+    io_log("Closing file %d\n", file_id);
+
+    MPI_File file = file_handle_map[file_id];
+
+    int ret = MPI_File_close(&file);
+
+    if (ret != MPI_SUCCESS) {
+      io_log("Error: Close failed\n");
+      return -1;
+    }
+
+    io_log("Close completed\n");
+
+    return 0;
+  }
+
 private:
   int getNextFileHandle() {
     return next_file_handle.fetch_add(1, std::memory_order_relaxed);
@@ -116,6 +138,15 @@ int omp_file_write(int file_handle, const void *data, size_t size, int async) {
   return ctx.writeFile(file_handle, data, size);
 }
 
-int omp_file_close() { return 0; }
+int omp_file_read(int file_handle, void *data, size_t size, int async) {
+  io_log("Error: File read not implemented\n");
+  return 0;
+}
+
+int omp_file_close(int file_handle){
+  auto &ctx = OmpFileContext::getInstance();
+
+  return ctx.closeFile(file_handle);
+}
 
 } // extern "C"
