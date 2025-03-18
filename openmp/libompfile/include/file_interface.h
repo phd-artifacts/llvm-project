@@ -13,6 +13,8 @@ int omp_file_read(int file_handle, void *data, size_t size, int async);
 
 int omp_file_close(int file_handle);
 
+int omp_file_seek(int file_handle, long offset);
+
 #ifdef __cplusplus
 }
 #endif

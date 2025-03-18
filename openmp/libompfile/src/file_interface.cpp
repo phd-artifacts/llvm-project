@@ -110,6 +110,50 @@ public:
     return 0;
   }
 
+  int readFile(int file_id, void *data, size_t size) {
+    if (file_handle_map.find(file_id) == file_handle_map.end()) {
+      io_log("Error: Invalid file handle %d\n", file_id);
+      return -1;
+    }
+
+    io_log("Reading %zu bytes from file %d\n", size, file_id);
+
+    MPI_File file = file_handle_map[file_id];
+
+    int ret = MPI_File_read(file, data, size, MPI_BYTE, MPI_STATUS_IGNORE);
+
+    if (ret != MPI_SUCCESS) {
+      io_log("Error: Read failed\n");
+      return -1;
+    }
+
+    io_log("Read completed\n");
+
+    return 0;
+  }
+
+  int seekFile(int file_id, long offset) {
+    io_log("Setting file pointer to offset %ld\n", offset);
+
+    if (file_handle_map.find(file_id) == file_handle_map.end()) {
+      io_log("Error: Invalid file handle %d\n", file_id);
+      return -1;
+    }
+
+    MPI_File file = file_handle_map[file_id];
+
+    int ret = MPI_File_seek(file, offset, MPI_SEEK_SET);
+
+    if (ret != MPI_SUCCESS) {
+      io_log("Error: Seek failed\n");
+      return -1;
+    }
+
+    io_log("Seek completed\n");
+
+    return 0;
+  }
+
 private:
   int getNextFileHandle() {
     return next_file_handle.fetch_add(1, std::memory_order_relaxed);
@@ -139,14 +183,26 @@ int omp_file_write(int file_handle, const void *data, size_t size, int async) {
 }
 
 int omp_file_read(int file_handle, void *data, size_t size, int async) {
-  io_log("Error: File read not implemented\n");
-  return 0;
+  if (async) {
+    io_log("Error: Asynchronous reads not supported yet\n");
+    return -1;
+  }
+
+  auto &ctx = OmpFileContext::getInstance();
+
+  return ctx.readFile(file_handle, data, size);
 }
 
-int omp_file_close(int file_handle){
+int omp_file_close(int file_handle) {
   auto &ctx = OmpFileContext::getInstance();
 
   return ctx.closeFile(file_handle);
+}
+
+int omp_file_seek(int file_handle, long offset) {
+  auto &ctx = OmpFileContext::getInstance();
+
+  return ctx.seekFile(file_handle, offset);
 }
 
 } // extern "C"
