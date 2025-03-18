@@ -9,7 +9,7 @@ extern "C" {
 int omp_file_open(const char *filename);
 
 // Example function to write data
-int omp_file_write(const void *data, size_t size);
+int omp_file_write(int file_handle, const void *data, size_t size, int async);
 
 // Example function to close
 int omp_file_close();

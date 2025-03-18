@@ -1,6 +1,7 @@
-#include "mpi.h"
 #include "debug_log.h"
+#include "mpi.h"
 #include <atomic>
+#include <cassert>
 #include <unordered_map>
 
 class OmpFileContext {
@@ -33,7 +34,7 @@ public:
     MPI_Finalize();
   }
 
-  static OmpFileContext& getInstance() {
+  static OmpFileContext &getInstance() {
     if (instance == nullptr) {
       io_log("Creating new instance of OmpFileContext\n");
       instance = new OmpFileContext();
@@ -52,6 +53,9 @@ public:
   int openFile(const char *filename) {
     int file_id = getNextFileHandle();
     MPI_File file_handle;
+
+    io_log("Opening file %s with file_id %d\n", filename, file_id);
+
     int ret = MPI_File_open(file_comm, filename, MPI_MODE_RDWR, MPI_INFO_NULL,
                             &file_handle);
     if (ret != MPI_SUCCESS) {
@@ -62,25 +66,55 @@ public:
     return file_id;
   }
 
+  int writeFile(int file_id, const void *data, size_t size) {
+    if (file_handle_map.find(file_id) == file_handle_map.end()) {
+      io_log("Error: Invalid file handle %d\n", file_id);
+      return -1;
+    }
+
+    io_log("Writing %zu bytes to file %d\n", size, file_id);
+
+    MPI_File file = file_handle_map[file_id];
+
+    int ret = MPI_File_write(file, data, size, MPI_BYTE, MPI_STATUS_IGNORE);
+
+    if (ret != MPI_SUCCESS) {
+      io_log("Error: Write failed\n");
+      return -1;
+    }
+
+    io_log("Write completed\n");
+
+    return 0;
+  }
+
 private:
   int getNextFileHandle() {
     return next_file_handle.fetch_add(1, std::memory_order_relaxed);
   }
 };
 
-OmpFileContext* OmpFileContext::instance = nullptr;
+OmpFileContext *OmpFileContext::instance = nullptr;
 
 extern "C" {
 
-int omp_file_open(const char *filename) { 
+int omp_file_open(const char *filename) {
 
-  auto& ctx = OmpFileContext::getInstance();
+  auto &ctx = OmpFileContext::getInstance();
   auto file_id = ctx.openFile(filename);
   return file_id;
-
 }
 
-int omp_file_write(const void *data, size_t size) { return 0; }
+int omp_file_write(int file_handle, const void *data, size_t size, int async) {
+  if (async) {
+    io_log("Error: Asynchronous writes not supported yet\n");
+    return -1;
+  }
+
+  auto &ctx = OmpFileContext::getInstance();
+
+  return ctx.writeFile(file_handle, data, size);
+}
 
 int omp_file_close() { return 0; }
 
