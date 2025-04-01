@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cstdio>
 #include <cstdarg>
+#include <cstdio>
 
 // -DOMP_IO_DEBUG should enable the logging
 #ifdef OMP_IO_DEBUG
