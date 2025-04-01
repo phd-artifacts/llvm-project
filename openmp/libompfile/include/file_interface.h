@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+#include <stddef.h>
+
 int omp_file_open(const char *filename);
 
 int omp_file_write(int file_handle, const void *data, size_t size, int async);
