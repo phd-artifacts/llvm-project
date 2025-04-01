@@ -8,6 +8,7 @@ add_compile_definitions(OMP_IO_DEBUG)
 
 add_library(ompfile SHARED
     src/file_interface.cpp
+    src/mpi_io_backend.cpp
 )
 
 find_package(MPI REQUIRED)
