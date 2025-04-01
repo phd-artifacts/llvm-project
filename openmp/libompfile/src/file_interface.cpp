@@ -154,6 +154,53 @@ public:
     return 0;
   }
 
+  int readFileAt(int file_id, void *data, size_t size, MPI_Offset offset) {
+    // Check if the file handle is valid
+    if (file_handle_map.find(file_id) == file_handle_map.end()) {
+      io_log("Error: Invalid file handle %d\n", file_id);
+      return -1;
+    }
+
+    io_log("Reading %zu bytes from file %d at offset %lld\n",
+          size, file_id, static_cast<long long>(offset));
+
+    MPI_File file = file_handle_map[file_id];
+
+    // Perform the actual read at the specified offset
+    int ret = MPI_File_read_at(file, offset, data, size, MPI_BYTE, MPI_STATUS_IGNORE);
+    if (ret != MPI_SUCCESS) {
+      io_log("Error: Read at offset failed\n");
+      return -1;
+    }
+
+    io_log("Read at offset completed\n");
+    return 0;
+  }
+
+  int writeFileAt(int file_id, const void *data, size_t size, MPI_Offset offset) {
+    // Check if the file handle is valid
+    if (file_handle_map.find(file_id) == file_handle_map.end()) {
+      io_log("Error: Invalid file handle %d\n", file_id);
+      return -1;
+    }
+
+  io_log("Writing %zu bytes to file %d at offset %lld\n",
+         size, file_id, static_cast<long long>(offset));
+
+  MPI_File file = file_handle_map[file_id];
+
+  // Perform the actual write at the specified offset
+  int ret = MPI_File_write_at(file, offset, data, size, MPI_BYTE, MPI_STATUS_IGNORE);
+  if (ret != MPI_SUCCESS) {
+    io_log("Error: Write at offset failed\n");
+    return -1;
+  }
+
+  io_log("Write at offset completed\n");
+  return 0;
+}
+
+
 private:
   int getNextFileHandle() {
     return next_file_handle.fetch_add(1, std::memory_order_relaxed);
@@ -180,6 +227,28 @@ int omp_file_write(int file_handle, const void *data, size_t size, int async) {
   auto &ctx = OmpFileContext::getInstance();
 
   return ctx.writeFile(file_handle, data, size);
+}
+
+int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size, int async) {
+  if (async) {
+    io_log("Error: Asynchronous writes not supported yet\n");
+    return -1;
+  }
+
+  auto &ctx = OmpFileContext::getInstance();
+
+  return ctx.writeFileAt(file_handle, data, size, offset);
+}
+
+int omp_file_pread(int file_handle, long offset, void *data, size_t size, int async) {
+  if (async) {
+    io_log("Error: Asynchronous reads not supported yet\n");
+    return -1;
+  }
+
+  auto &ctx = OmpFileContext::getInstance();
+
+  return ctx.readFileAt(file_handle, data, size, offset);
 }
 
 int omp_file_read(int file_handle, void *data, size_t size, int async) {

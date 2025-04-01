@@ -11,6 +11,10 @@ int omp_file_open(const char *filename);
 
 int omp_file_write(int file_handle, const void *data, size_t size, int async);
 
+int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size, int async);
+
+int omp_file_pread(int file_handle, long offset, void *data, size_t size, int async);
+
 int omp_file_read(int file_handle, void *data, size_t size, int async);
 
 int omp_file_close(int file_handle);
