@@ -2,6 +2,7 @@
 #include "debug_log.h"
 #include "mpi.h"
 #include "mpi_io_backend.h"
+#include "posix_backend.h"
 #include <atomic>
 #include <cassert>
 #include <memory>
@@ -17,10 +18,12 @@ public:
   OmpFileContext(IOBackendTy backend_type) {
     switch (backend_type) {
     case IOBackendTy::MPI:
+      io_log("MPI backend selected\n");
       io_backend = std::make_unique<MPIIOBackend>();
       break;
     case IOBackendTy::POSIX:
-      io_log("POSIX backend not implemented yet\n");
+      io_log("POSIX backend selected\n");
+      io_backend = std::make_unique<POSIXIOBackend>();
       break;
     case IOBackendTy::IO_URING:
       io_log("IO_URING backend not implemented yet\n");
@@ -34,8 +37,6 @@ public:
       break;
     }
     io_log("OmpFileContext constructor called\n");
-    io_log("Initializing OmpFileContext with backend type: %d\n",
-           static_cast<int>(backend_type));
   }
 
   ~OmpFileContext() { io_log("Destroying OmpFileContext\n"); }
@@ -43,7 +44,29 @@ public:
   static OmpFileContext &getInstance() {
     if (instance == nullptr) {
       io_log("Creating new instance of OmpFileContext\n");
-      instance = new OmpFileContext(IOBackendTy::MPI);
+
+      const char *env = std::getenv("LIBOMPFILE_BACKEND");
+      IOBackendTy backend = IOBackendTy::MPI; // Default
+
+      if (env) {
+        std::string envStr(env);
+        if (envStr == "MPI") {
+          backend = IOBackendTy::MPI;
+        } else if (envStr == "POSIX") {
+          backend = IOBackendTy::POSIX;
+        } else if (envStr == "IO_URING") {
+          backend = IOBackendTy::IO_URING;
+        } else if (envStr == "HDF5") {
+          backend = IOBackendTy::HDF5;
+        } else {
+          io_log("Unknown LIBOMPFILE_BACKEND value, defaulting to MPI\n");
+          io_log("Valid options are: MPI, POSIX, IO_URING, HDF5\n");
+        }
+      } else {
+        io_log("LIBOMPFILE_BACKEND not set, defaulting to MPI\n");
+      }
+
+      instance = new OmpFileContext(backend);
     }
 
     return *instance;
