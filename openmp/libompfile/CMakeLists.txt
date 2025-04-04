@@ -10,10 +10,20 @@ add_library(ompfile SHARED
     src/file_interface.cpp
     src/mpi_io_backend.cpp
     src/posix_backend.cpp
+    src/io_uring_io_backend.cpp
 )
 
 find_package(MPI REQUIRED)
+
+find_library(LIBURING_LIBRARY NAMES uring REQUIRED)
+find_path(LIBURING_INCLUDE_DIR liburing.h REQUIRED)
+target_include_directories(ompfile PRIVATE ${LIBURING_INCLUDE_DIR})
+target_link_libraries(ompfile PRIVATE ${LIBURING_LIBRARY})
+
+
 target_link_libraries(ompfile PRIVATE MPI::MPI_CXX)
+
+target_link_libraries(ompfile PRIVATE ${LIBURING_LIBRARY})
 
 target_link_libraries(ompfile PUBLIC omp)
 

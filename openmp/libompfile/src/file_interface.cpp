@@ -3,6 +3,7 @@
 #include "mpi.h"
 #include "mpi_io_backend.h"
 #include "posix_backend.h"
+#include "io_uring_io_backend.h"
 #include <atomic>
 #include <cassert>
 #include <memory>
@@ -26,16 +27,14 @@ public:
       io_backend = std::make_unique<POSIXIOBackend>();
       break;
     case IOBackendTy::IO_URING:
-      io_log("IO_URING backend not implemented yet\n");
+      io_log("IO_URING selected\n");
+      io_backend = std::make_unique<IoUringIOBackend>();
       break;
     case IOBackendTy::HDF5:
       io_log("HDF5 backend not implemented yet\n");
       break;
-    default:
-      io_log("Unknown backend type, defaulting to MPI\n");
-      io_backend = std::make_unique<MPIIOBackend>();
-      break;
     }
+
     io_log("OmpFileContext constructor called\n");
   }
 
@@ -45,9 +44,9 @@ public:
     if (instance == nullptr) {
       io_log("Creating new instance of OmpFileContext\n");
 
-      const char *env = std::getenv("LIBOMPFILE_BACKEND");
-      IOBackendTy backend = IOBackendTy::MPI; // Default
+      IOBackendTy backend = IOBackendTy::MPI; // Default to MPI backend
 
+      const char *env = std::getenv("LIBOMPFILE_BACKEND");
       if (env) {
         std::string envStr(env);
         if (envStr == "MPI") {
