@@ -11,6 +11,8 @@
 
 class IoUringIOBackend : public IOBackend {
 private:
+  bool is_initialized = false;
+
   // We maintain a global ring for all requests, but you could also keep
   // a ring per file if you need concurrency or different queue depths.
   io_uring ring;
@@ -25,7 +27,7 @@ private:
   std::unordered_map<int, FileData> file_handle_map;
 
   std::atomic<int> next_file_handle;
-  // You might want to store the queue depth as well.
+  // We might want to store the queue depth as well.
   // For example:
   // static constexpr unsigned QUEUE_DEPTH = 64; // or something suitable
 

@@ -18,24 +18,27 @@ IoUringIOBackend::IoUringIOBackend() {
   int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
   if (ret < 0) {
     io_log("io_uring_queue_init failed: %s\n", strerror(-ret));
-    // You may want to handle this error more gracefully
-    // or throw an exception if your environment supports it.
   } else {
     io_log("IoUringIOBackend initialized with queue depth %u\n", QUEUE_DEPTH);
+
+    is_initialized = true;
   }
 }
 
 IoUringIOBackend::~IoUringIOBackend() {
   // Teardown the ring
   io_uring_queue_exit(&ring);
+  is_initialized = false;
   io_log("IoUringIOBackend destroyed\n");
 }
 
 int IoUringIOBackend::getNextFileHandle() {
+  assert(is_initialized && "IoUringIOBackend not initialized");
   return next_file_handle.fetch_add(1, std::memory_order_relaxed);
 }
 
 int IoUringIOBackend::open(const char *filename) {
+  assert(is_initialized && "IoUringIOBackend not initialized");
   int file_id = getNextFileHandle();
   io_log("Opening file %s with file_id %d\n", filename, file_id);
 
@@ -56,6 +59,7 @@ int IoUringIOBackend::open(const char *filename) {
 }
 
 int IoUringIOBackend::close(int file_id) {
+  assert(is_initialized && "IoUringIOBackend not initialized");
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -64,7 +68,7 @@ int IoUringIOBackend::close(int file_id) {
 
   io_log("Closing file %d\n", file_id);
 
-  // For demonstration, we do a “normal” close.
+  // For demonstration, we do a "normal" close.
   // If you want to do it via io_uring, you’d do:
   //   io_uring_sqe* sqe = io_uring_get_sqe(&ring);
   //   io_uring_prep_close(sqe, it->second.fd);
@@ -85,6 +89,7 @@ int IoUringIOBackend::close(int file_id) {
 // Submits a prepared sqe to io_uring and blocks until the cqe is ready.
 // Returns the "res" field from the cqe (>= 0 is success, < 0 is -errno).
 int IoUringIOBackend::submitAndWait(io_uring_sqe* sqe) {
+  assert(is_initialized && "IoUringIOBackend not initialized");
   // Actually submit the SQE
   int submit_ret = io_uring_submit(&ring);
   if (submit_ret < 0) {
@@ -106,8 +111,9 @@ int IoUringIOBackend::submitAndWait(io_uring_sqe* sqe) {
   return result;
 }
 
-// “Synchronous” write that calls io_uring_prep_write and blocks for its completion.
+// "Synchronous" write that calls io_uring_prep_write and blocks for its completion.
 int IoUringIOBackend::write(int file_id, const void *data, size_t size) {
+  assert(is_initialized && "IoUringIOBackend not initialized");
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -145,8 +151,9 @@ int IoUringIOBackend::write(int file_id, const void *data, size_t size) {
   return 0;
 }
 
-// “Synchronous” read using io_uring_prep_read
+// "Synchronous" read using io_uring_prep_read
 int IoUringIOBackend::read(int file_id, void *data, size_t size) {
+  assert(is_initialized && "IoUringIOBackend not initialized");
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -180,6 +187,7 @@ int IoUringIOBackend::read(int file_id, void *data, size_t size) {
 }
 
 int IoUringIOBackend::seek(int file_id, long offset) {
+  assert(is_initialized && "IoUringIOBackend not initialized");
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -194,8 +202,9 @@ int IoUringIOBackend::seek(int file_id, long offset) {
   return 0;
 }
 
-// “Synchronous” read at a specific offset
+// "Synchronous" read at a specific offset
 int IoUringIOBackend::readAt(int file_id, long offset, void *data, size_t size) {
+  assert(is_initialized && "IoUringIOBackend not initialized");
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -223,8 +232,9 @@ int IoUringIOBackend::readAt(int file_id, long offset, void *data, size_t size) 
   return 0;
 }
 
-// “Synchronous” write at a specific offset
+// "Synchronous" write at a specific offset
 int IoUringIOBackend::writeAt(int file_id, long offset, const void *data, size_t size) {
+  assert(is_initialized && "IoUringIOBackend not initialized");
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
