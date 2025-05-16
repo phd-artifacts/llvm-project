@@ -10,6 +10,7 @@
 class MPIIOBackend : public IOBackend {
 private:
   MPI_Comm file_comm;
+  int externally_initialized;
   std::unordered_map<int, MPI_File> file_handle_map;
   std::atomic<int> next_file_handle;
 

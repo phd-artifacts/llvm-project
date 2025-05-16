@@ -6,22 +6,33 @@
 #include <unordered_map>
 
 MPIIOBackend::MPIIOBackend() {
-
-  /*TODO: do not INIT/Finalize MPI if the user also uses MPI*/
   int provided = 0;
-  // Initialize MPI with thread support
-  MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
+  int initialized = 0;
 
-  // Duplicate MPI_COMM_WORLD into our file_comm for file I/O
+  // Check if MPI is already initialized
+  MPI_Initialized(&initialized);
+  if (!initialized) {
+    // Initialize MPI with thread support
+    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
+    io_log("MPI_Init_thread called, provided = %d\n", provided);
+    externally_initialized = 0;
+  } else {
+    io_log("MPI already initialized by user program.\n");
+    externally_initialized = 1;
+  }
+
+  // Duplicate MPI_COMM_WORLD into file_comm for file I/O
   MPI_Comm_dup(MPI_COMM_WORLD, &file_comm);
+  io_log("MPI_Comm_dup completed for file I/O.\n");
 
-  // Optional: check what level of thread support was granted
-  io_log("MPI_Init_thread provided = %d\n", provided);
 }
 
 MPIIOBackend::~MPIIOBackend() {
-  // Finalize MPI
-  MPI_Finalize();
+  MPI_Comm_free(&file_comm);
+  // if(!externally_initialized) {
+  //   // Free the duplicated communicator
+  //   io_log("MPI_Comm_free completed.\n");
+  // }
 }
 
 int MPIIOBackend::open(const char *filename) {
