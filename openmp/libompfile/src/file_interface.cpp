@@ -8,12 +8,47 @@
 #include <cassert>
 #include <memory>
 #include <unordered_map>
+#include <thread>
+#include <chrono>
 
 class OmpFileContext {
 
 private:
   static OmpFileContext *instance;
   std::unique_ptr<IOBackend> io_backend;
+  std::atomic<int> io_resource_token{2}; // take this from env var?
+
+  // RAII guard for IO resource token
+  class IOResourceGuard {
+    std::atomic<int> &token;
+    std::chrono::milliseconds delay{1};
+    static constexpr std::chrono::milliseconds max_delay{100};
+  public:
+    IOResourceGuard(std::atomic<int> &tok) : token(tok) {
+      // Acquire a token with exponential backoff when none available
+      while (true) {
+        int current = token.load(std::memory_order_relaxed);
+        if (current > 0) {
+          if (token.compare_exchange_strong(current, current - 1,
+                                            std::memory_order_acquire)) {
+            break;
+          }
+        } else {
+          std::this_thread::sleep_for(delay);
+          // Exponential backoff capped at max_delay
+          delay = std::min(delay * 2, max_delay);
+        }
+      }
+    }
+
+    ~IOResourceGuard() {
+      token.fetch_add(1, std::memory_order_release);
+    }
+
+    // disable copying and moving
+    IOResourceGuard(const IOResourceGuard &) = delete;
+    IOResourceGuard &operator=(const IOResourceGuard &) = delete;
+  };
 
 public:
   OmpFileContext(IOBackendTy backend_type) {
@@ -71,25 +106,41 @@ public:
     return *instance;
   }
 
-  int openFile(const char *filename) { return io_backend->open(filename); }
+  int openFile(const char *filename) {
+    IOResourceGuard guard(io_resource_token);
+    return io_backend->open(filename);
+  }
+
   int writeFile(int file_handle, const void *data, size_t size) {
+    IOResourceGuard guard(io_resource_token);
     return io_backend->write(file_handle, data, size);
   }
+
   int readFile(int file_handle, void *data, size_t size) {
+    IOResourceGuard guard(io_resource_token);
     return io_backend->read(file_handle, data, size);
   }
-  int closeFile(int file_handle) { return io_backend->close(file_handle); }
+
+  int closeFile(int file_handle) {
+    IOResourceGuard guard(io_resource_token);
+    return io_backend->close(file_handle);
+  }
 
   int seekFile(int file_handle, long offset) {
+    IOResourceGuard guard(io_resource_token);
     return io_backend->seek(file_handle, offset);
   }
 
   int writeFileAt(int file_handle, const void *data, size_t size, long offset) {
+    IOResourceGuard guard(io_resource_token);
     return io_backend->writeAt(file_handle, offset, data, size);
   }
+
   int readFileAt(int file_handle, void *data, size_t size, long offset) {
+    IOResourceGuard guard(io_resource_token);
     return io_backend->readAt(file_handle, offset, data, size);
   }
+
   int getFileHandle(int file_handle) { return file_handle; }
 
   static void finalize() {
@@ -104,68 +155,52 @@ OmpFileContext *OmpFileContext::instance = nullptr;
 
 extern "C" {
 
-int omp_file_open(const char *filename) {
+inline int acquire_async_not_supported(int async) {
+  if (async) {
+    io_log("Error: Asynchronous IO not supported yet\n");
+    return -1;
+  }
+  return 0;
+}
 
+int omp_file_open(const char *filename) {
   auto &ctx = OmpFileContext::getInstance();
-  auto file_id = ctx.openFile(filename);
-  return file_id;
+  return ctx.openFile(filename);
 }
 
 int omp_file_write(int file_handle, const void *data, size_t size, int async) {
-  if (async) {
-    io_log("Error: Asynchronous writes not supported yet\n");
-    return -1;
-  }
-
+  if (acquire_async_not_supported(async)) return -1;
   auto &ctx = OmpFileContext::getInstance();
-
   return ctx.writeFile(file_handle, data, size);
 }
 
 int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size,
                     int async) {
-  if (async) {
-    io_log("Error: Asynchronous writes not supported yet\n");
-    return -1;
-  }
-
+  if (acquire_async_not_supported(async)) return -1;
   auto &ctx = OmpFileContext::getInstance();
-
   return ctx.writeFileAt(file_handle, data, size, offset);
 }
 
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,
                    int async) {
-  if (async) {
-    io_log("Error: Asynchronous reads not supported yet\n");
-    return -1;
-  }
-
+  if (acquire_async_not_supported(async)) return -1;
   auto &ctx = OmpFileContext::getInstance();
-
   return ctx.readFileAt(file_handle, data, size, offset);
 }
 
 int omp_file_read(int file_handle, void *data, size_t size, int async) {
-  if (async) {
-    io_log("Error: Asynchronous reads not supported yet\n");
-    return -1;
-  }
-
+  if (acquire_async_not_supported(async)) return -1;
   auto &ctx = OmpFileContext::getInstance();
-
   return ctx.readFile(file_handle, data, size);
 }
 
 int omp_file_close(int file_handle) {
   auto &ctx = OmpFileContext::getInstance();
-
   return ctx.closeFile(file_handle);
 }
 
 int omp_file_seek(int file_handle, long offset) {
   auto &ctx = OmpFileContext::getInstance();
-
   return ctx.seekFile(file_handle, offset);
 }
 
