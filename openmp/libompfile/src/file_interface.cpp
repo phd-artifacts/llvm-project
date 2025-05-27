@@ -10,13 +10,14 @@
 #include <unordered_map>
 #include <thread>
 #include <chrono>
+#include <cstdlib>
 
 class OmpFileContext {
 
 private:
   static OmpFileContext *instance;
   std::unique_ptr<IOBackend> io_backend;
-  std::atomic<int> io_resource_token{2}; // take this from env var?
+  std::atomic<int> io_resource_token;
 
   // RAII guard for IO resource token
   class IOResourceGuard {
@@ -51,7 +52,20 @@ private:
   };
 
 public:
-  OmpFileContext(IOBackendTy backend_type) {
+  OmpFileContext(IOBackendTy backend_type)
+    : io_resource_token([](){
+        const char* env = std::getenv("LIBOMPFILE_IO_TOKENS");
+        if (env) {
+          try {
+            int val = std::stoi(env);
+            if (val > 0) return val;
+          } catch (...) {}
+        }
+        // default tokens
+        return 4;
+      }()) {
+    io_log("IO resource slots set to %d\n", io_resource_token.load());
+
     switch (backend_type) {
     case IOBackendTy::MPI:
       io_log("MPI backend selected\n");
@@ -79,8 +93,7 @@ public:
     if (instance == nullptr) {
       io_log("Creating new instance of OmpFileContext\n");
 
-      IOBackendTy backend = IOBackendTy::MPI; // Default to MPI backend
-
+      IOBackendTy backend = IOBackendTy::MPI; // Default
       const char *env = std::getenv("LIBOMPFILE_BACKEND");
       if (env) {
         std::string envStr(env);
@@ -93,8 +106,7 @@ public:
         } else if (envStr == "HDF5") {
           backend = IOBackendTy::HDF5;
         } else {
-          io_log("Unknown LIBOMPFILE_BACKEND value, defaulting to MPI\n");
-          io_log("Valid options are: MPI, POSIX, IO_URING, HDF5\n");
+          io_log("Unknown LIBOMPFILE_BACKEND '%s', defaulting to MPI\n", env);
         }
       } else {
         io_log("LIBOMPFILE_BACKEND not set, defaulting to MPI\n");
