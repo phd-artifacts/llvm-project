@@ -9,6 +9,7 @@ project(libompfile CXX)
 add_library(ompfile SHARED
     src/file_interface.cpp
     src/mpi_io_backend.cpp
+    src/mpp_shim.cpp
     src/posix_backend.cpp
     src/io_uring_io_backend.cpp
 )
@@ -24,6 +25,7 @@ target_link_libraries(ompfile PRIVATE ${LIBURING_LIBRARY})
 target_link_libraries(ompfile PRIVATE MPI::MPI_CXX)
 
 target_link_libraries(ompfile PRIVATE ${LIBURING_LIBRARY})
+target_link_libraries(ompfile PRIVATE dl)
 
 target_link_libraries(ompfile PUBLIC omp)
 
@@ -40,9 +42,12 @@ set_target_properties(ompfile PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-# Install the library itself
+# Install the library itself. Only export targets for standalone OpenMP builds.
+if (OPENMP_STANDALONE_BUILD)
+    set(OMPFILE_EXPORT_ARG EXPORT ompfileTargets)
+endif()
 install(TARGETS ompfile
-    EXPORT ompfileTargets
+    ${OMPFILE_EXPORT_ARG}
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
@@ -54,13 +59,15 @@ install(FILES
     DESTINATION include
 )
 
-# Optionally export the CMake targets if you want a config file 
-# for third-party projects to `find_package(ompfile)`
-install(EXPORT ompfileTargets
-    FILE ompfileConfig.cmake
-    NAMESPACE ompfile::
-    DESTINATION lib/cmake/ompfile
-)
+# Optionally export the CMake targets if you want a config file
+# for third-party projects to `find_package(ompfile)`.
+if (OPENMP_STANDALONE_BUILD)
+    install(EXPORT ompfileTargets
+        FILE ompfileConfig.cmake
+        NAMESPACE ompfile::
+        DESTINATION lib/cmake/ompfile
+    )
+endif()
 
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include")
 
@@ -77,4 +84,3 @@ add_custom_command(
 add_custom_target(copy_ompfile_headers ALL
     DEPENDS "${CMAKE_BINARY_DIR}/include/file_interface.h"
 )
-

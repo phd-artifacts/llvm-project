@@ -1,7 +1,9 @@
 #include "mpi_io_backend.h"
 #include "debug_log.h"
+#include "mpp_shim.h"
 #include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <mpi.h>
 #include <unordered_map>
 
@@ -21,13 +23,29 @@ MPIIOBackend::MPIIOBackend() {
     externally_initialized = 1;
   }
 
-  // Duplicate MPI_COMM_WORLD into file_comm for file I/O
-  MPI_Comm_dup(MPI_COMM_WORLD, &file_comm);
+  MPI_Comm source_comm = MPI_COMM_WORLD;
+  const char *comm_self_env = std::getenv("LIBOMPFILE_MPI_COMM_SELF");
+  if (comm_self_env && comm_self_env[0] == '1' && comm_self_env[1] == '\0') {
+    source_comm = MPI_COMM_SELF;
+    io_log("LIBOMPFILE_MPI_COMM_SELF=1: using MPI_COMM_SELF for file I/O.\n");
+  }
+
+  // Duplicate the chosen communicator for file I/O.
+  MPI_Comm_dup(source_comm, &file_comm);
   io_log("MPI_Comm_dup completed for file I/O.\n");
+
+  if (ompfile::mpp::init()) {
+    const char *env = std::getenv("LIBOMPFILE_MPP_PING");
+    if (env && env[0] == '1' && env[1] == '\0') {
+      if (!ompfile::mpp::ping())
+        io_log("MPP shim ping failed.\n");
+    }
+  }
 
 }
 
 MPIIOBackend::~MPIIOBackend() {
+  ompfile::mpp::finalize();
   MPI_Comm_free(&file_comm);
   // if(!externally_initialized) {
   //   // Free the duplicated communicator

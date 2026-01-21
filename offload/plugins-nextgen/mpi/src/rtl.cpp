@@ -11,15 +11,18 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <list>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 
 #include "Shared/APITypes.h"
 #include "Shared/Debug.h"
@@ -55,6 +58,18 @@ struct MPIDeviceTy;
 struct MPIDeviceImageTy;
 struct MPIKernelTy;
 class MPIGlobalHandlerTy;
+
+static std::atomic<MPIPluginTy *> ActiveMPIPlugin{nullptr};
+
+static std::mutex &getOmpfileMppMutex() {
+  static std::mutex *Mutex = new std::mutex();
+  return *Mutex;
+}
+
+static std::unordered_map<uint64_t, EventTy> &getOmpfileMppEvents() {
+  static auto *Events = new std::unordered_map<uint64_t, EventTy>();
+  return *Events;
+}
 
 // TODO: Should this be defined inside the EventSystem?
 using MPIEventQueue = std::list<EventTy>;
@@ -403,10 +418,22 @@ Error MPIKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
 /// Class implementing the MPI plugin.
 struct MPIPluginTy : public GenericPluginTy {
   MPIPluginTy() : GenericPluginTy(getTripleArch()) {}
+  ~MPIPluginTy() override {
+    MPIPluginTy *Expected = this;
+    ActiveMPIPlugin.compare_exchange_strong(Expected, nullptr);
+  }
 
   /// This class should not be copied.
   MPIPluginTy(const MPIPluginTy &) = delete;
   MPIPluginTy(MPIPluginTy &&) = delete;
+
+  EventSystemTy &getEventSystemForOmpFile() { return EventSystem; }
+
+  bool ensureEventSystemInitializedForOmpFile() {
+    if (!EventSystem.is_initialized())
+      return EventSystem.initialize();
+    return true;
+  }
 
   /// Initialize the plugin and return the number of devices.
   Expected<int32_t> initImpl() override {
@@ -1340,7 +1367,80 @@ static Error Plugin::check(int32_t ErrorCode, const char *ErrFmt,
 } // namespace llvm::omp::target::plugin
 
 extern "C" {
+int ompfile_mpp_init() {
+  using namespace llvm::omp::target::plugin;
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+  return Plugin->ensureEventSystemInitializedForOmpFile() ? OFFLOAD_SUCCESS
+                                                          : OFFLOAD_FAIL;
+}
+
+int ompfile_mpp_submit(uint64_t Token) {
+  using namespace llvm::omp::target::plugin;
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfilePing, EventTypeTy::OMPFILE_PING, /*DstDeviceID=*/0,
+      Token);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+
+  auto &Events = getOmpfileMppEvents();
+  const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+  if (Events.count(Token))
+    return OFFLOAD_FAIL;
+  Events.emplace(Token, std::move(Event));
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_poll(uint64_t Token, int *Done) {
+  using namespace llvm::omp::target::plugin;
+  if (!Done)
+    return OFFLOAD_FAIL;
+
+  auto &Events = getOmpfileMppEvents();
+  const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+  auto It = Events.find(Token);
+  if (It == Events.end())
+    return OFFLOAD_FAIL;
+
+  It->second.advance();
+  if (!It->second.done()) {
+    *Done = 0;
+    return OFFLOAD_SUCCESS;
+  }
+
+  *Done = 1;
+  auto Error = It->second.getError();
+  Events.erase(It);
+  if (Error)
+    return OFFLOAD_FAIL;
+
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_finalize() {
+  using namespace llvm::omp::target::plugin;
+  auto &Events = getOmpfileMppEvents();
+  const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+  Events.clear();
+  return OFFLOAD_SUCCESS;
+}
+
 llvm::omp::target::plugin::GenericPluginTy *createPlugin_mpi() {
-  return new llvm::omp::target::plugin::MPIPluginTy();
+  auto *Plugin = new llvm::omp::target::plugin::MPIPluginTy();
+  llvm::omp::target::plugin::ActiveMPIPlugin.store(Plugin);
+  return Plugin;
 }
 }

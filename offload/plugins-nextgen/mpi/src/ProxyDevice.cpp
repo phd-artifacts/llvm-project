@@ -740,6 +740,18 @@ struct ProxyDevice {
     co_return (co_await RequestManager);
   }
 
+  EventTy ompfilePing(MPIRequestManagerTy RequestManager) {
+    uint64_t Token = 0;
+
+    RequestManager.receive(&Token, 1, MPI_UINT64_T);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    RequestManager.send(&Token, 1, MPI_UINT64_T);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
   EventTy initAsyncInfo(MPIRequestManagerTy RequestManager) {
     __tgt_async_info *TgtAsyncInfoPtr = nullptr;
 
@@ -1045,6 +1057,9 @@ struct ProxyDevice {
         break;
       case SYNCHRONIZE:
         NewEvent = synchronize(std::move(RequestManager));
+        break;
+      case OMPFILE_PING:
+        NewEvent = ompfilePing(std::move(RequestManager));
         break;
       case INIT_ASYNC_INFO:
         NewEvent = initAsyncInfo(std::move(RequestManager));

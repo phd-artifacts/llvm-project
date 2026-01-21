@@ -70,6 +70,7 @@ std::string EventTypeToString(EventTypeTy eventType) {
     case EventTypeTy::EXCHANGE_SRC: return "EXCHANGE_SRC";
     case EventTypeTy::EXCHANGE_DST: return "EXCHANGE_DST";
     case EventTypeTy::LAUNCH_KERNEL: return "LAUNCH_KERNEL";
+    case EventTypeTy::OMPFILE_PING: return "OMPFILE_PING";
     case EventTypeTy::SYNC: return "SYNC";
     case EventTypeTy::EXIT: return "EXIT";
     default: return "UNKNOWN_EVENT_TYPE";
@@ -452,6 +453,23 @@ EventTy synchronize(MPIRequestManagerTy RequestManager,
 
   if (!DeviceOpStatus)
     co_return createError("Failed to synchronize device.");
+
+  // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfilePing(MPIRequestManagerTy RequestManager, uint64_t Token) {
+  uint64_t Response = 0;
+
+  RequestManager.send(&Token, 1, MPI_UINT64_T);
+  RequestManager.receive(&Response, 1, MPI_UINT64_T);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  if (Response != Token)
+    co_return createError("OMPFile ping response mismatch.");
 
   // Event completion notification
   RequestManager.receive(nullptr, 0, MPI_BYTE);

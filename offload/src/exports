@@ -73,6 +73,10 @@ VERS1.0 {
     __llvmPushCallConfiguration;
     __llvmPopCallConfiguration;
     llvmLaunchKernel;
+    ompfile_mpp_init;
+    ompfile_mpp_submit;
+    ompfile_mpp_poll;
+    ompfile_mpp_finalize;
   local:
     *;
 };

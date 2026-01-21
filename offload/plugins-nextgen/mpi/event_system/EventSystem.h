@@ -92,6 +92,9 @@ enum class EventTypeTy : unsigned int {
   // Target region execution.
   LAUNCH_KERNEL, // Executes a target region at the remote process.
 
+  // OMPFile shim events.
+  OMPFILE_PING, // No-op event used to validate the MPP path.
+
   // Local event used to wait on other events.
   SYNC,
 
@@ -353,6 +356,7 @@ EventTy exchange(MPIRequestManagerTy RequestManager, int SrcRank,
                  int64_t Size, __tgt_async_info *AsyncInfoPtr);
 EventTy synchronize(MPIRequestManagerTy RequestManager,
                     __tgt_async_info *AsyncInfoPtr);
+EventTy ompfilePing(MPIRequestManagerTy RequestManager, uint64_t Token);
 EventTy sync(EventTy Event);
 EventTy loadBinary(MPIRequestManagerTy RequestManager,
                    const __tgt_device_image *Image,
