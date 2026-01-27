@@ -71,6 +71,10 @@ std::string EventTypeToString(EventTypeTy eventType) {
     case EventTypeTy::EXCHANGE_DST: return "EXCHANGE_DST";
     case EventTypeTy::LAUNCH_KERNEL: return "LAUNCH_KERNEL";
     case EventTypeTy::OMPFILE_PING: return "OMPFILE_PING";
+    case EventTypeTy::OMPFILE_OPEN: return "OMPFILE_OPEN";
+    case EventTypeTy::OMPFILE_CLOSE: return "OMPFILE_CLOSE";
+    case EventTypeTy::OMPFILE_PREAD: return "OMPFILE_PREAD";
+    case EventTypeTy::OMPFILE_PWRITE: return "OMPFILE_PWRITE";
     case EventTypeTy::SYNC: return "SYNC";
     case EventTypeTy::EXIT: return "EXIT";
     default: return "UNKNOWN_EVENT_TYPE";
@@ -475,6 +479,88 @@ EventTy ompfilePing(MPIRequestManagerTy RequestManager, uint64_t Token) {
   RequestManager.receive(nullptr, 0, MPI_BYTE);
   co_return (co_await RequestManager);
 }
+
+EventTy ompfileOpen(MPIRequestManagerTy RequestManager, const char *Path,
+                    int Flags, int Mode, int *RemoteHandle,
+                    int *RemoteErrno) {
+  uint32_t PathSize = std::strlen(Path) + 1;
+  RequestManager.send(&PathSize, 1, MPI_UINT32_T);
+  RequestManager.send(&Flags, 1, MPI_INT);
+  RequestManager.send(&Mode, 1, MPI_INT);
+  RequestManager.send(Path, PathSize, MPI_CHAR);
+
+  RequestManager.receive(RemoteHandle, 1, MPI_INT);
+  RequestManager.receive(RemoteErrno, 1, MPI_INT);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileClose(MPIRequestManagerTy RequestManager, int RemoteHandle,
+                     int *CloseRet, int *RemoteErrno) {
+  RequestManager.send(&RemoteHandle, 1, MPI_INT);
+  RequestManager.receive(CloseRet, 1, MPI_INT);
+  RequestManager.receive(RemoteErrno, 1, MPI_INT);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+
+EventTy ompfilePread(MPIRequestManagerTy RequestManager, int RemoteHandle,
+                     int64_t Offset, void *Buffer, uint64_t Size,
+                     int *IoRet, int *RemoteErrno, uint64_t *Bytes) {
+  RequestManager.send(&RemoteHandle, 1, MPI_INT);
+  RequestManager.send(&Offset, 1, MPI_INT64_T);
+  RequestManager.send(&Size, 1, MPI_UINT64_T);
+
+  RequestManager.receive(IoRet, 1, MPI_INT);
+  RequestManager.receive(RemoteErrno, 1, MPI_INT);
+  RequestManager.receive(Bytes, 1, MPI_UINT64_T);
+
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  if (*Bytes > 0) {
+    RequestManager.receiveInBatchs(Buffer, *Bytes);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+  }
+
+  // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
+                      int64_t Offset, const void *Buffer, uint64_t Size,
+                      int *IoRet, int *RemoteErrno) {
+  RequestManager.send(&RemoteHandle, 1, MPI_INT);
+  RequestManager.send(&Offset, 1, MPI_INT64_T);
+  RequestManager.send(&Size, 1, MPI_UINT64_T);
+  if (Size > 0)
+    RequestManager.sendInBatchs(const_cast<void *>(Buffer), Size);
+
+  RequestManager.receive(IoRet, 1, MPI_INT);
+  RequestManager.receive(RemoteErrno, 1, MPI_INT);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
 
 EventTy sync(EventTy Event) {
   while (!Event.done())

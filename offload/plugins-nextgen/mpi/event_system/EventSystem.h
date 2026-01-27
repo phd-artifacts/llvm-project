@@ -94,6 +94,10 @@ enum class EventTypeTy : unsigned int {
 
   // OMPFile shim events.
   OMPFILE_PING, // No-op event used to validate the MPP path.
+  OMPFILE_OPEN, // Open a file on the remote worker.
+  OMPFILE_CLOSE, // Close a file on the remote worker.
+  OMPFILE_PREAD, // Read from a file on the remote worker.
+  OMPFILE_PWRITE, // Write to a file on the remote worker.
 
   // Local event used to wait on other events.
   SYNC,
@@ -357,6 +361,17 @@ EventTy exchange(MPIRequestManagerTy RequestManager, int SrcRank,
 EventTy synchronize(MPIRequestManagerTy RequestManager,
                     __tgt_async_info *AsyncInfoPtr);
 EventTy ompfilePing(MPIRequestManagerTy RequestManager, uint64_t Token);
+EventTy ompfileOpen(MPIRequestManagerTy RequestManager, const char *Path,
+                    int Flags, int Mode, int *RemoteHandle,
+                    int *RemoteErrno);
+EventTy ompfileClose(MPIRequestManagerTy RequestManager, int RemoteHandle,
+                     int *CloseRet, int *RemoteErrno);
+EventTy ompfilePread(MPIRequestManagerTy RequestManager, int RemoteHandle,
+                     int64_t Offset, void *Buffer, uint64_t Size,
+                     int *IoRet, int *RemoteErrno, uint64_t *Bytes);
+EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
+                      int64_t Offset, const void *Buffer, uint64_t Size,
+                      int *IoRet, int *RemoteErrno);
 EventTy sync(EventTy Event);
 EventTy loadBinary(MPIRequestManagerTy RequestManager,
                    const __tgt_device_image *Image,

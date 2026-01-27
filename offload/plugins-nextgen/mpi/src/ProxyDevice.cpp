@@ -4,10 +4,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <tuple>
+#include <vector>
 
 #include "EventSystem.h"
 #include "RemotePluginManager.h"
@@ -752,6 +757,121 @@ struct ProxyDevice {
     co_return (co_await RequestManager);
   }
 
+  EventTy ompfileOpen(MPIRequestManagerTy RequestManager) {
+    uint32_t PathSize = 0;
+    int Flags = 0;
+    int Mode = 0;
+
+    RequestManager.receive(&PathSize, 1, MPI_UINT32_T);
+    RequestManager.receive(&Flags, 1, MPI_INT);
+    RequestManager.receive(&Mode, 1, MPI_INT);
+
+    std::string Path(PathSize, '\0');
+    RequestManager.receive(Path.data(), PathSize, MPI_CHAR);
+
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    int Fd = ::open(Path.c_str(), Flags, static_cast<mode_t>(Mode));
+    int Errno = 0;
+    if (Fd < 0)
+      Errno = errno;
+
+    RequestManager.send(&Fd, 1, MPI_INT);
+    RequestManager.send(&Errno, 1, MPI_INT);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfileClose(MPIRequestManagerTy RequestManager) {
+    int Fd = -1;
+    RequestManager.receive(&Fd, 1, MPI_INT);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    int Ret = ::close(Fd);
+    int Errno = 0;
+    if (Ret != 0)
+      Errno = errno;
+
+    RequestManager.send(&Ret, 1, MPI_INT);
+    RequestManager.send(&Errno, 1, MPI_INT);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfilePread(MPIRequestManagerTy RequestManager) {
+    int Fd = -1;
+    int64_t Offset = 0;
+    uint64_t Size = 0;
+
+    RequestManager.receive(&Fd, 1, MPI_INT);
+    RequestManager.receive(&Offset, 1, MPI_INT64_T);
+    RequestManager.receive(&Size, 1, MPI_UINT64_T);
+
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    std::vector<char> Buffer;
+    if (Size > 0)
+      Buffer.resize(Size);
+
+    ssize_t BytesRead = 0;
+    int Errno = 0;
+    if (Size > 0) {
+      BytesRead = ::pread(Fd, Buffer.data(), Size, static_cast<off_t>(Offset));
+      if (BytesRead < 0)
+        Errno = errno;
+    }
+
+    int Ret = (BytesRead < 0) ? -1 : 0;
+    uint64_t PayloadSize = (BytesRead > 0) ? static_cast<uint64_t>(BytesRead) : 0;
+
+    RequestManager.send(&Ret, 1, MPI_INT);
+    RequestManager.send(&Errno, 1, MPI_INT);
+    RequestManager.send(&PayloadSize, 1, MPI_UINT64_T);
+    if (PayloadSize > 0)
+      RequestManager.sendInBatchs(Buffer.data(), PayloadSize);
+
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfilePwrite(MPIRequestManagerTy RequestManager) {
+    int Fd = -1;
+    int64_t Offset = 0;
+    uint64_t Size = 0;
+
+    RequestManager.receive(&Fd, 1, MPI_INT);
+    RequestManager.receive(&Offset, 1, MPI_INT64_T);
+    RequestManager.receive(&Size, 1, MPI_UINT64_T);
+
+    std::vector<char> Buffer;
+    if (Size > 0) {
+      Buffer.resize(Size);
+      RequestManager.receiveInBatchs(Buffer.data(), Size);
+    }
+
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    ssize_t BytesWritten = 0;
+    int Errno = 0;
+    if (Size > 0) {
+      BytesWritten = ::pwrite(Fd, Buffer.data(), Size, static_cast<off_t>(Offset));
+      if (BytesWritten < 0)
+        Errno = errno;
+    }
+
+    int Ret = (BytesWritten < 0) ? -1 : 0;
+    RequestManager.send(&Ret, 1, MPI_INT);
+    RequestManager.send(&Errno, 1, MPI_INT);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+
+
   EventTy initAsyncInfo(MPIRequestManagerTy RequestManager) {
     __tgt_async_info *TgtAsyncInfoPtr = nullptr;
 
@@ -1060,6 +1180,18 @@ struct ProxyDevice {
         break;
       case OMPFILE_PING:
         NewEvent = ompfilePing(std::move(RequestManager));
+        break;
+      case OMPFILE_OPEN:
+        NewEvent = ompfileOpen(std::move(RequestManager));
+        break;
+      case OMPFILE_CLOSE:
+        NewEvent = ompfileClose(std::move(RequestManager));
+        break;
+      case OMPFILE_PREAD:
+        NewEvent = ompfilePread(std::move(RequestManager));
+        break;
+      case OMPFILE_PWRITE:
+        NewEvent = ompfilePwrite(std::move(RequestManager));
         break;
       case INIT_ASYNC_INFO:
         NewEvent = initAsyncInfo(std::move(RequestManager));

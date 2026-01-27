@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdlib>
+#include <fcntl.h>
 #include <mpi.h>
 #include <unordered_map>
 
@@ -33,6 +34,22 @@ MPIIOBackend::MPIIOBackend() {
   // Duplicate the chosen communicator for file I/O.
   MPI_Comm_dup(source_comm, &file_comm);
   io_log("MPI_Comm_dup completed for file I/O.\n");
+
+  const char *mpp_open_env = std::getenv("LIBOMPFILE_MPP_OPEN");
+  if (mpp_open_env && mpp_open_env[0] == '1' && mpp_open_env[1] == '\0') {
+    mpp_open_enabled = true;
+    io_log("LIBOMPFILE_MPP_OPEN=1: enabling MPP open/close path.\n");
+  }
+
+  const char *mpp_io_env = std::getenv("LIBOMPFILE_MPP_IO");
+  if (mpp_io_env && mpp_io_env[0] == '1' && mpp_io_env[1] == '\0') {
+    if (mpp_open_enabled) {
+      mpp_io_enabled = true;
+      io_log("LIBOMPFILE_MPP_IO=1: enabling MPP I/O path.\n");
+    } else {
+      io_log("LIBOMPFILE_MPP_IO set without MPP open enabled.\n");
+    }
+  }
 
   if (ompfile::mpp::init()) {
     const char *env = std::getenv("LIBOMPFILE_MPP_PING");
@@ -66,6 +83,17 @@ int MPIIOBackend::open(const char *filename) {
     return -1;
   }
   file_handle_map[file_id] = file_handle;
+
+  if (mpp_open_enabled) {
+    int remote_handle = -1;
+    if (!ompfile::mpp::open(filename, O_RDWR, 0666, remote_handle)) {
+      io_log("MPP open failed for %s\n", filename);
+      MPI_File_close(&file_handle);
+      file_handle_map.erase(file_id);
+      return -1;
+    }
+    remote_file_handle_map[file_id] = remote_handle;
+  }
   return file_id;
 }
 
@@ -99,6 +127,18 @@ int MPIIOBackend::close(int file_id) {
 
   io_log("Closing file %d\n", file_id);
 
+  int mpp_ret = 0;
+  if (mpp_open_enabled) {
+    auto it = remote_file_handle_map.find(file_id);
+    if (it != remote_file_handle_map.end()) {
+      if (!ompfile::mpp::close(it->second)) {
+        io_log("MPP close failed for file %d\n", file_id);
+        mpp_ret = -1;
+      }
+      remote_file_handle_map.erase(it);
+    }
+  }
+
   MPI_File file = file_handle_map[file_id];
 
   int ret = MPI_File_close(&file);
@@ -109,6 +149,9 @@ int MPIIOBackend::close(int file_id) {
   }
 
   file_handle_map.erase(file_id);
+
+  if (mpp_ret != 0)
+    return -1;
 
   io_log("Close completed\n");
 
@@ -169,6 +212,21 @@ int MPIIOBackend::readAt(int file_id, long offset, void *data, size_t size) {
   io_log("Reading %zu bytes from file %d at offset %lld\n", size, file_id,
          static_cast<long long>(offset));
 
+  if (mpp_io_enabled) {
+    auto it = remote_file_handle_map.find(file_id);
+    if (it == remote_file_handle_map.end()) {
+      io_log("Error: Missing remote handle for file %d\n", file_id);
+      return -1;
+    }
+    if (!ompfile::mpp::pread(it->second, offset, data, size)) {
+      io_log("MPP pread failed for file %d\n", file_id);
+      return -1;
+    }
+
+    io_log("MPP read at offset completed.\n");
+    return 0;
+  }
+
   MPI_File file = file_handle_map[file_id];
 
   // Perform the actual read at the specified offset
@@ -193,6 +251,21 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
 
   io_log("Writing %zu bytes to file %d at offset %lld\n", size, file_id,
          static_cast<long long>(offset));
+
+  if (mpp_io_enabled) {
+    auto it = remote_file_handle_map.find(file_id);
+    if (it == remote_file_handle_map.end()) {
+      io_log("Error: Missing remote handle for file %d\n", file_id);
+      return -1;
+    }
+    if (!ompfile::mpp::pwrite(it->second, offset, data, size)) {
+      io_log("MPP pwrite failed for file %d\n", file_id);
+      return -1;
+    }
+
+    io_log("MPP write at offset completed.\n");
+    return 0;
+  }
 
   MPI_File file = file_handle_map[file_id];
 

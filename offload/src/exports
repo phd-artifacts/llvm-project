@@ -75,6 +75,10 @@ VERS1.0 {
     llvmLaunchKernel;
     ompfile_mpp_init;
     ompfile_mpp_submit;
+    ompfile_mpp_open;
+    ompfile_mpp_close;
+    ompfile_mpp_pread;
+    ompfile_mpp_pwrite;
     ompfile_mpp_poll;
     ompfile_mpp_finalize;
   local:

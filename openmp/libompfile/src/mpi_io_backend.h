@@ -12,7 +12,10 @@ private:
   MPI_Comm file_comm;
   int externally_initialized;
   std::unordered_map<int, MPI_File> file_handle_map;
+  std::unordered_map<int, int> remote_file_handle_map;
   std::atomic<int> next_file_handle;
+  bool mpp_open_enabled = false;
+  bool mpp_io_enabled = false;
 
 public:
   MPIIOBackend();

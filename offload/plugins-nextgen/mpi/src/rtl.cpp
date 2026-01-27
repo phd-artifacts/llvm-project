@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <cerrno>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -1403,6 +1404,154 @@ int ompfile_mpp_submit(uint64_t Token) {
   Events.emplace(Token, std::move(Event));
   return OFFLOAD_SUCCESS;
 }
+
+int ompfile_mpp_open(const char *Path, int Flags, int Mode, int *Handle) {
+  using namespace llvm::omp::target::plugin;
+  if (!Path || !Handle)
+    return OFFLOAD_FAIL;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  int RemoteHandle = -1;
+  int RemoteErrno = 0;
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfileOpen, EventTypeTy::OMPFILE_OPEN,
+      /*DstDeviceID=*/0, Path, Flags, Mode, &RemoteHandle,
+      &RemoteErrno);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+
+  Event.wait();
+  if (auto Error = Event.getError())
+    return OFFLOAD_FAIL;
+
+  if (RemoteHandle < 0) {
+    errno = RemoteErrno;
+    return OFFLOAD_FAIL;
+  }
+
+  *Handle = RemoteHandle;
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_close(int Handle) {
+  using namespace llvm::omp::target::plugin;
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  int CloseRet = -1;
+  int RemoteErrno = 0;
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfileClose, EventTypeTy::OMPFILE_CLOSE,
+      /*DstDeviceID=*/0, Handle, &CloseRet, &RemoteErrno);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+
+  Event.wait();
+  if (auto Error = Event.getError())
+    return OFFLOAD_FAIL;
+
+  if (CloseRet != 0) {
+    errno = RemoteErrno;
+    return OFFLOAD_FAIL;
+  }
+
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
+  using namespace llvm::omp::target::plugin;
+  if (!Buffer && Size > 0)
+    return OFFLOAD_FAIL;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  int IoRet = -1;
+  int RemoteErrno = 0;
+  uint64_t Bytes = 0;
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfilePread, EventTypeTy::OMPFILE_PREAD,
+      /*DstDeviceID=*/0, Handle, Offset, Buffer, Size, &IoRet,
+      &RemoteErrno, &Bytes);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+
+  Event.wait();
+  if (auto Error = Event.getError())
+    return OFFLOAD_FAIL;
+
+  if (IoRet != 0) {
+    errno = RemoteErrno;
+    return OFFLOAD_FAIL;
+  }
+
+  if (Bytes < Size) {
+    errno = EIO;
+    return OFFLOAD_FAIL;
+  }
+
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer, uint64_t Size) {
+  using namespace llvm::omp::target::plugin;
+  if (!Buffer && Size > 0)
+    return OFFLOAD_FAIL;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  int IoRet = -1;
+  int RemoteErrno = 0;
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfilePwrite, EventTypeTy::OMPFILE_PWRITE,
+      /*DstDeviceID=*/0, Handle, Offset, Buffer, Size, &IoRet,
+      &RemoteErrno);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+
+  Event.wait();
+  if (auto Error = Event.getError())
+    return OFFLOAD_FAIL;
+
+  if (IoRet != 0) {
+    errno = RemoteErrno;
+    return OFFLOAD_FAIL;
+  }
+
+  return OFFLOAD_SUCCESS;
+}
+
 
 int ompfile_mpp_poll(uint64_t Token, int *Done) {
   using namespace llvm::omp::target::plugin;
