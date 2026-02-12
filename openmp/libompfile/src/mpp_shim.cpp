@@ -16,6 +16,8 @@ using MppOpenFn = int (*)(const char *, int, int, int *);
 using MppCloseFn = int (*)(int);
 using MppPreadFn = int (*)(int, int64_t, void *, uint64_t);
 using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
+using MppSchedRequestFn = int (*)(const ompfile::OmpFileIORequest *,
+                                  const char *, ompfile::OmpFileIOPlan *);
 using MppPollFn = int (*)(uint64_t, int *);
 using MppFinalizeFn = int (*)();
 
@@ -26,6 +28,7 @@ struct MppApi {
   MppCloseFn close = nullptr;
   MppPreadFn pread = nullptr;
   MppPwriteFn pwrite = nullptr;
+  MppSchedRequestFn sched_request = nullptr;
   MppPollFn poll = nullptr;
   MppFinalizeFn finalize = nullptr;
 };
@@ -44,6 +47,8 @@ MppApi loadMppApi() {
                                                        "ompfile_mpp_pread"));
   loaded.pwrite = reinterpret_cast<MppPwriteFn>(dlsym(RTLD_DEFAULT,
                                                         "ompfile_mpp_pwrite"));
+  loaded.sched_request = reinterpret_cast<MppSchedRequestFn>(dlsym(
+      RTLD_DEFAULT, "ompfile_mpp_sched_request"));
   loaded.poll = reinterpret_cast<MppPollFn>(dlsym(RTLD_DEFAULT,
                                                   "ompfile_mpp_poll"));
   loaded.finalize = reinterpret_cast<MppFinalizeFn>(dlsym(RTLD_DEFAULT,
@@ -75,8 +80,9 @@ bool init() {
     return false;
   }
 
-  if (api.init() != 0) {
-    io_log("MPP shim init failed.\n");
+  int init_rc = api.init();
+  if (init_rc != 0) {
+    io_log("MPP shim init failed (rc=%d).\n", init_rc);
     return false;
   }
 
@@ -191,6 +197,28 @@ bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {
   }
 
   return api.pwrite(handle, offset, buffer, size) == 0;
+}
+
+bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,
+                  ompfile::OmpFileIOPlan &plan) {
+  if (request.PathSize > 0 && !path)
+    return false;
+
+  if (!init()) {
+    io_log("MPP scheduler request aborted because MPP init failed.\n");
+    return false;
+  }
+
+  auto &api = getMppApi();
+  if (!api.sched_request)
+    api = loadMppApi();
+
+  if (!api.sched_request) {
+    io_log("MPP shim not available (ompfile_mpp_sched_request missing).\n");
+    return false;
+  }
+
+  return api.sched_request(&request, path, &plan) == 0;
 }
 
 bool ping() {

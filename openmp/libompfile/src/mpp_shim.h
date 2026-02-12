@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstddef>
 
+#include "ompfile_sched.h"
+
 namespace ompfile {
 namespace mpp {
 
@@ -17,6 +19,8 @@ bool open(const char *path, int flags, int mode, int &handle);
 bool close(int handle);
 bool pread(int handle, int64_t offset, void *buffer, size_t size);
 bool pwrite(int handle, int64_t offset, const void *buffer, size_t size);
+bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,
+                  ompfile::OmpFileIOPlan &plan);
 
 } // namespace mpp
 } // namespace ompfile

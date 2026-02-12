@@ -6,13 +6,15 @@
 #include <cstddef> // for size_t
 #include <mpi.h>
 #include <unordered_map>
+#include <unordered_set>
 
 class MPIIOBackend : public IOBackend {
 private:
-  MPI_Comm file_comm;
+  MPI_Comm file_comm = MPI_COMM_NULL;
   int externally_initialized;
   std::unordered_map<int, MPI_File> file_handle_map;
   std::unordered_map<int, int> remote_file_handle_map;
+  std::unordered_set<int> logical_handle_set;
   std::atomic<int> next_file_handle;
   bool mpp_open_enabled = false;
   bool mpp_io_enabled = false;
