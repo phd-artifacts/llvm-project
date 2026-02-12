@@ -1371,12 +1371,21 @@ extern "C" {
 int ompfile_mpp_init() {
   using namespace llvm::omp::target::plugin;
   MPIPluginTy *Plugin = ActiveMPIPlugin.load();
-  if (!Plugin)
+  if (!Plugin) {
+    DP("ompfile_mpp_init: ActiveMPIPlugin is null.\n");
     return OFFLOAD_FAIL;
-  if (auto Err = Plugin->init())
+  }
+  if (auto Err = Plugin->init()) {
+    DP("ompfile_mpp_init: Plugin->init failed: %s\n",
+       llvm::toString(std::move(Err)).c_str());
     return OFFLOAD_FAIL;
-  return Plugin->ensureEventSystemInitializedForOmpFile() ? OFFLOAD_SUCCESS
-                                                          : OFFLOAD_FAIL;
+  }
+  if (!Plugin->ensureEventSystemInitializedForOmpFile()) {
+    DP("ompfile_mpp_init: ensureEventSystemInitializedForOmpFile failed.\n");
+    return OFFLOAD_FAIL;
+  }
+  DP("ompfile_mpp_init: success.\n");
+  return OFFLOAD_SUCCESS;
 }
 
 int ompfile_mpp_submit(uint64_t Token) {
@@ -1439,6 +1448,61 @@ int ompfile_mpp_open(const char *Path, int Flags, int Mode, int *Handle) {
   }
 
   *Handle = RemoteHandle;
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_sched_request(const OmpFileIORequest *Request, const char *Path,
+                              OmpFileIOPlan *Plan) {
+  using namespace llvm::omp::target::plugin;
+  if (!Request || !Plan) {
+    DP("ompfile_mpp_sched_request: missing Request/Plan buffers.\n");
+    return OFFLOAD_FAIL;
+  }
+  if (Request->PathSize > 0 && !Path) {
+    DP("ompfile_mpp_sched_request: missing path for request %llu.\n",
+       static_cast<unsigned long long>(Request->RequestId));
+    return OFFLOAD_FAIL;
+  }
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin) {
+    DP("ompfile_mpp_sched_request: ActiveMPIPlugin is null.\n");
+    return OFFLOAD_FAIL;
+  }
+
+  if (auto Err = Plugin->init()) {
+    DP("ompfile_mpp_sched_request: Plugin->init failed: %s\n",
+       llvm::toString(std::move(Err)).c_str());
+    return OFFLOAD_FAIL;
+  }
+
+  if (!Plugin->ensureEventSystemInitializedForOmpFile()) {
+    DP("ompfile_mpp_sched_request: ensureEventSystemInitializedForOmpFile failed.\n");
+    return OFFLOAD_FAIL;
+  }
+
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfileSchedRequest, EventTypeTy::OMPFILE_SCHED_REQUEST,
+      /*DstDeviceID=*/0, Request, Path, Plan);
+  if (Event.empty()) {
+    DP("ompfile_mpp_sched_request: failed to create event.\n");
+    return OFFLOAD_FAIL;
+  }
+
+  Event.wait();
+  if (auto Error = Event.getError()) {
+    DP("ompfile_mpp_sched_request: event returned error: %s\n",
+       llvm::toString(std::move(Error)).c_str());
+    return OFFLOAD_FAIL;
+  }
+
+  if (Plan->Status != 0) {
+    errno = Plan->Errno;
+    DP("ompfile_mpp_sched_request: non-zero plan status=%d errno=%d.\n",
+       Plan->Status, Plan->Errno);
+    return OFFLOAD_FAIL;
+  }
+
   return OFFLOAD_SUCCESS;
 }
 

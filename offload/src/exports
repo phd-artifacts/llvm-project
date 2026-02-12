@@ -76,6 +76,7 @@ VERS1.0 {
     ompfile_mpp_init;
     ompfile_mpp_submit;
     ompfile_mpp_open;
+    ompfile_mpp_sched_request;
     ompfile_mpp_close;
     ompfile_mpp_pread;
     ompfile_mpp_pwrite;
