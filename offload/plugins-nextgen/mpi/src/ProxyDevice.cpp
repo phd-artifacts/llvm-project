@@ -1,4 +1,5 @@
 #include <chrono>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -13,8 +14,11 @@
 #include <mutex>
 #include <tuple>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "EventSystem.h"
+#include "OmpFileHeadnodeManager.h"
 #include "RemotePluginManager.h"
 #include "Shared/APITypes.h"
 #include "mpi.h"
@@ -27,6 +31,13 @@
 #include "omp-tools.h"
 extern void llvm::omp::target::ompt::connectLibrary();
 #endif
+
+struct ProxyDevice;
+
+namespace {
+std::mutex ActiveProxyDeviceMutex;
+ProxyDevice *ActiveProxyDevice = nullptr;
+}
 
 /// Class that holds a stage pointer for data transfer between host and remote
 /// device (RAII)
@@ -62,10 +73,23 @@ struct AsyncInfoHandle {
 
 /// Event Implementations on Device side.
 struct ProxyDevice {
+  struct OmpFileHandleEntry {
+    int Rank = -1;
+    int RemoteHandle = -1;
+  };
+
+  struct OmpFileOpenCacheEntry {
+    int Fd = -1;
+    uint64_t RefCount = 0;
+  };
+
   ProxyDevice()
       : NumExecEventHandlers("OMPTARGET_NUM_EXEC_EVENT_HANDLERS", 1),
         NumDataEventHandlers("OMPTARGET_NUM_DATA_EVENT_HANDLERS", 1),
-        EventPollingRate("OMPTARGET_EVENT_POLLING_RATE", 1) {
+        EventPollingRate("OMPTARGET_EVENT_POLLING_RATE", 1),
+        OmpFileOpenCacheEnable("LIBOMPFILE_OPT_OPEN_CACHE", false),
+        OmpFileOpenCacheKeepOpen("LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN", true),
+        OmpFileOptStats("LIBOMPFILE_OPT_STATS", false) {
 #ifdef OMPT_SUPPORT
     // Initialize OMPT first
     llvm::omp::target::ompt::connectLibrary();
@@ -73,9 +97,33 @@ struct ProxyDevice {
 
     EventSystem.initialize();
     PluginManager.init();
+    if (EventSystem.LocalRank == getHeadnodeRank()) {
+      OmpFileHeadnodeManager::instance().initialize(EventSystem.WorldSize,
+                                                    getHeadnodeRank());
+      DP("Initialized global OMPFile headnode manager on rank %d\n",
+         EventSystem.LocalRank);
+    }
+    if (OmpFileOptStats || OmpFileOpenCacheEnable) {
+      fprintf(stderr,
+              "MPIProxyDevice --> OMPFile cache config rank=%d enabled=%d "
+              "keep_open=%d stats=%d\n",
+              EventSystem.LocalRank, (int)OmpFileOpenCacheEnable.get(),
+              (int)OmpFileOpenCacheKeepOpen.get(), (int)OmpFileOptStats.get());
+    }
+    {
+      const std::lock_guard<std::mutex> Lock(ActiveProxyDeviceMutex);
+      ActiveProxyDevice = this;
+    }
   }
 
   ~ProxyDevice() {
+    drainOmpFileOpenCache();
+    reportOmpFileStats("proxy-dtor");
+    {
+      const std::lock_guard<std::mutex> Lock(ActiveProxyDeviceMutex);
+      if (ActiveProxyDevice == this)
+        ActiveProxyDevice = nullptr;
+    }
     EventSystem.deinitialize();
     PluginManager.deinit();
   }
@@ -757,6 +805,173 @@ struct ProxyDevice {
     co_return (co_await RequestManager);
   }
 
+  bool canUseOmpFileOpenCache(int Flags) const {
+    if (!OmpFileOpenCacheEnable)
+      return false;
+    if (Flags & (O_CREAT | O_EXCL | O_TRUNC))
+      return false;
+    const int AccessMode = Flags & O_ACCMODE;
+    if (AccessMode != O_RDONLY && AccessMode != O_WRONLY &&
+        AccessMode != O_RDWR)
+      return false;
+    return true;
+  }
+
+  std::string getOmpFileOpenCacheKey(const char *Path, int Flags, int Mode) const {
+    std::string Key = Path ? Path : "";
+    Key.push_back('\x1f');
+    Key += std::to_string(Flags);
+    Key.push_back('\x1f');
+    Key += std::to_string(Mode);
+    return Key;
+  }
+
+  int openWithOptionalCache(const char *Path, int Flags, int Mode, int &ErrnoOut) {
+    ErrnoOut = 0;
+    OmpFileStatsOpenRequests.fetch_add(1, std::memory_order_relaxed);
+
+    if (!Path) {
+      ErrnoOut = EINVAL;
+      return -1;
+    }
+
+    if (!canUseOmpFileOpenCache(Flags)) {
+      OmpFileStatsOpenSyscalls.fetch_add(1, std::memory_order_relaxed);
+      int Fd = ::open(Path, Flags, static_cast<mode_t>(Mode));
+      if (Fd < 0)
+        ErrnoOut = errno;
+      return Fd;
+    }
+
+    const std::string Key = getOmpFileOpenCacheKey(Path, Flags, Mode);
+    const std::lock_guard<std::mutex> Lock(OmpFileOpenCacheMutex);
+    auto It = OmpFileOpenCacheByKey.find(Key);
+    if (It != OmpFileOpenCacheByKey.end()) {
+      It->second.RefCount += 1;
+      OmpFileStatsOpenCacheHits.fetch_add(1, std::memory_order_relaxed);
+      return It->second.Fd;
+    }
+
+    OmpFileStatsOpenSyscalls.fetch_add(1, std::memory_order_relaxed);
+    int Fd = ::open(Path, Flags, static_cast<mode_t>(Mode));
+    if (Fd < 0) {
+      ErrnoOut = errno;
+      return -1;
+    }
+
+    OmpFileOpenCacheByKey.emplace(Key, OmpFileOpenCacheEntry{Fd, 1});
+    OmpFileOpenCacheFdToKey[Fd] = Key;
+    return Fd;
+  }
+
+  int closeWithOptionalCache(int Fd, int &ErrnoOut) {
+    ErrnoOut = 0;
+    OmpFileStatsCloseRequests.fetch_add(1, std::memory_order_relaxed);
+
+    if (!OmpFileOpenCacheEnable) {
+      OmpFileStatsCloseSyscalls.fetch_add(1, std::memory_order_relaxed);
+      int Ret = ::close(Fd);
+      if (Ret != 0)
+        ErrnoOut = errno;
+      return Ret;
+    }
+
+    bool NeedSysClose = false;
+    {
+      const std::lock_guard<std::mutex> Lock(OmpFileOpenCacheMutex);
+      auto FdIt = OmpFileOpenCacheFdToKey.find(Fd);
+      if (FdIt != OmpFileOpenCacheFdToKey.end()) {
+        auto KeyIt = OmpFileOpenCacheByKey.find(FdIt->second);
+        if (KeyIt != OmpFileOpenCacheByKey.end()) {
+          OmpFileOpenCacheEntry &Entry = KeyIt->second;
+          if (Entry.RefCount == 0) {
+            ErrnoOut = EBADF;
+            return -1;
+          }
+
+          Entry.RefCount -= 1;
+          if (Entry.RefCount > 0 || OmpFileOpenCacheKeepOpen) {
+            OmpFileStatsCloseDeferred.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+          }
+
+          OmpFileOpenCacheByKey.erase(KeyIt);
+          OmpFileOpenCacheFdToKey.erase(FdIt);
+          NeedSysClose = true;
+        } else {
+          OmpFileOpenCacheFdToKey.erase(FdIt);
+          NeedSysClose = true;
+        }
+      } else {
+        NeedSysClose = true;
+      }
+    }
+
+    if (!NeedSysClose)
+      return 0;
+
+    OmpFileStatsCloseSyscalls.fetch_add(1, std::memory_order_relaxed);
+    int Ret = ::close(Fd);
+    if (Ret != 0)
+      ErrnoOut = errno;
+    return Ret;
+  }
+
+  void drainOmpFileOpenCache() {
+    std::vector<int> FdsToClose;
+    {
+      const std::lock_guard<std::mutex> Lock(OmpFileOpenCacheMutex);
+      if (OmpFileOpenCacheByKey.empty() && OmpFileOpenCacheFdToKey.empty())
+        return;
+
+      FdsToClose.reserve(OmpFileOpenCacheByKey.size());
+      for (const auto &It : OmpFileOpenCacheByKey)
+        FdsToClose.push_back(It.second.Fd);
+      OmpFileOpenCacheByKey.clear();
+      OmpFileOpenCacheFdToKey.clear();
+    }
+
+    for (int Fd : FdsToClose) {
+      OmpFileStatsCloseSyscalls.fetch_add(1, std::memory_order_relaxed);
+      (void)::close(Fd);
+    }
+  }
+
+  void reportOmpFileStats(const char *Scope) {
+    if (!OmpFileOptStats)
+      return;
+
+    uint64_t OpenReq = OmpFileStatsOpenRequests.load(std::memory_order_relaxed);
+    uint64_t OpenSys = OmpFileStatsOpenSyscalls.load(std::memory_order_relaxed);
+    uint64_t OpenHits =
+        OmpFileStatsOpenCacheHits.load(std::memory_order_relaxed);
+    uint64_t CloseReq =
+        OmpFileStatsCloseRequests.load(std::memory_order_relaxed);
+    uint64_t CloseSys =
+        OmpFileStatsCloseSyscalls.load(std::memory_order_relaxed);
+    uint64_t CloseDeferred =
+        OmpFileStatsCloseDeferred.load(std::memory_order_relaxed);
+    size_t CacheEntries = 0;
+
+    {
+      const std::lock_guard<std::mutex> Lock(OmpFileOpenCacheMutex);
+      CacheEntries = OmpFileOpenCacheByKey.size();
+    }
+
+    fprintf(stderr,
+            "MPIProxyDevice --> OMPFile stats [%s] rank=%d "
+            "open_req=%llu open_sys=%llu open_hits=%llu "
+            "close_req=%llu close_sys=%llu close_deferred=%llu "
+            "cache_entries=%zu\n",
+            Scope ? Scope : "unknown", EventSystem.LocalRank,
+            static_cast<unsigned long long>(OpenReq),
+            static_cast<unsigned long long>(OpenSys),
+            static_cast<unsigned long long>(OpenHits),
+            static_cast<unsigned long long>(CloseReq),
+            static_cast<unsigned long long>(CloseSys),
+            static_cast<unsigned long long>(CloseDeferred), CacheEntries);
+  }
+
   EventTy ompfileOpen(MPIRequestManagerTy RequestManager) {
     uint32_t PathSize = 0;
     int Flags = 0;
@@ -772,10 +987,11 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    int Fd = ::open(Path.c_str(), Flags, static_cast<mode_t>(Mode));
+    if (!Path.empty() && Path.back() == '\0')
+      Path.pop_back();
+
     int Errno = 0;
-    if (Fd < 0)
-      Errno = errno;
+    int Fd = openWithOptionalCache(Path.c_str(), Flags, Mode, Errno);
 
     RequestManager.send(&Fd, 1, MPI_INT);
     RequestManager.send(&Errno, 1, MPI_INT);
@@ -789,10 +1005,8 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    int Ret = ::close(Fd);
     int Errno = 0;
-    if (Ret != 0)
-      Errno = errno;
+    int Ret = closeWithOptionalCache(Fd, Errno);
 
     RequestManager.send(&Ret, 1, MPI_INT);
     RequestManager.send(&Errno, 1, MPI_INT);
@@ -871,6 +1085,454 @@ struct ProxyDevice {
   }
 
 
+
+  bool isWorkerRank(int Rank) const {
+    return Rank >= 0 && Rank < EventSystem.WorldSize - 1;
+  }
+
+  int getHeadnodeRank() const { return 0; }
+
+  OmpFileIOPlan buildSchedulePlan(const OmpFileIORequest &Request,
+                                  const char *Path) {
+    OmpFileHeadnodeManager &Manager = OmpFileHeadnodeManager::instance();
+    Manager.initialize(EventSystem.WorldSize, getHeadnodeRank());
+    return Manager.planRequest(Request, Path, EventSystem.LocalRank);
+  }
+
+  template <class EventFuncTy, typename... ArgsTy>
+    requires std::invocable<EventFuncTy, MPIRequestManagerTy, ArgsTy...>
+  EventTy createRankEvent(EventFuncTy EventFunc, EventTypeTy EventType,
+                          int TargetRank, int TargetDeviceId, ArgsTy... Args) {
+    if (!isWorkerRank(TargetRank)) {
+      REPORT("Invalid OMPFile target rank %d for event %s.\n", TargetRank,
+             EventTypeToString(EventType).c_str());
+      return EventTy{};
+    }
+
+    const int EventTag = EventSystem.createNewEventTag();
+    auto &EventComm = EventSystem.getNewEventComm(EventTag);
+    int EventNotificationInfo[] = {static_cast<int>(EventType), EventTag,
+                                   TargetDeviceId};
+    MPI_Request NotificationRequest = MPI_REQUEST_NULL;
+    const int MPIError =
+        MPI_Isend(EventNotificationInfo, 3, MPI_INT, TargetRank,
+                  static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                  EventSystem.GateThreadComm, &NotificationRequest);
+
+    if (MPIError != MPI_SUCCESS) {
+      REPORT("Failed to notify rank %d for OMPFile event %s. MPI error=%d\n",
+             TargetRank, EventTypeToString(EventType).c_str(), MPIError);
+      return EventTy{};
+    }
+
+    MPIRequestManagerTy RequestManager(EventComm, EventTag, TargetRank,
+                                       TargetDeviceId, {NotificationRequest});
+    RequestManager.EventType = EventNotificationInfo[0];
+
+    auto Event = EventFunc(std::move(RequestManager), Args...);
+    Event.setEventType(EventType);
+    return Event;
+  }
+
+  bool waitForEvent(EventTy &Event, const char *OpName) {
+    if (Event.empty()) {
+      errno = EIO;
+      REPORT("OMPFile %s failed to create event.\n", OpName);
+      return false;
+    }
+
+    Event.wait();
+    if (auto Error = Event.getError()) {
+      errno = EIO;
+      REPORT("OMPFile %s event failed: %s\n", OpName,
+             toString(std::move(Error)).c_str());
+      return false;
+    }
+    return true;
+  }
+
+  bool dispatchSchedRequest(const OmpFileIORequest &Request, const char *Path,
+                            OmpFileIOPlan &Plan) {
+    if (EventSystem.LocalRank == getHeadnodeRank()) {
+      Plan = buildSchedulePlan(Request, Path);
+    } else {
+      EventTy Event = createRankEvent(
+          OriginEvents::ompfileSchedRequest, EventTypeTy::OMPFILE_SCHED_REQUEST,
+          getHeadnodeRank(), /*TargetDeviceId=*/0, &Request, Path, &Plan);
+      if (!waitForEvent(Event, "sched_request"))
+        return false;
+    }
+
+    if (Plan.Status != 0) {
+      errno = Plan.Errno;
+      return false;
+    }
+
+    return true;
+  }
+
+  int registerRemoteHandle(int Rank, int RemoteHandle) {
+    const int LocalHandle =
+        NextOmpFileHandle.fetch_add(1, std::memory_order_relaxed);
+    const std::lock_guard<std::mutex> Lock(OmpFileHandleMutex);
+    OmpFileHandles[LocalHandle] = {Rank, RemoteHandle};
+    return LocalHandle;
+  }
+
+  bool findRemoteHandle(int LocalHandle, OmpFileHandleEntry &Entry) {
+    const std::lock_guard<std::mutex> Lock(OmpFileHandleMutex);
+    auto It = OmpFileHandles.find(LocalHandle);
+    if (It == OmpFileHandles.end()) {
+      errno = EBADF;
+      return false;
+    }
+    Entry = It->second;
+    return true;
+  }
+
+  bool eraseRemoteHandle(int LocalHandle, OmpFileHandleEntry &Entry) {
+    const std::lock_guard<std::mutex> Lock(OmpFileHandleMutex);
+    auto It = OmpFileHandles.find(LocalHandle);
+    if (It == OmpFileHandles.end()) {
+      errno = EBADF;
+      return false;
+    }
+    Entry = It->second;
+    OmpFileHandles.erase(It);
+    return true;
+  }
+
+  bool openOnRank(int Rank, const char *Path, int Flags, int Mode,
+                  int &RemoteHandle) {
+    if (!Path) {
+      errno = EINVAL;
+      return false;
+    }
+
+    if (Rank == EventSystem.LocalRank) {
+      int OpenErrno = 0;
+      int Fd = openWithOptionalCache(Path, Flags, Mode, OpenErrno);
+      if (Fd < 0)
+        errno = OpenErrno;
+      if (Fd < 0)
+        return false;
+      RemoteHandle = Fd;
+      return true;
+    }
+
+    int RemoteErrno = 0;
+    EventTy Event =
+        createRankEvent(OriginEvents::ompfileOpen, EventTypeTy::OMPFILE_OPEN,
+                        Rank, /*TargetDeviceId=*/0, Path, Flags, Mode,
+                        &RemoteHandle, &RemoteErrno);
+    if (!waitForEvent(Event, "open"))
+      return false;
+
+    if (RemoteHandle < 0) {
+      errno = RemoteErrno;
+      return false;
+    }
+    return true;
+  }
+
+  bool closeOnRank(int Rank, int RemoteHandle) {
+    if (Rank == EventSystem.LocalRank) {
+      int CloseErrno = 0;
+      if (closeWithOptionalCache(RemoteHandle, CloseErrno) != 0) {
+        errno = CloseErrno;
+        return false;
+      }
+      return true;
+    }
+
+    int CloseRet = -1;
+    int RemoteErrno = 0;
+    EventTy Event = createRankEvent(
+        OriginEvents::ompfileClose, EventTypeTy::OMPFILE_CLOSE, Rank,
+        /*TargetDeviceId=*/0, RemoteHandle, &CloseRet, &RemoteErrno);
+    if (!waitForEvent(Event, "close"))
+      return false;
+    if (CloseRet != 0) {
+      errno = RemoteErrno;
+      return false;
+    }
+    return true;
+  }
+
+  bool preadOnRank(int Rank, int RemoteHandle, int64_t Offset, void *Buffer,
+                   uint64_t Size) {
+    if (!Buffer && Size > 0) {
+      errno = EINVAL;
+      return false;
+    }
+
+    if (Rank == EventSystem.LocalRank) {
+      const ssize_t BytesRead =
+          ::pread(RemoteHandle, Buffer, Size, static_cast<off_t>(Offset));
+      if (BytesRead < 0)
+        return false;
+      if (static_cast<uint64_t>(BytesRead) < Size) {
+        errno = EIO;
+        return false;
+      }
+      return true;
+    }
+
+    int IoRet = -1;
+    int RemoteErrno = 0;
+    uint64_t Bytes = 0;
+    EventTy Event = createRankEvent(
+        OriginEvents::ompfilePread, EventTypeTy::OMPFILE_PREAD, Rank,
+        /*TargetDeviceId=*/0, RemoteHandle, Offset, Buffer, Size, &IoRet,
+        &RemoteErrno, &Bytes);
+    if (!waitForEvent(Event, "pread"))
+      return false;
+    if (IoRet != 0) {
+      errno = RemoteErrno;
+      return false;
+    }
+    if (Bytes < Size) {
+      errno = EIO;
+      return false;
+    }
+    return true;
+  }
+
+  bool pwriteOnRank(int Rank, int RemoteHandle, int64_t Offset,
+                    const void *Buffer, uint64_t Size) {
+    if (!Buffer && Size > 0) {
+      errno = EINVAL;
+      return false;
+    }
+
+    if (Rank == EventSystem.LocalRank) {
+      const ssize_t BytesWritten =
+          ::pwrite(RemoteHandle, Buffer, Size, static_cast<off_t>(Offset));
+      if (BytesWritten < 0)
+        return false;
+      if (static_cast<uint64_t>(BytesWritten) < Size) {
+        errno = EIO;
+        return false;
+      }
+      return true;
+    }
+
+    int IoRet = -1;
+    int RemoteErrno = 0;
+    EventTy Event = createRankEvent(
+        OriginEvents::ompfilePwrite, EventTypeTy::OMPFILE_PWRITE, Rank,
+        /*TargetDeviceId=*/0, RemoteHandle, Offset, Buffer, Size, &IoRet,
+        &RemoteErrno);
+    if (!waitForEvent(Event, "pwrite"))
+      return false;
+    if (IoRet != 0) {
+      errno = RemoteErrno;
+      return false;
+    }
+    return true;
+  }
+
+  int selectAggregatorRankForOpen(const char *Path, int Flags, int Mode) {
+    int Rank = isWorkerRank(EventSystem.LocalRank) ? EventSystem.LocalRank : 0;
+    const char *SchedulerEnv = std::getenv("LIBOMPFILE_SCHEDULER");
+    if (!SchedulerEnv || std::strcmp(SchedulerEnv, "HEADNODE") != 0)
+      return Rank;
+
+    OmpFileIORequest Request{};
+    Request.RequestId =
+        NextSchedRequestId.fetch_add(1, std::memory_order_relaxed);
+    Request.Op = OmpFileIOOp::OPEN;
+    Request.Flags = Flags;
+    Request.Mode = Mode;
+    Request.ClientRank = EventSystem.LocalRank;
+    Request.PathSize = Path ? static_cast<uint32_t>(std::strlen(Path) + 1) : 0;
+
+    OmpFileIOPlan Plan{};
+    if (!dispatchSchedRequest(Request, Path, Plan)) {
+      DP("OMPFile scheduler request failed in proxy rank %d; using local rank\n",
+         EventSystem.LocalRank);
+      return Rank;
+    }
+
+    if (isWorkerRank(Plan.AggregatorRank))
+      return Plan.AggregatorRank;
+    return Rank;
+  }
+
+  int mppInit() {
+    DP("ompfile_mpp_init via proxy runtime (rank=%d, world=%d)\n",
+       EventSystem.LocalRank, EventSystem.WorldSize);
+    if (EventSystem.LocalRank == getHeadnodeRank())
+      OmpFileHeadnodeManager::instance().initialize(EventSystem.WorldSize,
+                                                    getHeadnodeRank());
+    const auto State = EventSystem.EventSystemState.load();
+    if (State == EventSystemStateTy::RUNNING ||
+        State == EventSystemStateTy::INITIALIZED)
+      return OFFLOAD_SUCCESS;
+    return OFFLOAD_FAIL;
+  }
+
+  int mppSubmit(uint64_t Token) {
+    if (EventSystem.LocalRank == getHeadnodeRank()) {
+      const std::lock_guard<std::mutex> Lock(MppEventMutex);
+      CompletedMppTokens.insert(Token);
+      return OFFLOAD_SUCCESS;
+    }
+
+    EventTy Event = createRankEvent(OriginEvents::ompfilePing,
+                                    EventTypeTy::OMPFILE_PING,
+                                    getHeadnodeRank(), /*TargetDeviceId=*/0,
+                                    Token);
+    if (Event.empty())
+      return OFFLOAD_FAIL;
+
+    const std::lock_guard<std::mutex> Lock(MppEventMutex);
+    if (MppEvents.count(Token))
+      return OFFLOAD_FAIL;
+    MppEvents.emplace(Token, std::move(Event));
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppPoll(uint64_t Token, int *Done) {
+    if (!Done)
+      return OFFLOAD_FAIL;
+
+    const std::lock_guard<std::mutex> Lock(MppEventMutex);
+    auto CompletedIt = CompletedMppTokens.find(Token);
+    if (CompletedIt != CompletedMppTokens.end()) {
+      *Done = 1;
+      CompletedMppTokens.erase(CompletedIt);
+      return OFFLOAD_SUCCESS;
+    }
+
+    auto It = MppEvents.find(Token);
+    if (It == MppEvents.end())
+      return OFFLOAD_FAIL;
+
+    It->second.advance();
+    if (!It->second.done()) {
+      *Done = 0;
+      return OFFLOAD_SUCCESS;
+    }
+
+    *Done = 1;
+    auto Error = It->second.getError();
+    MppEvents.erase(It);
+    if (Error)
+      return OFFLOAD_FAIL;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppOpen(const char *Path, int Flags, int Mode, int *Handle) {
+    if (!Path || !Handle)
+      return OFFLOAD_FAIL;
+
+    const int Rank = selectAggregatorRankForOpen(Path, Flags, Mode);
+    int RemoteHandle = -1;
+    if (!openOnRank(Rank, Path, Flags, Mode, RemoteHandle))
+      return OFFLOAD_FAIL;
+
+    *Handle = registerRemoteHandle(Rank, RemoteHandle);
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppClose(int Handle) {
+    OmpFileHandleEntry Entry{};
+    if (!eraseRemoteHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+    if (!closeOnRank(Entry.Rank, Entry.RemoteHandle))
+      return OFFLOAD_FAIL;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppPread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
+    OmpFileHandleEntry Entry{};
+    if (!findRemoteHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+    if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size))
+      return OFFLOAD_FAIL;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppPwrite(int Handle, int64_t Offset, const void *Buffer, uint64_t Size) {
+    OmpFileHandleEntry Entry{};
+    if (!findRemoteHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+    if (!pwriteOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size))
+      return OFFLOAD_FAIL;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppSchedRequest(const OmpFileIORequest *Request, const char *Path,
+                      OmpFileIOPlan *Plan) {
+    if (!Request || !Plan)
+      return OFFLOAD_FAIL;
+    if (Request->PathSize > 0 && !Path)
+      return OFFLOAD_FAIL;
+    if (!dispatchSchedRequest(*Request, Path, *Plan)) {
+      DP("ompfile_mpp_sched_request failed in proxy runtime (rank=%d)\n",
+         EventSystem.LocalRank);
+      return OFFLOAD_FAIL;
+    }
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppFinalize() {
+    reportOmpFileStats("mpp-finalize-before-drain");
+    drainOmpFileOpenCache();
+    {
+      const std::lock_guard<std::mutex> Lock(MppEventMutex);
+      MppEvents.clear();
+      CompletedMppTokens.clear();
+    }
+    {
+      const std::lock_guard<std::mutex> Lock(OmpFileHandleMutex);
+      OmpFileHandles.clear();
+    }
+    reportOmpFileStats("mpp-finalize-after-drain");
+    return OFFLOAD_SUCCESS;
+  }
+
+  EventTy ompfileSchedRequest(MPIRequestManagerTy RequestManager) {
+    OmpFileIORequest Request{};
+    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
+
+    std::string Path;
+    if (Request.PathSize > 0) {
+      Path.resize(Request.PathSize, '\0');
+      RequestManager.receive(Path.data(), Request.PathSize, MPI_CHAR);
+    }
+
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    OmpFileIOPlan Plan =
+        buildSchedulePlan(Request, Request.PathSize > 0 ? Path.c_str() : nullptr);
+
+    RequestManager.send(&Plan, sizeof(Plan), MPI_BYTE);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfileSchedPlan(MPIRequestManagerTy RequestManager) {
+    OmpFileIOPlan Plan{};
+    RequestManager.receive(&Plan, sizeof(Plan), MPI_BYTE);
+
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    OmpFileIOCompletion Completion{};
+    Completion.RequestId = Plan.RequestId;
+    Completion.Status = 0;
+    Completion.Errno = 0;
+    Completion.Bytes = 0;
+
+    OmpFileHeadnodeManager::instance().completeRequest(Plan);
+
+    RequestManager.send(&Completion, sizeof(Completion), MPI_BYTE);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
 
   EventTy initAsyncInfo(MPIRequestManagerTy RequestManager) {
     __tgt_async_info *TgtAsyncInfoPtr = nullptr;
@@ -1193,6 +1855,12 @@ struct ProxyDevice {
       case OMPFILE_PWRITE:
         NewEvent = ompfilePwrite(std::move(RequestManager));
         break;
+      case OMPFILE_SCHED_REQUEST:
+        NewEvent = ompfileSchedRequest(std::move(RequestManager));
+        break;
+      case OMPFILE_SCHED_PLAN:
+        NewEvent = ompfileSchedPlan(std::move(RequestManager));
+        break;
       case INIT_ASYNC_INFO:
         NewEvent = initAsyncInfo(std::move(RequestManager));
         break;
@@ -1244,9 +1912,100 @@ private:
   IntEnvar NumDataEventHandlers;
   /// Polling rate period (us) used by event handlers.
   IntEnvar EventPollingRate;
+  BoolEnvar OmpFileOpenCacheEnable;
+  BoolEnvar OmpFileOpenCacheKeepOpen;
+  BoolEnvar OmpFileOptStats;
   // Mutex for AsyncInfoTable
   std::mutex TableMutex;
+  std::atomic<uint64_t> NextSchedRequestId{1};
+  std::mutex OmpFileHandleMutex;
+  std::unordered_map<int, OmpFileHandleEntry> OmpFileHandles;
+  std::atomic<int> NextOmpFileHandle{1};
+  std::mutex OmpFileOpenCacheMutex;
+  std::unordered_map<std::string, OmpFileOpenCacheEntry> OmpFileOpenCacheByKey;
+  std::unordered_map<int, std::string> OmpFileOpenCacheFdToKey;
+  std::atomic<uint64_t> OmpFileStatsOpenRequests{0};
+  std::atomic<uint64_t> OmpFileStatsOpenSyscalls{0};
+  std::atomic<uint64_t> OmpFileStatsOpenCacheHits{0};
+  std::atomic<uint64_t> OmpFileStatsCloseRequests{0};
+  std::atomic<uint64_t> OmpFileStatsCloseSyscalls{0};
+  std::atomic<uint64_t> OmpFileStatsCloseDeferred{0};
+  std::mutex MppEventMutex;
+  std::unordered_map<uint64_t, EventTy> MppEvents;
+  std::unordered_set<uint64_t> CompletedMppTokens;
 };
+
+static ProxyDevice *getActiveProxyDevice() {
+  const std::lock_guard<std::mutex> Lock(ActiveProxyDeviceMutex);
+  return ActiveProxyDevice;
+}
+
+extern "C" {
+int ompfile_mpp_init() {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppInit();
+}
+
+int ompfile_mpp_submit(uint64_t Token) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppSubmit(Token);
+}
+
+int ompfile_mpp_open(const char *Path, int Flags, int Mode, int *Handle) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppOpen(Path, Flags, Mode, Handle);
+}
+
+int ompfile_mpp_sched_request(const OmpFileIORequest *Request, const char *Path,
+                              OmpFileIOPlan *Plan) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppSchedRequest(Request, Path, Plan);
+}
+
+int ompfile_mpp_close(int Handle) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppClose(Handle);
+}
+
+int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppPread(Handle, Offset, Buffer, Size);
+}
+
+int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,
+                       uint64_t Size) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppPwrite(Handle, Offset, Buffer, Size);
+}
+
+int ompfile_mpp_poll(uint64_t Token, int *Done) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppPoll(Token, Done);
+}
+
+int ompfile_mpp_finalize() {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppFinalize();
+}
+} // extern "C"
 
 int main(int argc, char **argv) {
   ProxyDevice PD;

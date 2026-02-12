@@ -105,6 +105,7 @@ configure_file(
 
 llvm_add_tool(OPENMP llvm-offload-mpi-proxy-device
   src/ProxyDevice.cpp
+  src/OmpFileHeadnodeManager.cpp
   src/RemotePluginManager.cpp
   ${LIBOMPTARGET_SRC_DIR}/OpenMP/OMPT/Callback.cpp
 )
@@ -116,6 +117,7 @@ target_link_libraries(llvm-offload-mpi-proxy-device PRIVATE
   LLVMSupport
   omp
 )
+target_link_options(llvm-offload-mpi-proxy-device PRIVATE -Wl,--export-dynamic)
 
 add_dependencies(llvm-offload-mpi-proxy-device omp)
 

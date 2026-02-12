@@ -98,6 +98,8 @@ enum class EventTypeTy : unsigned int {
   OMPFILE_CLOSE, // Close a file on the remote worker.
   OMPFILE_PREAD, // Read from a file on the remote worker.
   OMPFILE_PWRITE, // Write to a file on the remote worker.
+  OMPFILE_SCHED_REQUEST, // Scheduler request (client -> scheduler).
+  OMPFILE_SCHED_PLAN, // Scheduler plan (scheduler -> aggregator).
 
   // Local event used to wait on other events.
   SYNC,
@@ -107,6 +109,50 @@ enum class EventTypeTy : unsigned int {
 };
 
 std::string EventTypeToString(EventTypeTy eventType);
+
+enum class OmpFileIOOp : uint32_t {
+  OPEN = 0,
+  CLOSE = 1,
+  PREAD = 2,
+  PWRITE = 3,
+  PREFETCH = 4,
+};
+
+struct OmpFileIORequest {
+  uint64_t RequestId = 0;
+  OmpFileIOOp Op = OmpFileIOOp::OPEN;
+  int32_t FileHandle = -1;
+  int32_t Flags = 0;
+  int32_t Mode = 0;
+  int32_t ClientRank = -1;
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+  uint32_t PathSize = 0;
+  uint32_t Reserved = 0;
+};
+
+struct OmpFileIOPlan {
+  uint64_t RequestId = 0;
+  int32_t AggregatorRank = -1;
+  int32_t RemoteHandle = -1;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+  uint32_t PlanFlags = 0;
+  uint32_t Reserved = 0;
+};
+
+struct OmpFileIOCompletion {
+  uint64_t RequestId = 0;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  uint64_t Bytes = 0;
+};
+
+static_assert(std::is_standard_layout_v<OmpFileIORequest>);
+static_assert(std::is_standard_layout_v<OmpFileIOPlan>);
+static_assert(std::is_standard_layout_v<OmpFileIOCompletion>);
 
 /// Coroutine events
 ///
@@ -372,6 +418,12 @@ EventTy ompfilePread(MPIRequestManagerTy RequestManager, int RemoteHandle,
 EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
                       int64_t Offset, const void *Buffer, uint64_t Size,
                       int *IoRet, int *RemoteErrno);
+EventTy ompfileSchedRequest(MPIRequestManagerTy RequestManager,
+                            const OmpFileIORequest *Request, const char *Path,
+                            OmpFileIOPlan *Plan);
+EventTy ompfileSchedPlan(MPIRequestManagerTy RequestManager,
+                         const OmpFileIOPlan *Plan,
+                         OmpFileIOCompletion *Completion);
 EventTy sync(EventTy Event);
 EventTy loadBinary(MPIRequestManagerTy RequestManager,
                    const __tgt_device_image *Image,

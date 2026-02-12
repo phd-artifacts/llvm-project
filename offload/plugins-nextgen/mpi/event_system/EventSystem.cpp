@@ -75,6 +75,8 @@ std::string EventTypeToString(EventTypeTy eventType) {
     case EventTypeTy::OMPFILE_CLOSE: return "OMPFILE_CLOSE";
     case EventTypeTy::OMPFILE_PREAD: return "OMPFILE_PREAD";
     case EventTypeTy::OMPFILE_PWRITE: return "OMPFILE_PWRITE";
+    case EventTypeTy::OMPFILE_SCHED_REQUEST: return "OMPFILE_SCHED_REQUEST";
+    case EventTypeTy::OMPFILE_SCHED_PLAN: return "OMPFILE_SCHED_PLAN";
     case EventTypeTy::SYNC: return "SYNC";
     case EventTypeTy::EXIT: return "EXIT";
     default: return "UNKNOWN_EVENT_TYPE";
@@ -552,6 +554,46 @@ EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
 
   RequestManager.receive(IoRet, 1, MPI_INT);
   RequestManager.receive(RemoteErrno, 1, MPI_INT);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileSchedRequest(MPIRequestManagerTy RequestManager,
+                            const OmpFileIORequest *Request,
+                            const char *Path, OmpFileIOPlan *Plan) {
+  if (!Request || !Plan)
+    co_return createError("OMPFile sched request missing buffers.");
+
+  if (Request->PathSize > 0 && !Path)
+    co_return createError("OMPFile sched request missing path.");
+
+  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
+  if (Request->PathSize > 0)
+    RequestManager.send(Path, Request->PathSize, MPI_CHAR);
+
+  RequestManager.receive(Plan, sizeof(*Plan), MPI_BYTE);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileSchedPlan(MPIRequestManagerTy RequestManager,
+                         const OmpFileIOPlan *Plan,
+                         OmpFileIOCompletion *Completion) {
+  if (!Plan || !Completion)
+    co_return createError("OMPFile sched plan missing buffers.");
+
+  RequestManager.send(Plan, sizeof(*Plan), MPI_BYTE);
+  RequestManager.receive(Completion, sizeof(*Completion), MPI_BYTE);
 
   if (auto Error = co_await RequestManager; Error)
     co_return Error;
