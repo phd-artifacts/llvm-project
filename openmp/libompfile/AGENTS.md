@@ -43,11 +43,16 @@ This scope covers libompfile backend behavior and MPP shim usage.
 - Open/read errors with MPP enabled: inspect both libompfile logs and proxy/EventSystem logs together.
 
 ## Commit instructions
+- Commit message format must follow Rodrigo Ceccato style:
+  - subject line: `docs: short message`
+  - body: larger description with concrete implementation steps and justification.
+  - preferred command form:
+    - `git commit -m "docs: short message" -m "Step 1: ...\nStep 2: ...\n\nJustification: ..."`
 - Commit libompfile code changes in this submodule first:
   - `cd /scratch/rodrigo.freitas/io-playground/llvm-infra/llvm-project`
   - `git add openmp/libompfile/...`
-  - `git commit -m "libompfile: ..."`
+  - `git commit -m "docs: short message" -m "Step 1: ...\nStep 2: ...\n\nJustification: ..."`
 - Then update the superproject pointer:
   - `cd /scratch/rodrigo.freitas/io-playground`
   - `git add llvm-infra/llvm-project`
-  - `git commit -m "chore(submodule): bump llvm-project"`
+  - `git commit -m "docs: short message" -m "Step 1: ...\nStep 2: ...\n\nJustification: ..."`

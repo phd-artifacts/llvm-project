@@ -38,11 +38,16 @@ This scope covers MPP event routing, scheduler selection, and proxy-side I/O dis
 - Use `LIBOMPFILE_OPT_STATS=1` to inspect open/close cache counters printed by proxy.
 
 ## Commit instructions
+- Commit message format must follow Rodrigo Ceccato style:
+  - subject line: `docs: short message`
+  - body: larger description with concrete implementation steps and justification.
+  - preferred command form:
+    - `git commit -m "docs: short message" -m "Step 1: ...\nStep 2: ...\n\nJustification: ..."`
 - Commit MPI plugin changes in this submodule first:
   - `cd /scratch/rodrigo.freitas/io-playground/llvm-infra/llvm-project`
   - `git add offload/plugins-nextgen/mpi/...`
-  - `git commit -m "mpi-plugin: ..."`
+  - `git commit -m "docs: short message" -m "Step 1: ...\nStep 2: ...\n\nJustification: ..."`
 - Then update the superproject pointer:
   - `cd /scratch/rodrigo.freitas/io-playground`
   - `git add llvm-infra/llvm-project`
-  - `git commit -m "chore(submodule): bump llvm-project"`
+  - `git commit -m "docs: short message" -m "Step 1: ...\nStep 2: ...\n\nJustification: ..."`
