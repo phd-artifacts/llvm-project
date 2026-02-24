@@ -282,6 +282,7 @@ public:
   ~OmpFileClientContext() { io_log("Destroying OmpFileClientContext\n"); }
 
   static OmpFileClientContext &getInstance() {
+    static bool finalize_registered = false;
     if (instance == nullptr) {
       io_log("Creating new libompfile client instance\n");
 
@@ -305,6 +306,10 @@ public:
       }
 
       instance = new OmpFileClientContext(backend);
+      if (!finalize_registered) {
+        std::atexit(&OmpFileClientContext::finalize);
+        finalize_registered = true;
+      }
     }
 
     return *instance;
@@ -351,6 +356,7 @@ public:
     if (instance != nullptr) {
       io_log("Finalizing OmpFileClientContext\n");
       delete instance;
+      instance = nullptr;
     }
   }
 };

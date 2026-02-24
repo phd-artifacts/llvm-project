@@ -41,3 +41,13 @@ This scope covers libompfile backend behavior and MPP shim usage.
 ## Failure triage
 - `MPP shim init failed`: check runtime symbol export path and plugin initialization.
 - Open/read errors with MPP enabled: inspect both libompfile logs and proxy/EventSystem logs together.
+
+## Commit instructions
+- Commit libompfile code changes in this submodule first:
+  - `cd /scratch/rodrigo.freitas/io-playground/llvm-infra/llvm-project`
+  - `git add openmp/libompfile/...`
+  - `git commit -m "libompfile: ..."`
+- Then update the superproject pointer:
+  - `cd /scratch/rodrigo.freitas/io-playground`
+  - `git add llvm-infra/llvm-project`
+  - `git commit -m "chore(submodule): bump llvm-project"`

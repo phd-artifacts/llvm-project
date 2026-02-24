@@ -36,3 +36,13 @@ This scope covers MPP event routing, scheduler selection, and proxy-side I/O dis
 - If `ActiveMPIPlugin is null`, confirm which process loads this code path and whether plugin init is valid in that role.
 - If scheduling seems ignored, verify `LIBOMPFILE_SCHEDULER=HEADNODE` in the process environment.
 - Use `LIBOMPFILE_OPT_STATS=1` to inspect open/close cache counters printed by proxy.
+
+## Commit instructions
+- Commit MPI plugin changes in this submodule first:
+  - `cd /scratch/rodrigo.freitas/io-playground/llvm-infra/llvm-project`
+  - `git add offload/plugins-nextgen/mpi/...`
+  - `git commit -m "mpi-plugin: ..."`
+- Then update the superproject pointer:
+  - `cd /scratch/rodrigo.freitas/io-playground`
+  - `git add llvm-infra/llvm-project`
+  - `git commit -m "chore(submodule): bump llvm-project"`

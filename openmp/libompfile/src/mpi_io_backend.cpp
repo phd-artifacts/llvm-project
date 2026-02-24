@@ -3,9 +3,10 @@
 #include "mpp_shim.h"
 #include <atomic>
 #include <cassert>
-#include <cstdlib>
-#include <fcntl.h>
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <mpi.h>
 #include <unordered_map>
 
@@ -65,9 +66,22 @@ MPIIOBackend::MPIIOBackend() {
     }
   }
 
+  two_phase_enabled = parseBoolEnv("LIBOMPFILE_OPT_TWO_PHASE", false);
+  two_phase_window_us =
+      parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_WINDOW_US", 0);
+  two_phase_max_batch_bytes =
+      parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_MAX_BATCH_BYTES", 0);
+
+  io_log("Two-phase guard config: enabled=%d window_us=%llu "
+         "max_batch_bytes=%llu (Phase 0 fallback path)\n",
+         static_cast<int>(two_phase_enabled),
+         static_cast<unsigned long long>(two_phase_window_us),
+         static_cast<unsigned long long>(two_phase_max_batch_bytes));
+
 }
 
 MPIIOBackend::~MPIIOBackend() {
+  reportPhase0Stats();
   ompfile::mpp::finalize();
   if (file_comm != MPI_COMM_NULL)
     MPI_Comm_free(&file_comm);
@@ -262,6 +276,10 @@ int MPIIOBackend::seek(int file_id, long offset) {
 }
 
 int MPIIOBackend::readAt(int file_id, long offset, void *data, size_t size) {
+  pread_request_count.fetch_add(1, std::memory_order_relaxed);
+  if (two_phase_enabled)
+    two_phase_fallback_count.fetch_add(1, std::memory_order_relaxed);
+
   const bool remote_only = mpp_open_enabled && mpp_io_enabled;
 
   io_log("Reading %zu bytes from file %d at offset %lld\n", size, file_id,
@@ -273,6 +291,8 @@ int MPIIOBackend::readAt(int file_id, long offset, void *data, size_t size) {
       io_log("Error: Missing remote handle for file %d\n", file_id);
       return -1;
     }
+    remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
+    remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
     if (!ompfile::mpp::pread(it->second, offset, data, size)) {
       io_log("MPP pread failed for file %d\n", file_id);
       return -1;
@@ -294,6 +314,8 @@ int MPIIOBackend::readAt(int file_id, long offset, void *data, size_t size) {
       io_log("Error: Missing remote handle for file %d\n", file_id);
       return -1;
     }
+    remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
+    remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
     if (!ompfile::mpp::pread(it->second, offset, data, size)) {
       io_log("MPP pread failed for file %d\n", file_id);
       return -1;
@@ -376,4 +398,71 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
 
 int MPIIOBackend::getNextFileHandle() {
   return next_file_handle.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool MPIIOBackend::parseBoolEnv(const char *name, bool default_value) {
+  const char *env = std::getenv(name);
+  if (!env)
+    return default_value;
+
+  if (env[0] == '1' && env[1] == '\0')
+    return true;
+  if (env[0] == '0' && env[1] == '\0')
+    return false;
+
+  io_log("Invalid boolean value for %s='%s'; using default=%d\n", name, env,
+         static_cast<int>(default_value));
+  return default_value;
+}
+
+uint64_t MPIIOBackend::parseUint64Env(const char *name, uint64_t default_value) {
+  const char *env = std::getenv(name);
+  if (!env)
+    return default_value;
+
+  errno = 0;
+  char *end_ptr = nullptr;
+  const unsigned long long value = std::strtoull(env, &end_ptr, 10);
+  if (errno != 0 || end_ptr == env || (end_ptr && *end_ptr != '\0')) {
+    io_log("Invalid integer value for %s='%s'; using default=%llu\n", name, env,
+           static_cast<unsigned long long>(default_value));
+    return default_value;
+  }
+
+  return static_cast<uint64_t>(value);
+}
+
+bool MPIIOBackend::shouldReportStats() {
+  return parseBoolEnv("LIBOMPFILE_OPT_STATS", false);
+}
+
+void MPIIOBackend::reportPhase0Stats() const {
+  if (!two_phase_enabled && !shouldReportStats())
+    return;
+
+  const uint64_t pread_reqs =
+      pread_request_count.load(std::memory_order_relaxed);
+  const uint64_t remote_events =
+      remote_pread_event_count.load(std::memory_order_relaxed);
+  const uint64_t remote_bytes =
+      remote_pread_bytes_total.load(std::memory_order_relaxed);
+  const uint64_t fallback_count =
+      two_phase_fallback_count.load(std::memory_order_relaxed);
+
+  const double avg_remote_bytes =
+      remote_events == 0 ? 0.0
+                         : static_cast<double>(remote_bytes) /
+                               static_cast<double>(remote_events);
+
+  io_log("Phase 0 stats: pread_requests=%llu remote_pread_events=%llu "
+         "remote_pread_bytes_total=%llu remote_pread_avg_bytes=%.2f "
+         "fallbacks=%llu two_phase_enabled=%d window_us=%llu "
+         "max_batch_bytes=%llu\n",
+         static_cast<unsigned long long>(pread_reqs),
+         static_cast<unsigned long long>(remote_events),
+         static_cast<unsigned long long>(remote_bytes), avg_remote_bytes,
+         static_cast<unsigned long long>(fallback_count),
+         static_cast<int>(two_phase_enabled),
+         static_cast<unsigned long long>(two_phase_window_us),
+         static_cast<unsigned long long>(two_phase_max_batch_bytes));
 }
