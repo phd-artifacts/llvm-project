@@ -1601,10 +1601,14 @@ int ompfile_mpp_close(int Handle) {
   return OFFLOAD_SUCCESS;
 }
 
-int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
+int ompfile_mpp_pread_ex(int Handle, int64_t Offset, void *Buffer,
+                         uint64_t Size, uint64_t *BytesRead) {
   using namespace llvm::omp::target::plugin;
   if (!Buffer && Size > 0)
     return OFFLOAD_FAIL;
+  if (!BytesRead)
+    return OFFLOAD_FAIL;
+  *BytesRead = 0;
 
   MPIPluginTy *Plugin = ActiveMPIPlugin.load();
   if (!Plugin)
@@ -1635,12 +1639,21 @@ int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
     return OFFLOAD_FAIL;
   }
 
-  if (Bytes < Size) {
-    errno = EIO;
+  if (Bytes > Size) {
+    errno = EPROTO;
     return OFFLOAD_FAIL;
   }
+  if (Bytes < Size)
+    std::memset(static_cast<char *>(Buffer) + Bytes, 0,
+                static_cast<size_t>(Size - Bytes));
+  *BytesRead = Bytes;
 
   return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
+  uint64_t BytesRead = 0;
+  return ompfile_mpp_pread_ex(Handle, Offset, Buffer, Size, &BytesRead);
 }
 
 int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer, uint64_t Size) {

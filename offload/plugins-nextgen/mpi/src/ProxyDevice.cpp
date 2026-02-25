@@ -1189,53 +1189,20 @@ struct ProxyDevice {
       return true;
     }
 
-    const auto *Segments =
-        static_cast<const OmpFileIOBatchSegment *>(Payload);
-    std::vector<OmpFileIOBatchPlanEntry> Entries(Request.SegmentCount);
-    const bool FailOnAnyError =
-        (Request.RequestFlags & OMPFILE_BATCH_REQ_FAIL_ON_ANY_ERROR) != 0;
-
-    bool SawError = false;
-    bool StopScheduling = false;
-    int FirstErrno = 0;
-    for (uint32_t I = 0; I < Request.SegmentCount; ++I) {
-      const OmpFileIOBatchSegment &Segment = Segments[I];
-      OmpFileIOBatchPlanEntry &Entry = Entries[I];
-      Entry.SegmentId = Segment.SegmentId;
-      Entry.Offset = Segment.Offset;
-      Entry.Size = Segment.Size;
-      Entry.PlanFlags = OMPFILE_BATCH_PLAN_BATCH_API;
-
-      if (StopScheduling) {
-        Entry.Status = -1;
-        Entry.Errno = ECANCELED;
-        continue;
-      }
-
-      OmpFileIORequest ScalarRequest{};
-      ScalarRequest.RequestId =
-          Segment.SegmentId != 0
-              ? Segment.SegmentId
-              : (Request.BatchId + static_cast<uint64_t>(I) + 1);
-      ScalarRequest.Op = OmpFileIOOp::PREAD;
-      ScalarRequest.FileHandle = Segment.FileHandle;
-      ScalarRequest.ClientRank = Segment.ClientRank;
-      ScalarRequest.Offset = Segment.Offset;
-      ScalarRequest.Size = Segment.Size;
-
-      OmpFileIOPlan ScalarPlan = buildSchedulePlan(ScalarRequest, nullptr);
-      Entry.AggregatorRank = ScalarPlan.AggregatorRank;
-      Entry.RemoteHandle = ScalarPlan.RemoteHandle;
-      Entry.Status = ScalarPlan.Status;
-      Entry.Errno = ScalarPlan.Errno;
-
-      if (Entry.Status != 0) {
-        SawError = true;
-        if (FirstErrno == 0)
-          FirstErrno = Entry.Errno;
-        if (FailOnAnyError)
-          StopScheduling = true;
-      }
+    const auto *Segments = static_cast<const OmpFileIOBatchSegment *>(Payload);
+    std::vector<OmpFileIOBatchPlanEntry> Entries;
+    OmpFileHeadnodeManager &Manager = OmpFileHeadnodeManager::instance();
+    Manager.initialize(EventSystem.WorldSize, getHeadnodeRank());
+    if (!Manager.planBatchRequest(Request, Segments, Plan, Entries,
+                                  EventSystem.LocalRank)) {
+      Plan.Status = -1;
+      Plan.Errno = EIO;
+      return true;
+    }
+    if (Entries.size() != Request.SegmentCount) {
+      Plan.Status = -1;
+      Plan.Errno = EPROTO;
+      return true;
     }
 
     const uint64_t EntryBytes =
@@ -1251,11 +1218,7 @@ struct ProxyDevice {
     if (!PlanPayload.empty())
       std::memcpy(PlanPayload.data(), Entries.data(), PlanPayload.size());
     Plan.PayloadBytes = static_cast<uint32_t>(PlanPayload.size());
-
-    if (SawError) {
-      Plan.Status = -1;
-      Plan.Errno = FirstErrno != 0 ? FirstErrno : EIO;
-    }
+    Plan.PlanFlags |= OMPFILE_BATCH_PLAN_BATCH_API;
 
     return true;
   }
@@ -1280,10 +1243,11 @@ struct ProxyDevice {
     int EventNotificationInfo[] = {static_cast<int>(EventType), EventTag,
                                    TargetDeviceId};
     MPI_Request NotificationRequest = MPI_REQUEST_NULL;
-    const int MPIError =
-        MPI_Isend(EventNotificationInfo, 3, MPI_INT, TargetRank,
-                  static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                  EventSystem.GateThreadComm, &NotificationRequest);
+    const int MPIError = ompfileWithMPICallLock([&]() {
+      return MPI_Isend(EventNotificationInfo, 3, MPI_INT, TargetRank,
+                       static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                       EventSystem.GateThreadComm, &NotificationRequest);
+    });
 
     if (MPIError != MPI_SUCCESS) {
       REPORT("Failed to notify rank %d for OMPFile event %s. MPI error=%d\n",
@@ -1488,21 +1452,25 @@ struct ProxyDevice {
   }
 
   bool preadOnRank(int Rank, int RemoteHandle, int64_t Offset, void *Buffer,
-                   uint64_t Size) {
+                   uint64_t Size, uint64_t *BytesReadOut = nullptr) {
     if (!Buffer && Size > 0) {
       errno = EINVAL;
       return false;
     }
+    if (BytesReadOut)
+      *BytesReadOut = 0;
 
     if (Rank == EventSystem.LocalRank) {
       const ssize_t BytesRead =
           ::pread(RemoteHandle, Buffer, Size, static_cast<off_t>(Offset));
       if (BytesRead < 0)
         return false;
-      if (static_cast<uint64_t>(BytesRead) < Size) {
-        errno = EIO;
-        return false;
-      }
+      const uint64_t Bytes = static_cast<uint64_t>(BytesRead);
+      if (Bytes < Size)
+        std::memset(static_cast<char *>(Buffer) + Bytes, 0,
+                    static_cast<size_t>(Size - Bytes));
+      if (BytesReadOut)
+        *BytesReadOut = Bytes;
       return true;
     }
 
@@ -1519,10 +1487,15 @@ struct ProxyDevice {
       errno = RemoteErrno;
       return false;
     }
-    if (Bytes < Size) {
-      errno = EIO;
+    if (Bytes > Size) {
+      errno = EPROTO;
       return false;
     }
+    if (Bytes < Size)
+      std::memset(static_cast<char *>(Buffer) + Bytes, 0,
+                  static_cast<size_t>(Size - Bytes));
+    if (BytesReadOut)
+      *BytesReadOut = Bytes;
     return true;
   }
 
@@ -1687,10 +1660,28 @@ struct ProxyDevice {
     OmpFileHandleEntry Entry{};
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
-    if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size))
+    uint64_t BytesRead = 0;
+    if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
+                     &BytesRead)) {
       return OFFLOAD_FAIL;
-    traceOmpFile("mppPread exit local=%d rank=%d remote=%d\n", Handle,
-                 Entry.Rank, Entry.RemoteHandle);
+    }
+    traceOmpFile("mppPread exit local=%d rank=%d remote=%d bytes=%llu\n",
+                 Handle, Entry.Rank, Entry.RemoteHandle,
+                 static_cast<unsigned long long>(BytesRead));
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppPreadEx(int Handle, int64_t Offset, void *Buffer, uint64_t Size,
+                 uint64_t *BytesRead) {
+    if (!BytesRead)
+      return OFFLOAD_FAIL;
+    *BytesRead = 0;
+    OmpFileHandleEntry Entry{};
+    if (!findRemoteHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+    if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
+                     BytesRead))
+      return OFFLOAD_FAIL;
     return OFFLOAD_SUCCESS;
   }
 
@@ -2060,10 +2051,12 @@ struct ProxyDevice {
       MPI_Message EventReqMsg;
       MPI_Status EventStatus;
       int HasReceived = false;
-      MPI_Improbe(MPI_ANY_SOURCE,
-                  static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                  EventSystem.GateThreadComm, &HasReceived, &EventReqMsg,
-                  MPI_STATUS_IGNORE);
+      ompfileWithMPICallLock([&]() {
+        return MPI_Improbe(MPI_ANY_SOURCE,
+                           static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                           EventSystem.GateThreadComm, &HasReceived,
+                           &EventReqMsg, MPI_STATUS_IGNORE);
+      });
 
       // If none was received, wait for `EVENT_POLLING_RATE`us for the next
       // check.
@@ -2079,7 +2072,9 @@ struct ProxyDevice {
       // - Target comm
       // - Event source rank
       int EventInfo[3];
-      MPI_Mrecv(EventInfo, 3, MPI_INT, &EventReqMsg, &EventStatus);
+      ompfileWithMPICallLock([&]() {
+        return MPI_Mrecv(EventInfo, 3, MPI_INT, &EventReqMsg, &EventStatus);
+      });
       const auto NewEventType = static_cast<EventTypeTy>(EventInfo[0]);
       MPIRequestManagerTy RequestManager(
           EventSystem.getNewEventComm(EventInfo[1]), EventInfo[1],
@@ -2304,6 +2299,14 @@ int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppPread(Handle, Offset, Buffer, Size);
+}
+
+int ompfile_mpp_pread_ex(int Handle, int64_t Offset, void *Buffer,
+                         uint64_t Size, uint64_t *BytesRead) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppPreadEx(Handle, Offset, Buffer, Size, BytesRead);
 }
 
 int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,

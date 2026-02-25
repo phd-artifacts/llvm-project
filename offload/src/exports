@@ -80,6 +80,7 @@ VERS1.0 {
     ompfile_mpp_sched_request_batch;
     ompfile_mpp_close;
     ompfile_mpp_pread;
+    ompfile_mpp_pread_ex;
     ompfile_mpp_pwrite;
     ompfile_mpp_poll;
     ompfile_mpp_finalize;
