@@ -1506,6 +1506,69 @@ int ompfile_mpp_sched_request(const OmpFileIORequest *Request, const char *Path,
   return OFFLOAD_SUCCESS;
 }
 
+int ompfile_mpp_sched_request_batch(
+    const OmpFileIOBatchRequest *Request, const void *RequestPayload,
+    uint64_t RequestPayloadBytes, OmpFileIOBatchPlan *Plan, void *PlanPayload,
+    uint64_t PlanPayloadCapBytes, uint64_t *PlanPayloadOutBytes) {
+  using namespace llvm::omp::target::plugin;
+  if (!Request || !Plan || !PlanPayloadOutBytes) {
+    DP("ompfile_mpp_sched_request_batch: missing Request/Plan buffers.\n");
+    return OFFLOAD_FAIL;
+  }
+  if (RequestPayloadBytes > 0 && !RequestPayload) {
+    DP("ompfile_mpp_sched_request_batch: missing request payload.\n");
+    return OFFLOAD_FAIL;
+  }
+  if (Request->PayloadBytes != RequestPayloadBytes) {
+    DP("ompfile_mpp_sched_request_batch: payload size mismatch request=%u "
+       "arg=%llu.\n",
+       Request->PayloadBytes,
+       static_cast<unsigned long long>(RequestPayloadBytes));
+    return OFFLOAD_FAIL;
+  }
+  if (PlanPayloadCapBytes > 0 && !PlanPayload) {
+    DP("ompfile_mpp_sched_request_batch: missing plan payload buffer.\n");
+    return OFFLOAD_FAIL;
+  }
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin) {
+    DP("ompfile_mpp_sched_request_batch: ActiveMPIPlugin is null.\n");
+    return OFFLOAD_FAIL;
+  }
+
+  if (auto Err = Plugin->init()) {
+    DP("ompfile_mpp_sched_request_batch: Plugin->init failed: %s\n",
+       llvm::toString(std::move(Err)).c_str());
+    return OFFLOAD_FAIL;
+  }
+
+  if (!Plugin->ensureEventSystemInitializedForOmpFile()) {
+    DP("ompfile_mpp_sched_request_batch: "
+       "ensureEventSystemInitializedForOmpFile failed.\n");
+    return OFFLOAD_FAIL;
+  }
+
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfileSchedBatchRequest,
+      EventTypeTy::OMPFILE_SCHED_REQUEST_BATCH, /*DstDeviceID=*/0, Request,
+      RequestPayload, RequestPayloadBytes, Plan, PlanPayload,
+      PlanPayloadCapBytes, PlanPayloadOutBytes);
+  if (Event.empty()) {
+    DP("ompfile_mpp_sched_request_batch: failed to create event.\n");
+    return OFFLOAD_FAIL;
+  }
+
+  Event.wait();
+  if (auto Error = Event.getError()) {
+    DP("ompfile_mpp_sched_request_batch: event returned error: %s\n",
+       llvm::toString(std::move(Error)).c_str());
+    return OFFLOAD_FAIL;
+  }
+
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_close(int Handle) {
   using namespace llvm::omp::target::plugin;
   MPIPluginTy *Plugin = ActiveMPIPlugin.load();

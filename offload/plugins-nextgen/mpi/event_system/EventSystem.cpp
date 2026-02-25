@@ -24,6 +24,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <vector>
 
 #include <mpi.h>
 #include <unistd.h>
@@ -78,6 +79,8 @@ std::string EventTypeToString(EventTypeTy eventType) {
     case EventTypeTy::OMPFILE_PREAD: return "OMPFILE_PREAD";
     case EventTypeTy::OMPFILE_PWRITE: return "OMPFILE_PWRITE";
     case EventTypeTy::OMPFILE_SCHED_REQUEST: return "OMPFILE_SCHED_REQUEST";
+    case EventTypeTy::OMPFILE_SCHED_REQUEST_BATCH:
+      return "OMPFILE_SCHED_REQUEST_BATCH";
     case EventTypeTy::OMPFILE_SCHED_PLAN: return "OMPFILE_SCHED_PLAN";
     case EventTypeTy::SYNC: return "SYNC";
     case EventTypeTy::EXIT: return "EXIT";
@@ -696,6 +699,56 @@ EventTy ompfileSchedRequest(MPIRequestManagerTy RequestManager,
     co_return Error;
 
   // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileSchedBatchRequest(MPIRequestManagerTy RequestManager,
+                                 const OmpFileIOBatchRequest *Request,
+                                 const void *RequestPayload,
+                                 uint64_t RequestPayloadBytes,
+                                 OmpFileIOBatchPlan *Plan, void *PlanPayload,
+                                 uint64_t PlanPayloadCapBytes,
+                                 uint64_t *PlanPayloadOutBytes) {
+  if (!Request || !Plan || !PlanPayloadOutBytes)
+    co_return createError("OMPFile sched batch request missing buffers.");
+  if (RequestPayloadBytes > 0 && !RequestPayload)
+    co_return createError("OMPFile sched batch request missing payload.");
+
+  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
+  RequestManager.send(&RequestPayloadBytes, 1, MPI_UINT64_T);
+  if (RequestPayloadBytes > 0)
+    RequestManager.sendInBatchs(const_cast<void *>(RequestPayload),
+                                RequestPayloadBytes);
+
+  RequestManager.receive(Plan, sizeof(*Plan), MPI_BYTE);
+  RequestManager.receive(PlanPayloadOutBytes, 1, MPI_UINT64_T);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  if (*PlanPayloadOutBytes > PlanPayloadCapBytes) {
+    std::vector<uint8_t> Scratch(static_cast<size_t>(*PlanPayloadOutBytes));
+    if (*PlanPayloadOutBytes > 0)
+      RequestManager.receiveInBatchs(Scratch.data(), *PlanPayloadOutBytes);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+    RequestManager.receive(nullptr, 0, MPI_BYTE);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+    co_return createError("OMPFile sched batch response payload too large.");
+  }
+
+  if (*PlanPayloadOutBytes > 0) {
+    if (!PlanPayload)
+      co_return createError("OMPFile sched batch response missing payload "
+                            "buffer.");
+    RequestManager.receiveInBatchs(PlanPayload, *PlanPayloadOutBytes);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+  }
+
+  // Event completion notification.
   RequestManager.receive(nullptr, 0, MPI_BYTE);
   co_return (co_await RequestManager);
 }

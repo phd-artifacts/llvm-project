@@ -16,6 +16,7 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1138,6 +1139,127 @@ struct ProxyDevice {
     return Manager.planRequest(Request, Path, EventSystem.LocalRank);
   }
 
+  bool buildScheduleBatchPlan(const OmpFileIOBatchRequest &Request,
+                              const void *Payload, uint64_t PayloadBytes,
+                              OmpFileIOBatchPlan &Plan,
+                              std::vector<uint8_t> &PlanPayload) {
+    Plan = {};
+    PlanPayload.clear();
+    Plan.AbiVersion = OMPFILE_SCHED_BATCH_ABI_VERSION;
+    Plan.SegmentCount = Request.SegmentCount;
+    Plan.BatchId = Request.BatchId;
+    Plan.PlanFlags = OMPFILE_BATCH_PLAN_BATCH_API;
+
+    if (Request.AbiVersion != OMPFILE_SCHED_BATCH_ABI_VERSION) {
+      Plan.Status = -1;
+      Plan.Errno = EPROTO;
+      return true;
+    }
+
+    if (Request.PayloadBytes != PayloadBytes) {
+      Plan.Status = -1;
+      Plan.Errno = EINVAL;
+      return true;
+    }
+
+    const uint64_t SegmentCount = static_cast<uint64_t>(Request.SegmentCount);
+    const uint64_t SegmentBytes =
+        SegmentCount * static_cast<uint64_t>(sizeof(OmpFileIOBatchSegment));
+    if (Request.SegmentCount != 0 &&
+        SegmentBytes / sizeof(OmpFileIOBatchSegment) != SegmentCount) {
+      Plan.Status = -1;
+      Plan.Errno = EOVERFLOW;
+      return true;
+    }
+
+    if (SegmentBytes != PayloadBytes) {
+      Plan.Status = -1;
+      Plan.Errno = EINVAL;
+      return true;
+    }
+
+    if (PayloadBytes > 0 && !Payload) {
+      Plan.Status = -1;
+      Plan.Errno = EINVAL;
+      return true;
+    }
+
+    if (Request.SegmentCount == 0) {
+      Plan.PayloadBytes = 0;
+      return true;
+    }
+
+    const auto *Segments =
+        static_cast<const OmpFileIOBatchSegment *>(Payload);
+    std::vector<OmpFileIOBatchPlanEntry> Entries(Request.SegmentCount);
+    const bool FailOnAnyError =
+        (Request.RequestFlags & OMPFILE_BATCH_REQ_FAIL_ON_ANY_ERROR) != 0;
+
+    bool SawError = false;
+    bool StopScheduling = false;
+    int FirstErrno = 0;
+    for (uint32_t I = 0; I < Request.SegmentCount; ++I) {
+      const OmpFileIOBatchSegment &Segment = Segments[I];
+      OmpFileIOBatchPlanEntry &Entry = Entries[I];
+      Entry.SegmentId = Segment.SegmentId;
+      Entry.Offset = Segment.Offset;
+      Entry.Size = Segment.Size;
+      Entry.PlanFlags = OMPFILE_BATCH_PLAN_BATCH_API;
+
+      if (StopScheduling) {
+        Entry.Status = -1;
+        Entry.Errno = ECANCELED;
+        continue;
+      }
+
+      OmpFileIORequest ScalarRequest{};
+      ScalarRequest.RequestId =
+          Segment.SegmentId != 0
+              ? Segment.SegmentId
+              : (Request.BatchId + static_cast<uint64_t>(I) + 1);
+      ScalarRequest.Op = OmpFileIOOp::PREAD;
+      ScalarRequest.FileHandle = Segment.FileHandle;
+      ScalarRequest.ClientRank = Segment.ClientRank;
+      ScalarRequest.Offset = Segment.Offset;
+      ScalarRequest.Size = Segment.Size;
+
+      OmpFileIOPlan ScalarPlan = buildSchedulePlan(ScalarRequest, nullptr);
+      Entry.AggregatorRank = ScalarPlan.AggregatorRank;
+      Entry.RemoteHandle = ScalarPlan.RemoteHandle;
+      Entry.Status = ScalarPlan.Status;
+      Entry.Errno = ScalarPlan.Errno;
+
+      if (Entry.Status != 0) {
+        SawError = true;
+        if (FirstErrno == 0)
+          FirstErrno = Entry.Errno;
+        if (FailOnAnyError)
+          StopScheduling = true;
+      }
+    }
+
+    const uint64_t EntryBytes =
+        static_cast<uint64_t>(Entries.size()) *
+        static_cast<uint64_t>(sizeof(OmpFileIOBatchPlanEntry));
+    if (EntryBytes > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+      Plan.Status = -1;
+      Plan.Errno = EOVERFLOW;
+      return true;
+    }
+
+    PlanPayload.resize(static_cast<size_t>(EntryBytes));
+    if (!PlanPayload.empty())
+      std::memcpy(PlanPayload.data(), Entries.data(), PlanPayload.size());
+    Plan.PayloadBytes = static_cast<uint32_t>(PlanPayload.size());
+
+    if (SawError) {
+      Plan.Status = -1;
+      Plan.Errno = FirstErrno != 0 ? FirstErrno : EIO;
+    }
+
+    return true;
+  }
+
   template <class EventFuncTy, typename... ArgsTy>
     requires std::invocable<EventFuncTy, MPIRequestManagerTy, ArgsTy...>
   EventTy createRankEvent(EventFuncTy EventFunc, EventTypeTy EventType,
@@ -1220,6 +1342,47 @@ struct ProxyDevice {
       errno = Plan.Errno;
       return false;
     }
+
+    return true;
+  }
+
+  bool dispatchSchedBatchRequest(const OmpFileIOBatchRequest &Request,
+                                 const void *RequestPayload,
+                                 uint64_t RequestPayloadBytes,
+                                 OmpFileIOBatchPlan &Plan, void *PlanPayload,
+                                 uint64_t PlanPayloadCapBytes,
+                                 uint64_t &PlanPayloadOutBytes) {
+    if (EventSystem.LocalRank == getHeadnodeRank()) {
+      std::vector<uint8_t> LocalPayload;
+      if (!buildScheduleBatchPlan(Request, RequestPayload, RequestPayloadBytes,
+                                  Plan, LocalPayload))
+        return false;
+
+      PlanPayloadOutBytes = LocalPayload.size();
+      if (PlanPayloadOutBytes > PlanPayloadCapBytes) {
+        errno = ENOBUFS;
+        return false;
+      }
+
+      if (PlanPayloadOutBytes > 0) {
+        if (!PlanPayload) {
+          errno = EINVAL;
+          return false;
+        }
+        std::memcpy(PlanPayload, LocalPayload.data(),
+                    static_cast<size_t>(PlanPayloadOutBytes));
+      }
+
+      return true;
+    }
+
+    EventTy Event = createRankEvent(
+        OriginEvents::ompfileSchedBatchRequest,
+        EventTypeTy::OMPFILE_SCHED_REQUEST_BATCH, getHeadnodeRank(),
+        /*TargetDeviceId=*/0, &Request, RequestPayload, RequestPayloadBytes,
+        &Plan, PlanPayload, PlanPayloadCapBytes, &PlanPayloadOutBytes);
+    if (!waitForEvent(Event, "sched_request_batch"))
+      return false;
 
     return true;
   }
@@ -1554,6 +1717,30 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
+  int mppSchedBatchRequest(const OmpFileIOBatchRequest *Request,
+                           const void *RequestPayload,
+                           uint64_t RequestPayloadBytes,
+                           OmpFileIOBatchPlan *Plan, void *PlanPayload,
+                           uint64_t PlanPayloadCapBytes,
+                           uint64_t *PlanPayloadOutBytes) {
+    if (!Request || !Plan || !PlanPayloadOutBytes)
+      return OFFLOAD_FAIL;
+    if (RequestPayloadBytes > 0 && !RequestPayload)
+      return OFFLOAD_FAIL;
+    if (PlanPayloadCapBytes > 0 && !PlanPayload)
+      return OFFLOAD_FAIL;
+
+    if (!dispatchSchedBatchRequest(*Request, RequestPayload,
+                                   RequestPayloadBytes, *Plan, PlanPayload,
+                                   PlanPayloadCapBytes, *PlanPayloadOutBytes)) {
+      DP("ompfile_mpp_sched_request_batch failed in proxy runtime (rank=%d)\n",
+         EventSystem.LocalRank);
+      return OFFLOAD_FAIL;
+    }
+
+    return OFFLOAD_SUCCESS;
+  }
+
   int mppFinalize() {
     size_t HandleCount = 0;
     {
@@ -1596,6 +1783,40 @@ struct ProxyDevice {
         buildSchedulePlan(Request, Request.PathSize > 0 ? Path.c_str() : nullptr);
 
     RequestManager.send(&Plan, sizeof(Plan), MPI_BYTE);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfileSchedBatchRequest(MPIRequestManagerTy RequestManager) {
+    OmpFileIOBatchRequest Request{};
+    uint64_t RequestPayloadBytes = 0;
+    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
+    RequestManager.receive(&RequestPayloadBytes, 1, MPI_UINT64_T);
+
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    std::vector<uint8_t> RequestPayload;
+    if (RequestPayloadBytes > 0) {
+      RequestPayload.resize(static_cast<size_t>(RequestPayloadBytes));
+      RequestManager.receiveInBatchs(RequestPayload.data(), RequestPayloadBytes);
+      if (auto Error = co_await RequestManager; Error)
+        co_return Error;
+    }
+
+    OmpFileIOBatchPlan Plan{};
+    std::vector<uint8_t> PlanPayload;
+    buildScheduleBatchPlan(Request,
+                           RequestPayload.empty() ? nullptr
+                                                  : RequestPayload.data(),
+                           RequestPayloadBytes, Plan, PlanPayload);
+
+    uint64_t PlanPayloadBytes = PlanPayload.size();
+    RequestManager.send(&Plan, sizeof(Plan), MPI_BYTE);
+    RequestManager.send(&PlanPayloadBytes, 1, MPI_UINT64_T);
+    if (PlanPayloadBytes > 0)
+      RequestManager.sendInBatchs(PlanPayload.data(), PlanPayloadBytes);
+
     RequestManager.send(nullptr, 0, MPI_BYTE);
     co_return (co_await RequestManager);
   }
@@ -1944,6 +2165,9 @@ struct ProxyDevice {
       case OMPFILE_SCHED_REQUEST:
         NewEvent = ompfileSchedRequest(std::move(RequestManager));
         break;
+      case OMPFILE_SCHED_REQUEST_BATCH:
+        NewEvent = ompfileSchedBatchRequest(std::move(RequestManager));
+        break;
       case OMPFILE_SCHED_PLAN:
         NewEvent = ompfileSchedPlan(std::move(RequestManager));
         break;
@@ -2054,6 +2278,18 @@ int ompfile_mpp_sched_request(const OmpFileIORequest *Request, const char *Path,
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppSchedRequest(Request, Path, Plan);
+}
+
+int ompfile_mpp_sched_request_batch(
+    const OmpFileIOBatchRequest *Request, const void *RequestPayload,
+    uint64_t RequestPayloadBytes, OmpFileIOBatchPlan *Plan, void *PlanPayload,
+    uint64_t PlanPayloadCapBytes, uint64_t *PlanPayloadOutBytes) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppSchedBatchRequest(Request, RequestPayload, RequestPayloadBytes,
+                                  Plan, PlanPayload, PlanPayloadCapBytes,
+                                  PlanPayloadOutBytes);
 }
 
 int ompfile_mpp_close(int Handle) {

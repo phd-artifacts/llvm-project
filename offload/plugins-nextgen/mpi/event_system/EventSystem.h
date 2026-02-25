@@ -99,6 +99,7 @@ enum class EventTypeTy : unsigned int {
   OMPFILE_PREAD, // Read from a file on the remote worker.
   OMPFILE_PWRITE, // Write to a file on the remote worker.
   OMPFILE_SCHED_REQUEST, // Scheduler request (client -> scheduler).
+  OMPFILE_SCHED_REQUEST_BATCH, // Batch scheduler request (client -> scheduler).
   OMPFILE_SCHED_PLAN, // Scheduler plan (scheduler -> aggregator).
 
   // Local event used to wait on other events.
@@ -143,6 +144,63 @@ struct OmpFileIOPlan {
   uint32_t Reserved = 0;
 };
 
+constexpr uint32_t OMPFILE_SCHED_BATCH_ABI_VERSION = 1u;
+
+enum OmpFileBatchRequestFlags : uint32_t {
+  OMPFILE_BATCH_REQ_FAIL_ON_ANY_ERROR = 1u << 0,
+  OMPFILE_BATCH_REQ_DISABLE_SCALAR_FALLBACK = 1u << 1,
+};
+
+enum OmpFileBatchPlanFlags : uint32_t {
+  OMPFILE_BATCH_PLAN_BATCH_API = 1u << 0,
+  OMPFILE_BATCH_PLAN_SCALAR_FALLBACK = 1u << 1,
+};
+
+struct OmpFileIOBatchSegment {
+  uint64_t SegmentId = 0;
+  int32_t FileHandle = -1;
+  int32_t ClientRank = -1;
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+  uint64_t PathKey = 0;
+  uint32_t SegmentFlags = 0;
+  uint32_t Reserved = 0;
+};
+
+struct OmpFileIOBatchRequest {
+  uint32_t AbiVersion = OMPFILE_SCHED_BATCH_ABI_VERSION;
+  uint32_t SegmentCount = 0;
+  uint32_t RequestFlags = 0;
+  uint32_t Reserved0 = 0;
+  uint64_t BatchId = 0;
+  uint32_t PayloadBytes = 0;
+  uint32_t Reserved1 = 0;
+};
+
+struct OmpFileIOBatchPlanEntry {
+  uint64_t SegmentId = 0;
+  int32_t AggregatorRank = -1;
+  int32_t RemoteHandle = -1;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+  uint32_t PlanFlags = 0;
+  uint32_t Reserved = 0;
+};
+
+struct OmpFileIOBatchPlan {
+  uint32_t AbiVersion = OMPFILE_SCHED_BATCH_ABI_VERSION;
+  uint32_t SegmentCount = 0;
+  uint32_t PlanFlags = 0;
+  uint32_t Reserved0 = 0;
+  uint64_t BatchId = 0;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  uint32_t PayloadBytes = 0;
+  uint32_t Reserved1 = 0;
+};
+
 struct OmpFileIOCompletion {
   uint64_t RequestId = 0;
   int32_t Status = 0;
@@ -152,6 +210,10 @@ struct OmpFileIOCompletion {
 
 static_assert(std::is_standard_layout_v<OmpFileIORequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOPlan>);
+static_assert(std::is_standard_layout_v<OmpFileIOBatchSegment>);
+static_assert(std::is_standard_layout_v<OmpFileIOBatchRequest>);
+static_assert(std::is_standard_layout_v<OmpFileIOBatchPlanEntry>);
+static_assert(std::is_standard_layout_v<OmpFileIOBatchPlan>);
 static_assert(std::is_standard_layout_v<OmpFileIOCompletion>);
 
 /// Coroutine events
@@ -421,6 +483,13 @@ EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
 EventTy ompfileSchedRequest(MPIRequestManagerTy RequestManager,
                             const OmpFileIORequest *Request, const char *Path,
                             OmpFileIOPlan *Plan);
+EventTy ompfileSchedBatchRequest(MPIRequestManagerTy RequestManager,
+                                 const OmpFileIOBatchRequest *Request,
+                                 const void *RequestPayload,
+                                 uint64_t RequestPayloadBytes,
+                                 OmpFileIOBatchPlan *Plan, void *PlanPayload,
+                                 uint64_t PlanPayloadCapBytes,
+                                 uint64_t *PlanPayloadOutBytes);
 EventTy ompfileSchedPlan(MPIRequestManagerTy RequestManager,
                          const OmpFileIOPlan *Plan,
                          OmpFileIOCompletion *Completion);
