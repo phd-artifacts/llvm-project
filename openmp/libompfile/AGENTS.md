@@ -42,18 +42,26 @@ This scope covers libompfile backend behavior and MPP shim usage.
 - `MPP shim init failed`: check runtime symbol export path and plugin initialization.
 - Open/read errors with MPP enabled: inspect both libompfile logs and proxy/EventSystem logs together.
 
+## Defensive checks
+- When modifying libompfile C/C++ code, add `assert(...)` around internal bounds
+  invariants (file-id ranges, map/vector index use, offset/size arithmetic).
+- Keep explicit error-path checks for external/runtime failures (`errno`/return
+  codes); do not rely on asserts for recoverable conditions.
+
 ## Commit instructions
 - Commit message format must follow Rodrigo Ceccato style:
-  - subject line: `docs: short message`
+  - subject line: `<scope>: short message`
+  - preferred scopes in this area: `libompfile`, `runtime`, `tests`, `docs`.
+  - use `docs:` only for docs-only commits.
   - body: concise bullet list with what changed and why.
   - do not use `Step 1:`, `Step 2:` style.
   - preferred command form:
-    - `git commit -m "docs: short message" -m "- updated docs with libompfile+MPP suite job\n- add info on how to read logs from test job\n- documented local test\n\nWhy:\n- keeps the workflow reproducible on sorgan."`
+    - `git commit -m "libompfile: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
 - Commit libompfile code changes in this submodule first:
   - `cd /scratch/rodrigo.freitas/io-playground/llvm-infra/llvm-project`
   - `git add openmp/libompfile/...`
-  - `git commit -m "docs: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
+  - `git commit -m "libompfile: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
 - Then update the superproject pointer:
   - `cd /scratch/rodrigo.freitas/io-playground`
   - `git add llvm-infra/llvm-project`
-  - `git commit -m "docs: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
+  - `git commit -m "runtime: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`

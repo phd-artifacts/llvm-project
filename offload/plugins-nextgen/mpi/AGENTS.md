@@ -39,16 +39,18 @@ This scope covers MPP event routing, scheduler selection, and proxy-side I/O dis
 
 ## Commit instructions
 - Commit message format must follow Rodrigo Ceccato style:
-  - subject line: `docs: short message`
+  - subject line: `<scope>: short message`
+  - preferred scopes in this area: `mpp`, `runtime`, `tests`, `docs`.
+  - use `docs:` only for docs-only commits.
   - body: concise bullet list with what changed and why.
   - do not use `Step 1:`, `Step 2:` style.
   - preferred command form:
-    - `git commit -m "docs: short message" -m "- updated docs with libompfile+MPP suite job\n- add info on how to read logs from test job\n- documented local test\n\nWhy:\n- keeps the workflow reproducible on sorgan."`
+    - `git commit -m "mpp: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
 - Commit MPI plugin changes in this submodule first:
   - `cd /scratch/rodrigo.freitas/io-playground/llvm-infra/llvm-project`
   - `git add offload/plugins-nextgen/mpi/...`
-  - `git commit -m "docs: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
+  - `git commit -m "mpp: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
 - Then update the superproject pointer:
   - `cd /scratch/rodrigo.freitas/io-playground`
   - `git add llvm-infra/llvm-project`
-  - `git commit -m "docs: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
+  - `git commit -m "runtime: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
