@@ -50,18 +50,32 @@ This scope covers libompfile backend behavior and MPP shim usage.
 
 ## Commit instructions
 - Commit message format must follow Rodrigo Ceccato style:
-  - subject line: `<scope>: short message`
-  - preferred scopes in this area: `libompfile`, `runtime`, `tests`, `docs`.
-  - use `docs:` only for docs-only commits.
+  - subject line: `[scope]: short message`
+  - scope describes the implementation change, not the subfolder name.
+  - preferred scopes in this area: `mpp-libompfile`, `runtime`, `tests`, `docs`.
+  - use `[docs]:` only for docs-only commits.
   - body: concise bullet list with what changed and why.
   - do not use `Step 1:`, `Step 2:` style.
   - preferred command form:
-    - `git commit -m "libompfile: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
+    - `git commit -m "[mpp-libompfile]: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
 - Commit libompfile code changes in this submodule first:
   - `cd /scratch/rodrigo.freitas/io-playground/llvm-infra/llvm-project`
   - `git add openmp/libompfile/...`
-  - `git commit -m "libompfile: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
+  - `git commit -m "[mpp-libompfile]: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
 - Then update the superproject pointer:
   - `cd /scratch/rodrigo.freitas/io-playground`
   - `git add llvm-infra/llvm-project`
-  - `git commit -m "runtime: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
+  - `git commit -m "[runtime]: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
+
+## MkDocs sync requirements
+- Any libompfile runtime behavior change must update MkDocs in the same workstream.
+- Keep `docs/roadmap.md` marked with:
+  - current phase/stage
+  - limitations and instability conditions
+  - observed speedups/slowdowns on sorgan
+  - current/expected challenges
+- Keep architecture and execution diagrams aligned with current code paths.
+- Ensure docs always cover:
+  - disk access pattern description
+  - execution flow description
+  - software architecture description
