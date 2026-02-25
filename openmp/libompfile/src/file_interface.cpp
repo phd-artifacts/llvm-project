@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstring>
+#include <mutex>
 #include <memory>
 #include <unordered_map>
 #include <thread>
@@ -69,7 +70,10 @@ public:
 
   int open(const char *filename) override {
     scheduleOpen(filename);
-    return backend.open(filename);
+    const int file_handle = backend.open(filename);
+    if (file_handle >= 0 && filename)
+      rememberOpenPath(file_handle, filename);
+    return file_handle;
   }
 
   int write(int file_handle, const void *data, size_t size) override {
@@ -84,7 +88,10 @@ public:
 
   int close(int file_handle) override {
     scheduleClose(file_handle);
-    return backend.close(file_handle);
+    const int rc = backend.close(file_handle);
+    if (rc == 0)
+      forgetOpenPath(file_handle);
+    return rc;
   }
 
   int seek(int file_handle, long offset) override {
@@ -92,8 +99,9 @@ public:
   }
 
   int readAt(int file_handle, long offset, void *data, size_t size) override {
-    scheduleRead(file_handle, offset, size);
-    return backend.readAt(file_handle, offset, data, size);
+    ompfile::OmpFileReadRequestContext context{};
+    buildReadContext(file_handle, offset, size, context);
+    return backend.readAtWithContext(context, data, size);
   }
 
   int writeAt(int file_handle, long offset, const void *data,
@@ -103,9 +111,16 @@ public:
   }
 
 private:
+  struct TrackedFileMetadata {
+    std::string Path;
+    uint64_t PathKey = 0;
+  };
+
   IOBackend &backend;
   int client_rank = -1;
   std::atomic<uint64_t> request_id{1};
+  std::mutex tracked_file_mutex;
+  std::unordered_map<int, TrackedFileMetadata> tracked_file_map;
 
   static int resolveClientRank() {
     int initialized = 0;
@@ -117,8 +132,51 @@ private:
     return rank;
   }
 
+  static uint64_t computePathKey(const char *path) {
+    // 64-bit FNV-1a hash for a stable per-path key in scheduler context.
+    constexpr uint64_t offset_basis = 1469598103934665603ULL;
+    constexpr uint64_t prime = 1099511628211ULL;
+    uint64_t hash = offset_basis;
+    if (!path)
+      return hash;
+
+    for (const unsigned char *p =
+             reinterpret_cast<const unsigned char *>(path);
+         *p != '\0'; ++p) {
+      hash ^= static_cast<uint64_t>(*p);
+      hash *= prime;
+    }
+    return hash;
+  }
+
+  void rememberOpenPath(int file_handle, const char *path) {
+    if (!path)
+      return;
+    TrackedFileMetadata metadata{};
+    metadata.Path = path;
+    metadata.PathKey = computePathKey(path);
+    const std::lock_guard<std::mutex> lock(tracked_file_mutex);
+    tracked_file_map[file_handle] = std::move(metadata);
+  }
+
+  void forgetOpenPath(int file_handle) {
+    const std::lock_guard<std::mutex> lock(tracked_file_mutex);
+    tracked_file_map.erase(file_handle);
+  }
+
+  bool getTrackedPath(int file_handle, std::string &path_out,
+                      uint64_t &path_key_out) {
+    const std::lock_guard<std::mutex> lock(tracked_file_mutex);
+    auto it = tracked_file_map.find(file_handle);
+    if (it == tracked_file_map.end())
+      return false;
+    path_out = it->second.Path;
+    path_key_out = it->second.PathKey;
+    return true;
+  }
+
   bool schedRequest(const ompfile::OmpFileIORequest &req,
-                    const char *path) {
+                    const char *path, ompfile::OmpFileIOPlan *plan_out) {
     ompfile::OmpFileIOPlan plan{};
     if (!ompfile::mpp::schedRequest(req, path, plan)) {
       io_log("HEADNODE scheduler request failed (global manager unavailable); "
@@ -130,6 +188,9 @@ private:
       errno = plan.Errno;
       return false;
     }
+
+    if (plan_out)
+      *plan_out = plan;
     return true;
   }
 
@@ -141,7 +202,7 @@ private:
     req.Op = ompfile::OmpFileIOOp::OPEN;
     req.ClientRank = client_rank;
     req.PathSize = static_cast<uint32_t>(std::strlen(path) + 1);
-    (void)schedRequest(req, path);
+    (void)schedRequest(req, path, nullptr);
   }
 
   void scheduleClose(int file_handle) {
@@ -150,18 +211,41 @@ private:
     req.Op = ompfile::OmpFileIOOp::CLOSE;
     req.ClientRank = client_rank;
     req.FileHandle = file_handle;
-    (void)schedRequest(req, nullptr);
+    (void)schedRequest(req, nullptr, nullptr);
   }
 
-  void scheduleRead(int file_handle, long offset, size_t size) {
+  void buildReadContext(int file_handle, long offset, size_t size,
+                        ompfile::OmpFileReadRequestContext &context) {
+    context = {};
+    context.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
+    context.FileHandle = file_handle;
+    context.ClientRank = client_rank;
+    context.Offset = static_cast<int64_t>(offset);
+    context.Size = static_cast<uint64_t>(size);
+    context.PathKey = static_cast<uint64_t>(static_cast<uint32_t>(file_handle));
+
+    std::string tracked_path;
+    if (getTrackedPath(file_handle, tracked_path, context.PathKey))
+      context.ContextFlags |= ompfile::OMPFILE_READ_CTX_HAS_PATH_KEY;
+
     ompfile::OmpFileIORequest req{};
-    req.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
+    req.RequestId = context.RequestId;
     req.Op = ompfile::OmpFileIOOp::PREAD;
     req.ClientRank = client_rank;
     req.FileHandle = file_handle;
     req.Offset = static_cast<int64_t>(offset);
     req.Size = static_cast<uint64_t>(size);
-    (void)schedRequest(req, nullptr);
+
+    ompfile::OmpFileIOPlan plan{};
+    if (schedRequest(req, nullptr, &plan)) {
+      context.ContextFlags |= ompfile::OMPFILE_READ_CTX_HAS_PLAN;
+      context.Plan = plan;
+    }
+  }
+
+  void scheduleRead(int file_handle, long offset, size_t size) {
+    ompfile::OmpFileReadRequestContext context{};
+    buildReadContext(file_handle, offset, size, context);
   }
 
   void scheduleWrite(int file_handle, long offset, size_t size) {
@@ -172,7 +256,7 @@ private:
     req.FileHandle = file_handle;
     req.Offset = static_cast<int64_t>(offset);
     req.Size = static_cast<uint64_t>(size);
-    (void)schedRequest(req, nullptr);
+    (void)schedRequest(req, nullptr, nullptr);
   }
 };
 
@@ -282,8 +366,8 @@ public:
   ~OmpFileClientContext() { io_log("Destroying OmpFileClientContext\n"); }
 
   static OmpFileClientContext &getInstance() {
-    static bool finalize_registered = false;
-    if (instance == nullptr) {
+    static std::once_flag init_once;
+    std::call_once(init_once, []() {
       io_log("Creating new libompfile client instance\n");
 
       IOBackendTy backend = IOBackendTy::MPI; // Default
@@ -306,11 +390,8 @@ public:
       }
 
       instance = new OmpFileClientContext(backend);
-      if (!finalize_registered) {
-        std::atexit(&OmpFileClientContext::finalize);
-        finalize_registered = true;
-      }
-    }
+      std::atexit(&OmpFileClientContext::finalize);
+    });
 
     return *instance;
   }

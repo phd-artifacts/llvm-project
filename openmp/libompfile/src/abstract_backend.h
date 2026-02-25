@@ -1,6 +1,7 @@
 #ifndef OMPFILE_ABSTRACT_BACKEND_H
 #define OMPFILE_ABSTRACT_BACKEND_H
 
+#include "ompfile_sched.h"
 #include <stddef.h>
 
 enum class IOBackendTy {
@@ -20,6 +21,10 @@ public:
   virtual int close(int file_id) = 0;
   virtual int seek(int file_id, long offset) = 0;
   virtual int readAt(int file_id, long offset, void *data, size_t size) = 0;
+  virtual int readAtWithContext(const ompfile::OmpFileReadRequestContext &ctx,
+                                void *data, size_t size) {
+    return readAt(ctx.FileHandle, static_cast<long>(ctx.Offset), data, size);
+  }
   virtual int writeAt(int file_id, long offset, const void *data,
                       size_t size) = 0;
 };
