@@ -14,9 +14,11 @@
 #include "EventSystem.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -82,6 +84,88 @@ std::string EventTypeToString(EventTypeTy eventType) {
     default: return "UNKNOWN_EVENT_TYPE";
   }
 }
+
+namespace {
+
+bool ompfileTraceEnabled() {
+  static const bool Enabled = []() {
+    const char *Env = std::getenv("LIBOMPFILE_DEBUG_TRACE");
+    return Env && Env[0] == '1' && Env[1] == '\0';
+  }();
+  return Enabled;
+}
+
+bool ompfileMpiErrorsReturnEnabled() {
+  static const bool Enabled = []() {
+    const char *Env = std::getenv("LIBOMPFILE_DEBUG_MPI_ERRORS_RETURN");
+    return Env && Env[0] == '1' && Env[1] == '\0';
+  }();
+  return Enabled;
+}
+
+uint64_t nextTraceSeq() {
+  static std::atomic<uint64_t> Seq{1};
+  return Seq.fetch_add(1, std::memory_order_relaxed);
+}
+
+unsigned long threadIdHash() {
+  return static_cast<unsigned long>(
+      std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+void ompfileTrace(const char *Fmt, ...) {
+  if (!ompfileTraceEnabled())
+    return;
+
+  va_list Args;
+  va_start(Args, Fmt);
+  fprintf(stderr, "[ompfile-mpi][trace][seq=%llu][pid=%d][tid=%lu] ",
+          static_cast<unsigned long long>(nextTraceSeq()), getpid(),
+          threadIdHash());
+  vfprintf(stderr, Fmt, Args);
+  va_end(Args);
+}
+
+unsigned long long requestBits(const MPI_Request &Req) {
+  unsigned long long Bits = 0;
+  static_assert(sizeof(Bits) >= sizeof(MPI_Request),
+                "Cannot safely print MPI_Request payload.");
+  std::memcpy(&Bits, &Req, sizeof(MPI_Request));
+  return Bits;
+}
+
+void traceRequestSample(const llvm::SmallVector<MPI_Request> &Requests) {
+  if (!ompfileTraceEnabled())
+    return;
+
+  constexpr size_t MaxSample = 6;
+  char Buf[256];
+  size_t Offset = 0;
+  Offset += static_cast<size_t>(
+      std::snprintf(Buf + Offset, sizeof(Buf) - Offset, "["));
+  for (size_t I = 0; I < Requests.size() && I < MaxSample &&
+                   Offset + 32 < sizeof(Buf);
+       ++I) {
+    Offset += static_cast<size_t>(std::snprintf(
+        Buf + Offset, sizeof(Buf) - Offset, "%s0x%llx", I == 0 ? "" : ",",
+        requestBits(Requests[static_cast<int>(I)])));
+  }
+  if (Requests.size() > MaxSample && Offset + 8 < sizeof(Buf))
+    Offset += static_cast<size_t>(
+        std::snprintf(Buf + Offset, sizeof(Buf) - Offset, ",..."));
+  std::snprintf(Buf + Offset, sizeof(Buf) - Offset, "]");
+  ompfileTrace("MPI request sample count=%zu values=%s\n", Requests.size(), Buf);
+}
+
+void configureCommErrhandlerForDebug(MPI_Comm Comm, const char *Label) {
+  if (!ompfileMpiErrorsReturnEnabled() || Comm == MPI_COMM_NULL)
+    return;
+  const int Rc = MPI_Comm_set_errhandler(Comm, MPI_ERRORS_RETURN);
+  ompfileTrace("configure errhandler label=%s rc=%d\n",
+               Label ? Label : "(unknown)", Rc);
+}
+
+} // namespace
 
 /// Resumes the most recent incomplete coroutine in the list.
 void EventTy::resume() {
@@ -183,18 +267,48 @@ void MPIRequestManagerTy::receiveInBatchs(void *Buffer, int64_t Size) {
 /// Coroutine that waits until all pending requests finish.
 EventTy MPIRequestManagerTy::wait() {
   int RequestsCompleted = false;
+  uint64_t PollIterations = 0;
+  ompfileTrace("MPIRequestManagerTy::wait enter this=%p req_count=%zu "
+               "other_rank=%d tag=%d event_type=%d\n",
+               static_cast<void *>(this), Requests.size(), OtherRank, Tag,
+               EventType);
+  traceRequestSample(Requests);
 
   while (!RequestsCompleted) {
+    ++PollIterations;
+    if (ompfileTraceEnabled() &&
+        (PollIterations <= 3 || (PollIterations % 1024) == 0)) {
+      ompfileTrace("MPIRequestManagerTy::wait poll this=%p iter=%llu "
+                   "req_count=%zu\n",
+                   static_cast<void *>(this),
+                   static_cast<unsigned long long>(PollIterations),
+                   Requests.size());
+      traceRequestSample(Requests);
+    }
+
     int MPIError = MPI_Testall(Requests.size(), Requests.data(),
                                &RequestsCompleted, MPI_STATUSES_IGNORE);
 
-    if (MPIError != MPI_SUCCESS)
+    if (MPIError != MPI_SUCCESS) {
+      char ErrBuf[MPI_MAX_ERROR_STRING] = {0};
+      int ErrLen = 0;
+      MPI_Error_string(MPIError, ErrBuf, &ErrLen);
+      ompfileTrace("MPIRequestManagerTy::wait MPI_Testall error this=%p "
+                   "iter=%llu mpi_error=%d msg=%.*s\n",
+                   static_cast<void *>(this),
+                   static_cast<unsigned long long>(PollIterations), MPIError,
+                   ErrLen, ErrBuf);
+      traceRequestSample(Requests);
       co_return createError("Waiting of MPI requests failed with code %d",
                             MPIError);
+    }
 
     co_await std::suspend_always{};
   }
 
+  ompfileTrace("MPIRequestManagerTy::wait success this=%p poll_iters=%llu\n",
+               static_cast<void *>(this),
+               static_cast<unsigned long long>(PollIterations));
   Requests.clear();
 
   co_return llvm::Error::success();
@@ -945,13 +1059,15 @@ bool EventSystemTy::createLocalMPIContext() {
   MPIError = MPI_Comm_dup(MPI_COMM_WORLD, &GateThreadComm);
   CHECK(MPIError == MPI_SUCCESS,
         "Failed to create gate thread MPI comm with error %d\n", MPIError);
+  configureCommErrhandlerForDebug(GateThreadComm, "GateThreadComm");
 
   // Create event comm pool.
   EventCommPool.resize(NumMPIComms.get(), MPI_COMM_NULL);
   for (auto &Comm : EventCommPool) {
-    MPI_Comm_dup(MPI_COMM_WORLD, &Comm);
+    MPIError = MPI_Comm_dup(MPI_COMM_WORLD, &Comm);
     CHECK(MPIError == MPI_SUCCESS,
           "Failed to create MPI comm pool with error %d\n", MPIError);
+    configureCommErrhandlerForDebug(Comm, "EventCommPool");
   }
 
   // Get local MPI process description.

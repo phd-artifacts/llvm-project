@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <tuple>
 #include <vector>
 #include <unordered_map>
@@ -37,6 +39,24 @@ struct ProxyDevice;
 namespace {
 std::mutex ActiveProxyDeviceMutex;
 ProxyDevice *ActiveProxyDevice = nullptr;
+
+bool ompfileProxyTraceEnabled() {
+  static const bool Enabled = []() {
+    const char *Env = std::getenv("LIBOMPFILE_DEBUG_TRACE");
+    return Env && Env[0] == '1' && Env[1] == '\0';
+  }();
+  return Enabled;
+}
+
+uint64_t nextProxyTraceSeq() {
+  static std::atomic<uint64_t> Seq{1};
+  return Seq.fetch_add(1, std::memory_order_relaxed);
+}
+
+unsigned long proxyThreadIdHash() {
+  return static_cast<unsigned long>(
+      std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
 }
 
 /// Class that holds a stage pointer for data transfer between host and remote
@@ -82,6 +102,20 @@ struct ProxyDevice {
     int Fd = -1;
     uint64_t RefCount = 0;
   };
+
+  void traceOmpFile(const char *Fmt, ...) const {
+    if (!ompfileProxyTraceEnabled())
+      return;
+
+    va_list Args;
+    va_start(Args, Fmt);
+    fprintf(stderr,
+            "[ompfile-proxy][trace][seq=%llu][pid=%d][tid=%lu][rank=%d] ",
+            static_cast<unsigned long long>(nextProxyTraceSeq()), getpid(),
+            proxyThreadIdHash(), EventSystem.LocalRank);
+    vfprintf(stderr, Fmt, Args);
+    va_end(Args);
+  }
 
   ProxyDevice()
       : NumExecEventHandlers("OMPTARGET_NUM_EXEC_EVENT_HANDLERS", 1),
@@ -981,11 +1015,16 @@ struct ProxyDevice {
     RequestManager.receive(&Flags, 1, MPI_INT);
     RequestManager.receive(&Mode, 1, MPI_INT);
 
-    std::string Path(PathSize, '\0');
-    RequestManager.receive(Path.data(), PathSize, MPI_CHAR);
-
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
+
+    std::string Path;
+    if (PathSize > 0) {
+      Path.resize(PathSize, '\0');
+      RequestManager.receive(Path.data(), PathSize, MPI_CHAR);
+      if (auto Error = co_await RequestManager; Error)
+        co_return Error;
+    }
 
     if (!Path.empty() && Path.back() == '\0')
       Path.pop_back();
@@ -1103,9 +1142,14 @@ struct ProxyDevice {
     requires std::invocable<EventFuncTy, MPIRequestManagerTy, ArgsTy...>
   EventTy createRankEvent(EventFuncTy EventFunc, EventTypeTy EventType,
                           int TargetRank, int TargetDeviceId, ArgsTy... Args) {
+    traceOmpFile("createRankEvent enter type=%s target_rank=%d target_dev=%d\n",
+                 EventTypeToString(EventType).c_str(), TargetRank,
+                 TargetDeviceId);
     if (!isWorkerRank(TargetRank)) {
       REPORT("Invalid OMPFile target rank %d for event %s.\n", TargetRank,
              EventTypeToString(EventType).c_str());
+      traceOmpFile("createRankEvent invalid target type=%s rank=%d\n",
+                   EventTypeToString(EventType).c_str(), TargetRank);
       return EventTy{};
     }
 
@@ -1122,6 +1166,8 @@ struct ProxyDevice {
     if (MPIError != MPI_SUCCESS) {
       REPORT("Failed to notify rank %d for OMPFile event %s. MPI error=%d\n",
              TargetRank, EventTypeToString(EventType).c_str(), MPIError);
+      traceOmpFile("createRankEvent notify fail type=%s rank=%d mpi_err=%d\n",
+                   EventTypeToString(EventType).c_str(), TargetRank, MPIError);
       return EventTy{};
     }
 
@@ -1131,13 +1177,18 @@ struct ProxyDevice {
 
     auto Event = EventFunc(std::move(RequestManager), Args...);
     Event.setEventType(EventType);
+    traceOmpFile("createRankEvent exit type=%s tag=%d target_rank=%d\n",
+                 EventTypeToString(EventType).c_str(), EventTag, TargetRank);
     return Event;
   }
 
   bool waitForEvent(EventTy &Event, const char *OpName) {
+    traceOmpFile("waitForEvent enter op=%s empty=%d\n", OpName ? OpName : "?",
+                 static_cast<int>(Event.empty()));
     if (Event.empty()) {
       errno = EIO;
       REPORT("OMPFile %s failed to create event.\n", OpName);
+      traceOmpFile("waitForEvent empty op=%s\n", OpName ? OpName : "?");
       return false;
     }
 
@@ -1146,8 +1197,10 @@ struct ProxyDevice {
       errno = EIO;
       REPORT("OMPFile %s event failed: %s\n", OpName,
              toString(std::move(Error)).c_str());
+      traceOmpFile("waitForEvent error op=%s\n", OpName ? OpName : "?");
       return false;
     }
+    traceOmpFile("waitForEvent success op=%s\n", OpName ? OpName : "?");
     return true;
   }
 
@@ -1176,6 +1229,8 @@ struct ProxyDevice {
         NextOmpFileHandle.fetch_add(1, std::memory_order_relaxed);
     const std::lock_guard<std::mutex> Lock(OmpFileHandleMutex);
     OmpFileHandles[LocalHandle] = {Rank, RemoteHandle};
+    traceOmpFile("registerRemoteHandle local=%d rank=%d remote=%d map_size=%zu\n",
+                 LocalHandle, Rank, RemoteHandle, OmpFileHandles.size());
     return LocalHandle;
   }
 
@@ -1184,9 +1239,14 @@ struct ProxyDevice {
     auto It = OmpFileHandles.find(LocalHandle);
     if (It == OmpFileHandles.end()) {
       errno = EBADF;
+      traceOmpFile("findRemoteHandle miss local=%d map_size=%zu\n", LocalHandle,
+                   OmpFileHandles.size());
       return false;
     }
     Entry = It->second;
+    traceOmpFile("findRemoteHandle hit local=%d rank=%d remote=%d map_size=%zu\n",
+                 LocalHandle, Entry.Rank, Entry.RemoteHandle,
+                 OmpFileHandles.size());
     return true;
   }
 
@@ -1195,10 +1255,15 @@ struct ProxyDevice {
     auto It = OmpFileHandles.find(LocalHandle);
     if (It == OmpFileHandles.end()) {
       errno = EBADF;
+      traceOmpFile("eraseRemoteHandle miss local=%d map_size=%zu\n", LocalHandle,
+                   OmpFileHandles.size());
       return false;
     }
     Entry = It->second;
     OmpFileHandles.erase(It);
+    traceOmpFile(
+        "eraseRemoteHandle hit local=%d rank=%d remote=%d map_size=%zu\n",
+        LocalHandle, Entry.Rank, Entry.RemoteHandle, OmpFileHandles.size());
     return true;
   }
 
@@ -1427,30 +1492,42 @@ struct ProxyDevice {
     if (!Path || !Handle)
       return OFFLOAD_FAIL;
 
+    traceOmpFile("mppOpen enter path=%s flags=0x%x mode=%o\n", Path, Flags,
+                 Mode);
     const int Rank = selectAggregatorRankForOpen(Path, Flags, Mode);
     int RemoteHandle = -1;
     if (!openOnRank(Rank, Path, Flags, Mode, RemoteHandle))
       return OFFLOAD_FAIL;
 
     *Handle = registerRemoteHandle(Rank, RemoteHandle);
+    traceOmpFile("mppOpen exit local=%d rank=%d remote=%d\n", *Handle, Rank,
+                 RemoteHandle);
     return OFFLOAD_SUCCESS;
   }
 
   int mppClose(int Handle) {
+    traceOmpFile("mppClose enter local=%d\n", Handle);
     OmpFileHandleEntry Entry{};
     if (!eraseRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
     if (!closeOnRank(Entry.Rank, Entry.RemoteHandle))
       return OFFLOAD_FAIL;
+    traceOmpFile("mppClose exit local=%d rank=%d remote=%d\n", Handle,
+                 Entry.Rank, Entry.RemoteHandle);
     return OFFLOAD_SUCCESS;
   }
 
   int mppPread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
+    traceOmpFile("mppPread enter local=%d offset=%lld size=%llu\n", Handle,
+                 static_cast<long long>(Offset),
+                 static_cast<unsigned long long>(Size));
     OmpFileHandleEntry Entry{};
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
     if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size))
       return OFFLOAD_FAIL;
+    traceOmpFile("mppPread exit local=%d rank=%d remote=%d\n", Handle,
+                 Entry.Rank, Entry.RemoteHandle);
     return OFFLOAD_SUCCESS;
   }
 
@@ -1478,6 +1555,12 @@ struct ProxyDevice {
   }
 
   int mppFinalize() {
+    size_t HandleCount = 0;
+    {
+      const std::lock_guard<std::mutex> Lock(OmpFileHandleMutex);
+      HandleCount = OmpFileHandles.size();
+    }
+    traceOmpFile("mppFinalize enter handle_count=%zu\n", HandleCount);
     reportOmpFileStats("mpp-finalize-before-drain");
     drainOmpFileOpenCache();
     {
@@ -1490,6 +1573,7 @@ struct ProxyDevice {
       OmpFileHandles.clear();
     }
     reportOmpFileStats("mpp-finalize-after-drain");
+    traceOmpFile("mppFinalize exit\n");
     return OFFLOAD_SUCCESS;
   }
 
@@ -1497,14 +1581,16 @@ struct ProxyDevice {
     OmpFileIORequest Request{};
     RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
 
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
     std::string Path;
     if (Request.PathSize > 0) {
       Path.resize(Request.PathSize, '\0');
       RequestManager.receive(Path.data(), Request.PathSize, MPI_CHAR);
+      if (auto Error = co_await RequestManager; Error)
+        co_return Error;
     }
-
-    if (auto Error = co_await RequestManager; Error)
-      co_return Error;
 
     OmpFileIOPlan Plan =
         buildSchedulePlan(Request, Request.PathSize > 0 ? Path.c_str() : nullptr);

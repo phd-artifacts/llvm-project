@@ -41,9 +41,11 @@ private:
   std::atomic<uint64_t> two_phase_planner_scalar_fallback_count{0};
   std::atomic<uint64_t> two_phase_planner_error_count{0};
   std::atomic<uint64_t> two_phase_planner_batch_id{1};
+  std::atomic<uint64_t> two_phase_request_id{1};
   bool two_phase_batch_in_progress = false;
 
   struct TwoPhaseReadRequest {
+    uint64_t DebugRequestId = 0;
     int FileHandle = -1;
     int ClientRank = -1;
     long Offset = 0;
@@ -90,6 +92,9 @@ private:
   static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
   static bool shouldReportStats();
+  void traceHandleStateLocked(const char *where, int file_id,
+                              int remote_handle) const;
+  void traceHandleState(const char *where, int file_id, int remote_handle);
   void reportPhase0Stats() const;
 };
 

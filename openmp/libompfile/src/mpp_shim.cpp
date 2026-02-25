@@ -70,6 +70,11 @@ MppApi &getMppApi() {
   return api;
 }
 
+uint64_t nextShimCallId() {
+  static std::atomic<uint64_t> call_id{1};
+  return call_id.fetch_add(1, std::memory_order_relaxed);
+}
+
 } // namespace
 
 namespace ompfile {
@@ -80,23 +85,41 @@ bool init() {
   if (ready.load(std::memory_order_acquire))
     return true;
 
+  io_trace("mpp_shim::init enter\n");
+
   auto &api = getMppApi();
   if (!api.init)
     api = loadMppApi();
 
   if (!api.init) {
     io_log("MPP shim not available (ompfile_mpp_init missing).\n");
+    io_trace("mpp_shim::init missing init symbol\n");
     return false;
   }
+
+  io_trace_symbol_owner("ompfile_mpp_init", reinterpret_cast<void *>(api.init));
+  io_trace_symbol_owner("ompfile_mpp_open", reinterpret_cast<void *>(api.open));
+  io_trace_symbol_owner("ompfile_mpp_close",
+                        reinterpret_cast<void *>(api.close));
+  io_trace_symbol_owner("ompfile_mpp_pread",
+                        reinterpret_cast<void *>(api.pread));
+  io_trace_symbol_owner("ompfile_mpp_pwrite",
+                        reinterpret_cast<void *>(api.pwrite));
+  io_trace_symbol_owner("ompfile_mpp_sched_request",
+                        reinterpret_cast<void *>(api.sched_request));
+  io_trace_symbol_owner("ompfile_mpp_sched_request_batch",
+                        reinterpret_cast<void *>(api.sched_batch_request));
 
   int init_rc = api.init();
   if (init_rc != 0) {
     io_log("MPP shim init failed (rc=%d).\n", init_rc);
+    io_trace("mpp_shim::init failed rc=%d\n", init_rc);
     return false;
   }
 
   ready.store(true, std::memory_order_release);
   io_log("MPP shim initialized.\n");
+  io_trace("mpp_shim::init success\n");
   return true;
 }
 
@@ -133,7 +156,11 @@ void finalize() {
 }
 
 bool open(const char *path, int flags, int mode, int &handle) {
+  const uint64_t call_id = nextShimCallId();
   handle = -1;
+  io_trace("mpp_shim::open enter call=%llu path=%s flags=0x%x mode=%o\n",
+           static_cast<unsigned long long>(call_id), path ? path : "(null)",
+           flags, mode);
   if (!init())
     return false;
 
@@ -143,18 +170,28 @@ bool open(const char *path, int flags, int mode, int &handle) {
 
   if (!api.open) {
     io_log("MPP shim not available (ompfile_mpp_open missing).\n");
+    io_trace("mpp_shim::open missing symbol call=%llu\n",
+             static_cast<unsigned long long>(call_id));
     return false;
   }
 
-  if (api.open(path, flags, mode, &handle) != 0) {
+  const int rc = api.open(path, flags, mode, &handle);
+  if (rc != 0) {
     io_log("MPP shim open failed.\n");
+    io_trace("mpp_shim::open failed call=%llu rc=%d handle=%d\n",
+             static_cast<unsigned long long>(call_id), rc, handle);
     return false;
   }
 
+  io_trace("mpp_shim::open success call=%llu handle=%d\n",
+           static_cast<unsigned long long>(call_id), handle);
   return true;
 }
 
 bool close(int handle) {
+  const uint64_t call_id = nextShimCallId();
+  io_trace("mpp_shim::close enter call=%llu handle=%d\n",
+           static_cast<unsigned long long>(call_id), handle);
   if (!init())
     return false;
 
@@ -164,13 +201,22 @@ bool close(int handle) {
 
   if (!api.close) {
     io_log("MPP shim not available (ompfile_mpp_close missing).\n");
+    io_trace("mpp_shim::close missing symbol call=%llu\n",
+             static_cast<unsigned long long>(call_id));
     return false;
   }
 
-  return api.close(handle) == 0;
+  const int rc = api.close(handle);
+  io_trace("mpp_shim::close exit call=%llu rc=%d\n",
+           static_cast<unsigned long long>(call_id), rc);
+  return rc == 0;
 }
 
 bool pread(int handle, int64_t offset, void *buffer, size_t size) {
+  const uint64_t call_id = nextShimCallId();
+  io_trace("mpp_shim::pread enter call=%llu handle=%d offset=%lld size=%zu\n",
+           static_cast<unsigned long long>(call_id), handle,
+           static_cast<long long>(offset), size);
   if (!buffer && size > 0)
     return false;
 
@@ -183,13 +229,22 @@ bool pread(int handle, int64_t offset, void *buffer, size_t size) {
 
   if (!api.pread) {
     io_log("MPP shim not available (ompfile_mpp_pread missing).\n");
+    io_trace("mpp_shim::pread missing symbol call=%llu\n",
+             static_cast<unsigned long long>(call_id));
     return false;
   }
 
-  return api.pread(handle, offset, buffer, size) == 0;
+  const int rc = api.pread(handle, offset, buffer, size);
+  io_trace("mpp_shim::pread exit call=%llu rc=%d\n",
+           static_cast<unsigned long long>(call_id), rc);
+  return rc == 0;
 }
 
 bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {
+  const uint64_t call_id = nextShimCallId();
+  io_trace("mpp_shim::pwrite enter call=%llu handle=%d offset=%lld size=%zu\n",
+           static_cast<unsigned long long>(call_id), handle,
+           static_cast<long long>(offset), size);
   if (!buffer && size > 0)
     return false;
 
@@ -202,19 +257,34 @@ bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {
 
   if (!api.pwrite) {
     io_log("MPP shim not available (ompfile_mpp_pwrite missing).\n");
+    io_trace("mpp_shim::pwrite missing symbol call=%llu\n",
+             static_cast<unsigned long long>(call_id));
     return false;
   }
 
-  return api.pwrite(handle, offset, buffer, size) == 0;
+  const int rc = api.pwrite(handle, offset, buffer, size);
+  io_trace("mpp_shim::pwrite exit call=%llu rc=%d\n",
+           static_cast<unsigned long long>(call_id), rc);
+  return rc == 0;
 }
 
 bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,
                   ompfile::OmpFileIOPlan &plan) {
+  const uint64_t call_id = nextShimCallId();
+  io_trace("mpp_shim::schedRequest enter call=%llu req_id=%llu op=%u "
+           "file=%d client_rank=%d offset=%lld size=%llu path_size=%u\n",
+           static_cast<unsigned long long>(call_id),
+           static_cast<unsigned long long>(request.RequestId),
+           static_cast<unsigned>(request.Op), request.FileHandle,
+           request.ClientRank, static_cast<long long>(request.Offset),
+           static_cast<unsigned long long>(request.Size), request.PathSize);
   if (request.PathSize > 0 && !path)
     return false;
 
   if (!init()) {
     io_log("MPP scheduler request aborted because MPP init failed.\n");
+    io_trace("mpp_shim::schedRequest init failed call=%llu\n",
+             static_cast<unsigned long long>(call_id));
     return false;
   }
 
@@ -224,10 +294,17 @@ bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,
 
   if (!api.sched_request) {
     io_log("MPP shim not available (ompfile_mpp_sched_request missing).\n");
+    io_trace("mpp_shim::schedRequest missing symbol call=%llu\n",
+             static_cast<unsigned long long>(call_id));
     return false;
   }
 
-  return api.sched_request(&request, path, &plan) == 0;
+  const int rc = api.sched_request(&request, path, &plan);
+  io_trace("mpp_shim::schedRequest exit call=%llu rc=%d plan_status=%d "
+           "plan_errno=%d aggregator=%d remote_handle=%d flags=0x%x\n",
+           static_cast<unsigned long long>(call_id), rc, plan.Status, plan.Errno,
+           plan.AggregatorRank, plan.RemoteHandle, plan.PlanFlags);
+  return rc == 0;
 }
 
 bool schedBatchRequest(
@@ -235,18 +312,32 @@ bool schedBatchRequest(
     const std::vector<ompfile::OmpFileIOBatchSegment> &segments,
     ompfile::OmpFileIOBatchPlan &plan,
     std::vector<ompfile::OmpFileIOBatchPlanEntry> &entries) {
+  const uint64_t call_id = nextShimCallId();
+  io_trace("mpp_shim::schedBatchRequest enter call=%llu batch_id=%llu "
+           "segments=%zu flags=0x%x\n",
+           static_cast<unsigned long long>(call_id),
+           static_cast<unsigned long long>(request.BatchId), segments.size(),
+           request.RequestFlags);
   plan = {};
   entries.clear();
 
   if (request.AbiVersion != ompfile::OMPFILE_SCHED_BATCH_ABI_VERSION) {
     io_log("MPP batch scheduler request has unsupported ABI version=%u\n",
            request.AbiVersion);
+    io_trace("mpp_shim::schedBatchRequest abi mismatch call=%llu "
+             "abi=%u expected=%u\n",
+             static_cast<unsigned long long>(call_id), request.AbiVersion,
+             ompfile::OMPFILE_SCHED_BATCH_ABI_VERSION);
     return false;
   }
 
   if (request.SegmentCount != segments.size()) {
     io_log("MPP batch scheduler segment count mismatch: header=%u vec=%zu\n",
            request.SegmentCount, segments.size());
+    io_trace("mpp_shim::schedBatchRequest segment mismatch call=%llu "
+             "header=%u vec=%zu\n",
+             static_cast<unsigned long long>(call_id), request.SegmentCount,
+             segments.size());
     return false;
   }
 
@@ -261,6 +352,8 @@ bool schedBatchRequest(
 
   if (!init()) {
     io_log("MPP batch scheduler request aborted because MPP init failed.\n");
+    io_trace("mpp_shim::schedBatchRequest init failed call=%llu\n",
+             static_cast<unsigned long long>(call_id));
     return false;
   }
 
@@ -293,20 +386,31 @@ bool schedBatchRequest(
               plan_payload.empty() ? nullptr : plan_payload.data(),
               plan_payload.size(), plan.SegmentCount, entries)) {
         io_log("MPP batch scheduler returned malformed plan payload.\n");
+        io_trace("mpp_shim::schedBatchRequest malformed payload call=%llu\n",
+                 static_cast<unsigned long long>(call_id));
         return false;
       }
       plan.PlanFlags |= ompfile::OMPFILE_BATCH_PLAN_BATCH_API;
+      io_trace("mpp_shim::schedBatchRequest native success call=%llu "
+               "segment_count=%u plan_flags=0x%x status=%d\n",
+               static_cast<unsigned long long>(call_id), plan.SegmentCount,
+               plan.PlanFlags, plan.Status);
       return true;
     }
 
     io_log("MPP batch scheduler API returned rc=%d; falling back to scalar "
            "scheduler path.\n",
            rc);
+    io_trace("mpp_shim::schedBatchRequest native rc=%d call=%llu "
+             "falling back to scalar path\n",
+             rc, static_cast<unsigned long long>(call_id));
   }
 
   if ((normalized_request.RequestFlags &
        ompfile::OMPFILE_BATCH_REQ_DISABLE_SCALAR_FALLBACK) != 0) {
     io_log("MPP batch scheduler unavailable and scalar fallback disabled.\n");
+    io_trace("mpp_shim::schedBatchRequest scalar fallback disabled call=%llu\n",
+             static_cast<unsigned long long>(call_id));
     return false;
   }
 
@@ -361,6 +465,10 @@ bool schedBatchRequest(
     plan.Errno = first_errno != 0 ? first_errno : EIO;
   }
 
+  io_trace("mpp_shim::schedBatchRequest scalar done call=%llu "
+           "entries=%zu plan_status=%d plan_errno=%d flags=0x%x\n",
+           static_cast<unsigned long long>(call_id), entries.size(),
+           plan.Status, plan.Errno, plan.PlanFlags);
   return true;
 }
 

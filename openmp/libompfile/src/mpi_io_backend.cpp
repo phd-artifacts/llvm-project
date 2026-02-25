@@ -10,6 +10,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <mpi.h>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -87,6 +89,20 @@ MPIIOBackend::MPIIOBackend() {
     io_log("Two-phase requested but inactive (requires remote-only MPP mode).\n");
   }
 
+  int rank = -1;
+  int mpi_initialized_for_rank = 0;
+  MPI_Initialized(&mpi_initialized_for_rank);
+  if (mpi_initialized_for_rank)
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  io_trace("MPIIOBackend ctor this=%p rank=%d external_mpi=%d mpp_open=%d "
+           "mpp_io=%d two_phase_enabled=%d two_phase_window_us=%llu "
+           "two_phase_max_batch_bytes=%llu\n",
+           static_cast<void *>(this), rank, externally_initialized,
+           static_cast<int>(mpp_open_enabled), static_cast<int>(mpp_io_enabled),
+           static_cast<int>(two_phase_enabled),
+           static_cast<unsigned long long>(two_phase_window_us),
+           static_cast<unsigned long long>(two_phase_max_batch_bytes));
+
 }
 
 MPIIOBackend::~MPIIOBackend() {
@@ -109,6 +125,10 @@ int MPIIOBackend::open(const char *filename) {
   const bool remote_only = mpp_open_enabled && mpp_io_enabled;
 
   io_log("Opening file %s with file_id %d\n", filename, file_id);
+  io_trace("MPIIOBackend::open enter this=%p file_id=%d remote_only=%d "
+           "filename=%s\n",
+           static_cast<void *>(this), file_id, static_cast<int>(remote_only),
+           filename ? filename : "(null)");
 
   if (remote_only) {
     int remote_handle = -1;
@@ -126,8 +146,10 @@ int MPIIOBackend::open(const char *filename) {
       const std::lock_guard<std::mutex> lock(handle_mutex);
       remote_file_handle_map[file_id] = remote_handle;
       logical_handle_set.insert(file_id);
+      traceHandleStateLocked("open.remote_only.insert", file_id, remote_handle);
     }
     io_log("Remote-only open completed for file_id %d\n", file_id);
+    traceHandleState("open.remote_only.done", file_id, remote_handle);
     return file_id;
   }
 
@@ -147,6 +169,7 @@ int MPIIOBackend::open(const char *filename) {
     const std::lock_guard<std::mutex> lock(handle_mutex);
     file_handle_map[file_id] = file_handle;
     logical_handle_set.insert(file_id);
+    traceHandleStateLocked("open.mpi.insert", file_id, -1);
   }
 
   if (mpp_open_enabled) {
@@ -163,6 +186,7 @@ int MPIIOBackend::open(const char *filename) {
         const std::lock_guard<std::mutex> lock(handle_mutex);
         file_handle_map.erase(file_id);
         logical_handle_set.erase(file_id);
+        traceHandleStateLocked("open.mpp.fail.cleanup", file_id, -1);
       }
       errno = EIO;
       return -1;
@@ -170,8 +194,10 @@ int MPIIOBackend::open(const char *filename) {
     {
       const std::lock_guard<std::mutex> lock(handle_mutex);
       remote_file_handle_map[file_id] = remote_handle;
+      traceHandleStateLocked("open.mpp.remote.insert", file_id, remote_handle);
     }
   }
+  traceHandleState("open.done", file_id, -1);
   return file_id;
 }
 
@@ -214,11 +240,14 @@ int MPIIOBackend::close(int file_id) {
   int remote_handle = -1;
   bool has_remote_handle = false;
   MPI_File mpi_file = MPI_FILE_NULL;
+  io_trace("MPIIOBackend::close enter this=%p file_id=%d remote_only=%d\n",
+           static_cast<void *>(this), file_id, static_cast<int>(remote_only));
 
   {
     const std::lock_guard<std::mutex> lock(handle_mutex);
     if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
+      traceHandleStateLocked("close.invalid_handle", file_id, -1);
       return -1;
     }
 
@@ -240,6 +269,7 @@ int MPIIOBackend::close(int file_id) {
     }
 
     logical_handle_set.erase(file_id);
+    traceHandleStateLocked("close.after_local_erase", file_id, remote_handle);
   }
 
   int mpp_ret = 0;
@@ -259,6 +289,7 @@ int MPIIOBackend::close(int file_id) {
     if (mpp_ret != 0)
       return -1;
     io_log("Remote-only close completed\n");
+    traceHandleState("close.remote_only.done", file_id, remote_handle);
     return 0;
   }
 
@@ -278,6 +309,7 @@ int MPIIOBackend::close(int file_id) {
     return -1;
 
   io_log("Close completed\n");
+  traceHandleState("close.done", file_id, remote_handle);
 
   return 0;
 }
@@ -372,6 +404,16 @@ int MPIIOBackend::readAtWithContext(
   const int file_id = context.FileHandle;
   const long offset = static_cast<long>(context.Offset);
   pread_request_count.fetch_add(1, std::memory_order_relaxed);
+  io_trace("MPIIOBackend::readAtWithContext enter this=%p req_id=%llu file=%d "
+           "offset=%ld size=%zu ctx_flags=0x%x has_plan=%d has_path_key=%d "
+           "plan_status=%d aggregator=%d remote_handle=%d\n",
+           static_cast<void *>(this),
+           static_cast<unsigned long long>(context.RequestId), file_id, offset,
+           size, context.ContextFlags,
+           (context.ContextFlags & ompfile::OMPFILE_READ_CTX_HAS_PLAN) != 0,
+           (context.ContextFlags & ompfile::OMPFILE_READ_CTX_HAS_PATH_KEY) != 0,
+           context.Plan.Status, context.Plan.AggregatorRank,
+           context.Plan.RemoteHandle);
 
   io_log("Reading %zu bytes from file %d at offset %lld\n", size, file_id,
          static_cast<long long>(offset));
@@ -406,16 +448,25 @@ int MPIIOBackend::readAtWithContext(
       }
 
       io_log("MPP read at offset completed.\n");
+      io_trace("MPIIOBackend::readAtWithContext planned read success req_id=%llu "
+               "file=%d remote_handle=%d\n",
+               static_cast<unsigned long long>(context.RequestId), file_id,
+               remote_handle);
       return 0;
     }
     io_log("Phase 1 planner produced a route but remote handle is missing for "
            "file %d; falling back to baseline pread path.\n",
            file_id);
+    traceHandleState("readAtWithContext.plan_missing_remote", file_id, -1);
   }
 
   if (two_phase_enabled)
     two_phase_fallback_count.fetch_add(1, std::memory_order_relaxed);
 
+  io_trace("MPIIOBackend::readAtWithContext fallback req_id=%llu file=%d "
+           "offset=%ld size=%zu\n",
+           static_cast<unsigned long long>(context.RequestId), file_id, offset,
+           size);
   return readAtFallback(file_id, offset, data, size);
 }
 
@@ -433,6 +484,8 @@ int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
     }
     if (remote_handle < 0) {
       io_log("Error: Missing remote handle for file %d\n", file_id);
+      traceHandleState("readAtFallback.remote_only.missing_remote", file_id,
+                       remote_handle);
       return -1;
     }
     remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
@@ -444,6 +497,8 @@ int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
     }
     if (!pread_ok) {
       io_log("MPP pread failed for file %d\n", file_id);
+      traceHandleState("readAtFallback.remote_only.pread_fail", file_id,
+                       remote_handle);
       return -1;
     }
 
@@ -462,6 +517,8 @@ int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
     }
     if (remote_handle < 0) {
       io_log("Error: Missing remote handle for file %d\n", file_id);
+      traceHandleState("readAtFallback.mpp_io.missing_remote", file_id,
+                       remote_handle);
       return -1;
     }
     remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
@@ -473,6 +530,8 @@ int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
     }
     if (!pread_ok) {
       io_log("MPP pread failed for file %d\n", file_id);
+      traceHandleState("readAtFallback.mpp_io.pread_fail", file_id,
+                       remote_handle);
       return -1;
     }
 
@@ -507,6 +566,8 @@ int MPIIOBackend::readAtTwoPhase(
     const ompfile::OmpFileReadRequestContext &context, void *data,
     size_t size) {
   TwoPhaseReadRequest request{};
+  request.DebugRequestId =
+      two_phase_request_id.fetch_add(1, std::memory_order_relaxed);
   request.FileHandle = context.FileHandle;
   request.ClientRank = context.ClientRank;
   request.Offset = static_cast<long>(context.Offset);
@@ -516,14 +577,26 @@ int MPIIOBackend::readAtTwoPhase(
   request.HasPathKey =
       (context.ContextFlags & ompfile::OMPFILE_READ_CTX_HAS_PATH_KEY) != 0;
 
+  const auto enqueue_ts = std::chrono::steady_clock::now();
   std::vector<TwoPhaseReadRequest *> batch;
   std::unique_lock<std::mutex> lock(two_phase_mutex);
+  const size_t queue_size_before = two_phase_queue.size();
+  io_trace("MPIIOBackend::readAtTwoPhase enqueue req=%llu file=%d offset=%ld "
+           "size=%zu queue_before=%zu in_progress=%d\n",
+           static_cast<unsigned long long>(request.DebugRequestId),
+           request.FileHandle, request.Offset, request.Size, queue_size_before,
+           static_cast<int>(two_phase_batch_in_progress));
   two_phase_queue.push_back(&request);
   two_phase_queue_cv.notify_all();
 
   while (!request.Done) {
     if (!two_phase_batch_in_progress) {
       two_phase_batch_in_progress = true;
+      io_trace("MPIIOBackend::readAtTwoPhase leader req=%llu queue_size=%zu "
+               "window_us=%llu\n",
+               static_cast<unsigned long long>(request.DebugRequestId),
+               two_phase_queue.size(),
+               static_cast<unsigned long long>(two_phase_window_us));
 
       if (two_phase_window_us > 0) {
         two_phase_queue_cv.wait_for(lock,
@@ -534,6 +607,10 @@ int MPIIOBackend::readAtTwoPhase(
         batch.push_back(two_phase_queue.front());
         two_phase_queue.pop_front();
       }
+      io_trace("MPIIOBackend::readAtTwoPhase leader req=%llu draining batch "
+               "size=%zu queue_after_drain=%zu\n",
+               static_cast<unsigned long long>(request.DebugRequestId),
+               batch.size(), two_phase_queue.size());
 
       lock.unlock();
       processTwoPhaseBatch(batch);
@@ -543,16 +620,31 @@ int MPIIOBackend::readAtTwoPhase(
       two_phase_batch_in_progress = false;
       two_phase_queue_cv.notify_all();
     } else {
+      io_trace("MPIIOBackend::readAtTwoPhase follower wait req=%llu "
+               "queue_size=%zu\n",
+               static_cast<unsigned long long>(request.DebugRequestId),
+               two_phase_queue.size());
       two_phase_queue_cv.wait(
           lock, [this, &request] { return request.Done || !two_phase_batch_in_progress; });
     }
   }
 
+  const auto done_ts = std::chrono::steady_clock::now();
+  const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           done_ts - enqueue_ts)
+                           .count();
   if (request.Status != 0) {
     errno = request.Errno;
+    io_trace("MPIIOBackend::readAtTwoPhase done req=%llu status=%d errno=%d "
+             "wait_us=%lld\n",
+             static_cast<unsigned long long>(request.DebugRequestId),
+             request.Status, request.Errno, static_cast<long long>(wait_us));
     return -1;
   }
 
+  io_trace("MPIIOBackend::readAtTwoPhase done req=%llu status=0 wait_us=%lld\n",
+           static_cast<unsigned long long>(request.DebugRequestId),
+           static_cast<long long>(wait_us));
   return 0;
 }
 
@@ -560,12 +652,16 @@ void MPIIOBackend::processTwoPhaseBatch(std::vector<TwoPhaseReadRequest *> &batc
   if (batch.empty())
     return;
 
+  io_trace("MPIIOBackend::processTwoPhaseBatch enter this=%p batch_size=%zu\n",
+           static_cast<void *>(this), batch.size());
   two_phase_batch_count.fetch_add(1, std::memory_order_relaxed);
 
   std::unordered_map<uint64_t, std::vector<TwoPhaseReadRequest *>> grouped;
   grouped.reserve(batch.size());
   for (TwoPhaseReadRequest *request : batch)
     grouped[getTwoPhaseGroupKey(*request)].push_back(request);
+
+  io_trace("MPIIOBackend::processTwoPhaseBatch grouped=%zu\n", grouped.size());
 
   for (auto &entry : grouped)
     processTwoPhaseGroup(entry.second);
@@ -575,11 +671,22 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
   if (group.empty())
     return;
 
+  io_trace("MPIIOBackend::processTwoPhaseGroup enter this=%p group_size=%zu "
+           "first_req=%llu first_file=%d first_offset=%ld first_size=%zu\n",
+           static_cast<void *>(this), group.size(),
+           static_cast<unsigned long long>(group.front()->DebugRequestId),
+           group.front()->FileHandle, group.front()->Offset,
+           group.front()->Size);
+
   if (group.size() == 1) {
     TwoPhaseReadRequest *request = group.front();
     const int rc = readAtFallback(request->FileHandle, request->Offset,
                                   request->Buffer, request->Size);
     completeTwoPhaseRequest(*request, rc, rc == 0 ? 0 : errno);
+    io_trace("MPIIOBackend::processTwoPhaseGroup singleton req=%llu rc=%d "
+             "errno=%d\n",
+             static_cast<unsigned long long>(request->DebugRequestId), rc,
+             rc == 0 ? 0 : errno);
     return;
   }
 
@@ -660,6 +767,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
 
   ompfile::OmpFileIOBatchPlan batch_plan{};
   std::vector<ompfile::OmpFileIOBatchPlanEntry> batch_entries;
+  io_trace("MPIIOBackend::processTwoPhaseGroup coalesced_ranges=%zu "
+           "batch_id=%llu\n",
+           coalesced.size(),
+           static_cast<unsigned long long>(batch_request.BatchId));
   if (ompfile::mpp::schedBatchRequest(batch_request, batch_segments, batch_plan,
                                       batch_entries)) {
     two_phase_planner_batch_count.fetch_add(1, std::memory_order_relaxed);
@@ -677,6 +788,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
              "actual=%zu\n",
              coalesced.size(), batch_entries.size());
     } else {
+      io_trace("MPIIOBackend::processTwoPhaseGroup planner success batch_id=%llu "
+               "entries=%zu flags=0x%x status=%d\n",
+               static_cast<unsigned long long>(batch_request.BatchId),
+               batch_entries.size(), batch_plan.PlanFlags, batch_plan.Status);
       for (size_t i = 0; i < batch_entries.size(); ++i) {
         const ompfile::OmpFileIOBatchPlanEntry &entry = batch_entries[i];
         CoalescedRead &item = coalesced[i];
@@ -689,6 +804,8 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     }
   } else {
     two_phase_planner_error_count.fetch_add(1, std::memory_order_relaxed);
+    io_trace("MPIIOBackend::processTwoPhaseGroup planner failed batch_id=%llu\n",
+             static_cast<unsigned long long>(batch_request.BatchId));
   }
 
   two_phase_coalesced_read_count.fetch_add(coalesced.size(),
@@ -696,6 +813,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
 
   for (CoalescedRead &item : coalesced) {
     if (item.Skip) {
+      io_trace("MPIIOBackend::processTwoPhaseGroup skipping range start=%ld "
+               "end=%ld requests=%zu status=%d errno=%d\n",
+               item.Start, item.End, item.Requests.size(), item.ErrorStatus,
+               item.ErrorErrno);
       for (TwoPhaseReadRequest *request : item.Requests)
         completeTwoPhaseRequest(*request, item.ErrorStatus, item.ErrorErrno);
       continue;
@@ -710,6 +831,9 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
                                   buffer.data(), read_size);
     if (rc != 0) {
       const int errnum = errno;
+      io_trace("MPIIOBackend::processTwoPhaseGroup coalesced read failed "
+               "start=%ld end=%ld size=%zu rc=%d errno=%d\n",
+               item.Start, item.End, read_size, rc, errnum);
       for (TwoPhaseReadRequest *request : item.Requests)
         completeTwoPhaseRequest(*request, rc, errnum);
       continue;
@@ -722,6 +846,9 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
                   request->Size);
       completeTwoPhaseRequest(*request, 0, 0);
     }
+    io_trace("MPIIOBackend::processTwoPhaseGroup coalesced read success "
+             "start=%ld end=%ld size=%zu scattered=%zu\n",
+             item.Start, item.End, read_size, item.Requests.size());
   }
 }
 
@@ -738,6 +865,11 @@ void MPIIOBackend::completeTwoPhaseRequest(TwoPhaseReadRequest &request,
   request.Status = status;
   request.Errno = errnum;
   request.Done = true;
+  io_trace("MPIIOBackend::completeTwoPhaseRequest req=%llu file=%d offset=%ld "
+           "size=%zu status=%d errno=%d\n",
+           static_cast<unsigned long long>(request.DebugRequestId),
+           request.FileHandle, request.Offset, request.Size, status, errnum);
+  two_phase_queue_cv.notify_all();
 }
 
 bool MPIIOBackend::isTwoPhaseActive() const {
@@ -829,6 +961,67 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
 
 int MPIIOBackend::getNextFileHandle() {
   return next_file_handle.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MPIIOBackend::traceHandleStateLocked(const char *where, int file_id,
+                                          int remote_handle) const {
+  if (!io_trace_enabled())
+    return;
+
+  const bool logical_present =
+      logical_handle_set.find(file_id) != logical_handle_set.end();
+  const auto remote_it = remote_file_handle_map.find(file_id);
+  const bool remote_present = remote_it != remote_file_handle_map.end();
+  const int remote_mapped_handle =
+      remote_present ? remote_it->second : -1;
+  const bool mpi_present = file_handle_map.find(file_id) != file_handle_map.end();
+
+  std::ostringstream logical_ids;
+  int logical_emitted = 0;
+  for (int id : logical_handle_set) {
+    if (logical_emitted++ >= 8) {
+      logical_ids << "...";
+      break;
+    }
+    if (logical_emitted > 1)
+      logical_ids << ",";
+    logical_ids << id;
+  }
+  if (logical_emitted == 0)
+    logical_ids << "(empty)";
+
+  std::ostringstream remote_ids;
+  int remote_emitted = 0;
+  for (const auto &entry : remote_file_handle_map) {
+    if (remote_emitted++ >= 8) {
+      remote_ids << "...";
+      break;
+    }
+    if (remote_emitted > 1)
+      remote_ids << ",";
+    remote_ids << entry.first << "->" << entry.second;
+  }
+  if (remote_emitted == 0)
+    remote_ids << "(empty)";
+
+  io_trace("MPIIOBackend::%s this=%p file_id=%d remote_handle_arg=%d "
+           "logical_present=%d remote_present=%d remote_mapped=%d "
+           "mpi_present=%d logical_count=%zu remote_count=%zu mpi_count=%zu "
+           "logical_ids=[%s] remote_ids=[%s]\n",
+           where ? where : "(unknown)", static_cast<const void *>(this), file_id,
+           remote_handle, static_cast<int>(logical_present),
+           static_cast<int>(remote_present), remote_mapped_handle,
+           static_cast<int>(mpi_present), logical_handle_set.size(),
+           remote_file_handle_map.size(), file_handle_map.size(),
+           logical_ids.str().c_str(), remote_ids.str().c_str());
+}
+
+void MPIIOBackend::traceHandleState(const char *where, int file_id,
+                                    int remote_handle) {
+  if (!io_trace_enabled())
+    return;
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  traceHandleStateLocked(where, file_id, remote_handle);
 }
 
 bool MPIIOBackend::parseBoolEnv(const char *name, bool default_value) {
