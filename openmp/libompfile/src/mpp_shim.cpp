@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <limits>
 #include <thread>
 
 namespace {
@@ -16,6 +17,7 @@ using MppSubmitFn = int (*)(uint64_t);
 using MppOpenFn = int (*)(const char *, int, int, int *);
 using MppCloseFn = int (*)(int);
 using MppPreadFn = int (*)(int, int64_t, void *, uint64_t);
+using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
 using MppSchedRequestFn = int (*)(const ompfile::OmpFileIORequest *,
                                   const char *, ompfile::OmpFileIOPlan *);
@@ -32,6 +34,7 @@ struct MppApi {
   MppOpenFn open = nullptr;
   MppCloseFn close = nullptr;
   MppPreadFn pread = nullptr;
+  MppPreadExFn pread_ex = nullptr;
   MppPwriteFn pwrite = nullptr;
   MppSchedRequestFn sched_request = nullptr;
   MppSchedBatchRequestFn sched_batch_request = nullptr;
@@ -51,6 +54,8 @@ MppApi loadMppApi() {
                                                        "ompfile_mpp_close"));
   loaded.pread = reinterpret_cast<MppPreadFn>(dlsym(RTLD_DEFAULT,
                                                        "ompfile_mpp_pread"));
+  loaded.pread_ex = reinterpret_cast<MppPreadExFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_ex"));
   loaded.pwrite = reinterpret_cast<MppPwriteFn>(dlsym(RTLD_DEFAULT,
                                                         "ompfile_mpp_pwrite"));
   loaded.sched_request = reinterpret_cast<MppSchedRequestFn>(dlsym(
@@ -103,6 +108,8 @@ bool init() {
                         reinterpret_cast<void *>(api.close));
   io_trace_symbol_owner("ompfile_mpp_pread",
                         reinterpret_cast<void *>(api.pread));
+  io_trace_symbol_owner("ompfile_mpp_pread_ex",
+                        reinterpret_cast<void *>(api.pread_ex));
   io_trace_symbol_owner("ompfile_mpp_pwrite",
                         reinterpret_cast<void *>(api.pwrite));
   io_trace_symbol_owner("ompfile_mpp_sched_request",
@@ -213,7 +220,14 @@ bool close(int handle) {
 }
 
 bool pread(int handle, int64_t offset, void *buffer, size_t size) {
+  size_t bytes_read = 0;
+  return preadEx(handle, offset, buffer, size, bytes_read);
+}
+
+bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
+             size_t &bytes_read) {
   const uint64_t call_id = nextShimCallId();
+  bytes_read = 0;
   io_trace("mpp_shim::pread enter call=%llu handle=%d offset=%lld size=%zu\n",
            static_cast<unsigned long long>(call_id), handle,
            static_cast<long long>(offset), size);
@@ -234,10 +248,28 @@ bool pread(int handle, int64_t offset, void *buffer, size_t size) {
     return false;
   }
 
+  if (api.pread_ex) {
+    uint64_t remote_bytes_read = 0;
+    const int rc = api.pread_ex(handle, offset, buffer, size, &remote_bytes_read);
+    io_trace("mpp_shim::pread_ex exit call=%llu rc=%d bytes=%llu\n",
+             static_cast<unsigned long long>(call_id), rc,
+             static_cast<unsigned long long>(remote_bytes_read));
+    if (rc != 0)
+      return false;
+    if (remote_bytes_read >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+      return false;
+    bytes_read = static_cast<size_t>(remote_bytes_read);
+    return true;
+  }
+
   const int rc = api.pread(handle, offset, buffer, size);
-  io_trace("mpp_shim::pread exit call=%llu rc=%d\n",
+  io_trace("mpp_shim::pread legacy exit call=%llu rc=%d\n",
            static_cast<unsigned long long>(call_id), rc);
-  return rc == 0;
+  if (rc != 0)
+    return false;
+  bytes_read = size;
+  return true;
 }
 
 bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {

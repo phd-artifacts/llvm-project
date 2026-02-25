@@ -53,6 +53,8 @@ enum OmpFileBatchRequestFlags : uint32_t {
 enum OmpFileBatchPlanFlags : uint32_t {
   OMPFILE_BATCH_PLAN_BATCH_API = 1u << 0,
   OMPFILE_BATCH_PLAN_SCALAR_FALLBACK = 1u << 1,
+  OMPFILE_BATCH_PLAN_FILE_AFFINITY = 1u << 2,
+  OMPFILE_BATCH_PLAN_REBALANCED = 1u << 3,
 };
 
 struct OmpFileIOBatchSegment {

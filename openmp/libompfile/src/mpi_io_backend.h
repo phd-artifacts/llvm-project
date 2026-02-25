@@ -16,6 +16,12 @@
 
 class MPIIOBackend : public IOBackend {
 private:
+  enum class TwoPhasePolicy {
+    Disabled,
+    Enabled,
+    Auto,
+  };
+
   MPI_Comm file_comm = MPI_COMM_NULL;
   int externally_initialized;
   std::unordered_map<int, MPI_File> file_handle_map;
@@ -26,18 +32,23 @@ private:
   std::mutex mpp_call_mutex;
   bool mpp_open_enabled = false;
   bool mpp_io_enabled = false;
+  TwoPhasePolicy two_phase_policy = TwoPhasePolicy::Disabled;
   bool two_phase_enabled = false;
   uint64_t two_phase_window_us = 0;
   uint64_t two_phase_max_batch_bytes = 0;
   std::atomic<uint64_t> pread_request_count{0};
   std::atomic<uint64_t> remote_pread_event_count{0};
   std::atomic<uint64_t> remote_pread_bytes_total{0};
+  std::atomic<uint64_t> short_read_count{0};
+  std::atomic<uint64_t> short_read_bytes_total{0};
   std::atomic<uint64_t> two_phase_fallback_count{0};
   std::atomic<uint64_t> two_phase_batch_count{0};
   std::atomic<uint64_t> two_phase_coalesced_read_count{0};
   std::atomic<uint64_t> two_phase_coalesced_bytes_total{0};
   std::atomic<uint64_t> two_phase_planner_batch_count{0};
   std::atomic<uint64_t> two_phase_planner_segment_count{0};
+  std::atomic<uint64_t> two_phase_planner_affinity_count{0};
+  std::atomic<uint64_t> two_phase_planner_rebalanced_count{0};
   std::atomic<uint64_t> two_phase_planner_scalar_fallback_count{0};
   std::atomic<uint64_t> two_phase_planner_error_count{0};
   std::atomic<uint64_t> two_phase_planner_batch_id{1};
@@ -79,6 +90,8 @@ public:
 
 private:
   int readAtFallback(int file_id, long offset, void *data, size_t size);
+  int readAtFallbackWithBytes(int file_id, long offset, void *data, size_t size,
+                              size_t &bytes_read);
   int readAtTwoPhase(const ompfile::OmpFileReadRequestContext &context,
                      void *data, size_t size);
   void processTwoPhaseBatch(std::vector<TwoPhaseReadRequest *> &batch);
@@ -89,6 +102,8 @@ private:
   bool isTwoPhaseActive() const;
   bool hasUsablePlannedRead(const ompfile::OmpFileReadRequestContext &context) const;
   int getNextFileHandle();
+  static TwoPhasePolicy parseTwoPhasePolicy(const char *env_value);
+  static const char *twoPhasePolicyToString(TwoPhasePolicy policy);
   static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
   static bool shouldReportStats();

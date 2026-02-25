@@ -4,11 +4,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <climits>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <mpi.h>
 #include <sstream>
 #include <string>
@@ -71,14 +73,25 @@ MPIIOBackend::MPIIOBackend() {
     }
   }
 
-  two_phase_enabled = parseBoolEnv("LIBOMPFILE_OPT_TWO_PHASE", false);
+  two_phase_policy = parseTwoPhasePolicy(std::getenv("LIBOMPFILE_OPT_TWO_PHASE"));
+  if (two_phase_policy == TwoPhasePolicy::Enabled) {
+    two_phase_enabled = true;
+  } else if (two_phase_policy == TwoPhasePolicy::Auto) {
+    const char *scheduler_env = std::getenv("LIBOMPFILE_SCHEDULER");
+    const bool scheduler_headnode =
+        scheduler_env && std::strcmp(scheduler_env, "HEADNODE") == 0;
+    two_phase_enabled = remote_only && scheduler_headnode;
+  } else {
+    two_phase_enabled = false;
+  }
   two_phase_window_us =
       parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_WINDOW_US", 0);
   two_phase_max_batch_bytes =
       parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_MAX_BATCH_BYTES", 0);
 
-  io_log("Two-phase guard config: enabled=%d window_us=%llu "
+  io_log("Two-phase guard config: policy=%s enabled=%d window_us=%llu "
          "max_batch_bytes=%llu\n",
+         twoPhasePolicyToString(two_phase_policy),
          static_cast<int>(two_phase_enabled),
          static_cast<unsigned long long>(two_phase_window_us),
          static_cast<unsigned long long>(two_phase_max_batch_bytes));
@@ -87,6 +100,8 @@ MPIIOBackend::MPIIOBackend() {
     io_log("Two-phase batching active (leader/follower mode).\n");
   } else if (two_phase_enabled) {
     io_log("Two-phase requested but inactive (requires remote-only MPP mode).\n");
+  } else if (two_phase_policy == TwoPhasePolicy::Auto) {
+    io_log("Two-phase auto policy resolved to disabled for this run.\n");
   }
 
   int rank = -1;
@@ -95,10 +110,12 @@ MPIIOBackend::MPIIOBackend() {
   if (mpi_initialized_for_rank)
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   io_trace("MPIIOBackend ctor this=%p rank=%d external_mpi=%d mpp_open=%d "
-           "mpp_io=%d two_phase_enabled=%d two_phase_window_us=%llu "
+           "mpp_io=%d two_phase_policy=%s two_phase_enabled=%d "
+           "two_phase_window_us=%llu "
            "two_phase_max_batch_bytes=%llu\n",
            static_cast<void *>(this), rank, externally_initialized,
            static_cast<int>(mpp_open_enabled), static_cast<int>(mpp_io_enabled),
+           twoPhasePolicyToString(two_phase_policy),
            static_cast<int>(two_phase_enabled),
            static_cast<unsigned long long>(two_phase_window_us),
            static_cast<unsigned long long>(two_phase_max_batch_bytes));
@@ -403,6 +420,15 @@ int MPIIOBackend::readAtWithContext(
     size_t size) {
   const int file_id = context.FileHandle;
   const long offset = static_cast<long>(context.Offset);
+  assert(size == static_cast<size_t>(context.Size) || context.Size == 0);
+  if (offset < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (!data && size > 0) {
+    errno = EINVAL;
+    return -1;
+  }
   pread_request_count.fetch_add(1, std::memory_order_relaxed);
   io_trace("MPIIOBackend::readAtWithContext enter this=%p req_id=%llu file=%d "
            "offset=%ld size=%zu ctx_flags=0x%x has_plan=%d has_path_key=%d "
@@ -438,13 +464,29 @@ int MPIIOBackend::readAtWithContext(
              static_cast<unsigned long long>(context.PathKey),
              context.Plan.AggregatorRank);
       bool pread_ok = false;
+      size_t bytes_read = 0;
       {
         const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-        pread_ok = ompfile::mpp::pread(remote_handle, offset, data, size);
+        pread_ok =
+            ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
       }
       if (!pread_ok) {
         io_log("MPP pread failed for file %d\n", file_id);
         return -1;
+      }
+      if (bytes_read > size) {
+        errno = EPROTO;
+        return -1;
+      }
+      if (bytes_read < size && data) {
+        const size_t short_bytes = size - bytes_read;
+        short_read_count.fetch_add(1, std::memory_order_relaxed);
+        short_read_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
+        std::memset(static_cast<char *>(data) + bytes_read, 0, short_bytes);
+        io_trace("MPIIOBackend::readAtWithContext short-read req_id=%llu "
+                 "file=%d requested=%zu read=%zu short=%zu\n",
+                 static_cast<unsigned long long>(context.RequestId), file_id,
+                 size, bytes_read, short_bytes);
       }
 
       io_log("MPP read at offset completed.\n");
@@ -472,38 +514,20 @@ int MPIIOBackend::readAtWithContext(
 
 int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
                                  size_t size) {
-  const bool remote_only = mpp_open_enabled && mpp_io_enabled;
+  size_t bytes_read = 0;
+  return readAtFallbackWithBytes(file_id, offset, data, size, bytes_read);
+}
 
-  if (remote_only) {
-    int remote_handle = -1;
-    {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
-      auto it = remote_file_handle_map.find(file_id);
-      if (it != remote_file_handle_map.end())
-        remote_handle = it->second;
-    }
-    if (remote_handle < 0) {
-      io_log("Error: Missing remote handle for file %d\n", file_id);
-      traceHandleState("readAtFallback.remote_only.missing_remote", file_id,
-                       remote_handle);
-      return -1;
-    }
-    remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
-    remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
-    bool pread_ok = false;
-    {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-      pread_ok = ompfile::mpp::pread(remote_handle, offset, data, size);
-    }
-    if (!pread_ok) {
-      io_log("MPP pread failed for file %d\n", file_id);
-      traceHandleState("readAtFallback.remote_only.pread_fail", file_id,
-                       remote_handle);
-      return -1;
-    }
-
-    io_log("MPP read at offset completed.\n");
-    return 0;
+int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
+                                          size_t size, size_t &bytes_read) {
+  bytes_read = 0;
+  if (offset < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (!data && size > 0) {
+    errno = EINVAL;
+    return -1;
   }
 
   // Check if the file handle is valid
@@ -526,13 +550,24 @@ int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
     bool pread_ok = false;
     {
       const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-      pread_ok = ompfile::mpp::pread(remote_handle, offset, data, size);
+      pread_ok =
+          ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
     }
     if (!pread_ok) {
       io_log("MPP pread failed for file %d\n", file_id);
       traceHandleState("readAtFallback.mpp_io.pread_fail", file_id,
                        remote_handle);
       return -1;
+    }
+    if (bytes_read > size) {
+      errno = EPROTO;
+      return -1;
+    }
+    if (bytes_read < size && data) {
+      const size_t short_bytes = size - bytes_read;
+      short_read_count.fetch_add(1, std::memory_order_relaxed);
+      short_read_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
+      std::memset(static_cast<char *>(data) + bytes_read, 0, short_bytes);
     }
 
     io_log("MPP read at offset completed.\n");
@@ -550,12 +585,34 @@ int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
     file = it->second;
   }
 
-  // Perform the actual read at the specified offset
-  int ret =
-      MPI_File_read_at(file, offset, data, size, MPI_BYTE, MPI_STATUS_IGNORE);
+  if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+
+  MPI_Status status{};
+  const int ret = MPI_File_read_at(file, offset, data, static_cast<int>(size),
+                                   MPI_BYTE, &status);
   if (ret != MPI_SUCCESS) {
     io_log("Error: Read at offset failed\n");
     return -1;
+  }
+  int count = 0;
+  if (MPI_Get_count(&status, MPI_BYTE, &count) != MPI_SUCCESS || count < 0) {
+    errno = EIO;
+    return -1;
+  }
+
+  bytes_read = static_cast<size_t>(count);
+  if (bytes_read > size) {
+    errno = EPROTO;
+    return -1;
+  }
+  if (bytes_read < size && data) {
+    const size_t short_bytes = size - bytes_read;
+    short_read_count.fetch_add(1, std::memory_order_relaxed);
+    short_read_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
+    std::memset(static_cast<char *>(data) + bytes_read, 0, short_bytes);
   }
 
   io_log("Read at offset completed\n");
@@ -680,13 +737,15 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
 
   if (group.size() == 1) {
     TwoPhaseReadRequest *request = group.front();
-    const int rc = readAtFallback(request->FileHandle, request->Offset,
-                                  request->Buffer, request->Size);
+    size_t bytes_read = 0;
+    const int rc = readAtFallbackWithBytes(request->FileHandle, request->Offset,
+                                           request->Buffer, request->Size,
+                                           bytes_read);
     completeTwoPhaseRequest(*request, rc, rc == 0 ? 0 : errno);
     io_trace("MPIIOBackend::processTwoPhaseGroup singleton req=%llu rc=%d "
-             "errno=%d\n",
+             "errno=%d bytes_read=%zu\n",
              static_cast<unsigned long long>(request->DebugRequestId), rc,
-             rc == 0 ? 0 : errno);
+             rc == 0 ? 0 : errno, bytes_read);
     return;
   }
 
@@ -709,6 +768,19 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
   std::vector<CoalescedRead> coalesced;
   coalesced.reserve(group.size());
   for (TwoPhaseReadRequest *request : group) {
+    if (request->Offset < 0) {
+      completeTwoPhaseRequest(*request, -1, EINVAL);
+      continue;
+    }
+    if (request->Size >
+            static_cast<size_t>(std::numeric_limits<long>::max()) ||
+        request->Offset >
+            std::numeric_limits<long>::max() -
+                static_cast<long>(request->Size)) {
+      completeTwoPhaseRequest(*request, -1, EOVERFLOW);
+      continue;
+    }
+
     const long start = request->Offset;
     const long end = start + static_cast<long>(request->Size);
     if (coalesced.empty()) {
@@ -740,6 +812,8 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     item.Requests.push_back(request);
     coalesced.push_back(std::move(item));
   }
+  if (coalesced.empty())
+    return;
 
   ompfile::OmpFileIOBatchRequest batch_request{};
   batch_request.AbiVersion = ompfile::OMPFILE_SCHED_BATCH_ABI_VERSION;
@@ -795,6 +869,12 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       for (size_t i = 0; i < batch_entries.size(); ++i) {
         const ompfile::OmpFileIOBatchPlanEntry &entry = batch_entries[i];
         CoalescedRead &item = coalesced[i];
+        if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_FILE_AFFINITY) != 0)
+          two_phase_planner_affinity_count.fetch_add(1,
+                                                     std::memory_order_relaxed);
+        if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_REBALANCED) != 0)
+          two_phase_planner_rebalanced_count.fetch_add(
+              1, std::memory_order_relaxed);
         if (entry.Status != 0) {
           item.Skip = true;
           item.ErrorStatus = -1;
@@ -826,9 +906,11 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     two_phase_coalesced_bytes_total.fetch_add(read_size,
                                               std::memory_order_relaxed);
     std::vector<char> buffer(read_size);
+    size_t bytes_read = 0;
 
-    const int rc = readAtFallback(item.Requests.front()->FileHandle, item.Start,
-                                  buffer.data(), read_size);
+    const int rc = readAtFallbackWithBytes(item.Requests.front()->FileHandle,
+                                           item.Start, buffer.data(), read_size,
+                                           bytes_read);
     if (rc != 0) {
       const int errnum = errno;
       io_trace("MPIIOBackend::processTwoPhaseGroup coalesced read failed "
@@ -842,13 +924,21 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     for (TwoPhaseReadRequest *request : item.Requests) {
       const size_t scatter_offset =
           static_cast<size_t>(request->Offset - item.Start);
+      assert(scatter_offset <= buffer.size() &&
+             "Scatter offset must stay within coalesced read buffer.");
+      if (scatter_offset > buffer.size() ||
+          request->Size > (buffer.size() - scatter_offset)) {
+        completeTwoPhaseRequest(*request, -1, EPROTO);
+        continue;
+      }
       std::memcpy(request->Buffer, buffer.data() + scatter_offset,
                   request->Size);
       completeTwoPhaseRequest(*request, 0, 0);
     }
     io_trace("MPIIOBackend::processTwoPhaseGroup coalesced read success "
-             "start=%ld end=%ld size=%zu scattered=%zu\n",
-             item.Start, item.End, read_size, item.Requests.size());
+             "start=%ld end=%ld size=%zu bytes_read=%zu scattered=%zu\n",
+             item.Start, item.End, read_size, bytes_read,
+             item.Requests.size());
   }
 }
 
@@ -1039,6 +1129,38 @@ bool MPIIOBackend::parseBoolEnv(const char *name, bool default_value) {
   return default_value;
 }
 
+MPIIOBackend::TwoPhasePolicy
+MPIIOBackend::parseTwoPhasePolicy(const char *env_value) {
+  if (!env_value || env_value[0] == '\0')
+    return TwoPhasePolicy::Disabled;
+
+  if (std::strcmp(env_value, "1") == 0)
+    return TwoPhasePolicy::Enabled;
+  if (std::strcmp(env_value, "0") == 0)
+    return TwoPhasePolicy::Disabled;
+  if (std::strcmp(env_value, "auto") == 0 ||
+      std::strcmp(env_value, "AUTO") == 0) {
+    return TwoPhasePolicy::Auto;
+  }
+
+  io_log("Invalid LIBOMPFILE_OPT_TWO_PHASE='%s'; using disabled policy.\n",
+         env_value);
+  return TwoPhasePolicy::Disabled;
+}
+
+const char *
+MPIIOBackend::twoPhasePolicyToString(TwoPhasePolicy policy) {
+  switch (policy) {
+  case TwoPhasePolicy::Disabled:
+    return "disabled";
+  case TwoPhasePolicy::Enabled:
+    return "enabled";
+  case TwoPhasePolicy::Auto:
+    return "auto";
+  }
+  return "unknown";
+}
+
 uint64_t MPIIOBackend::parseUint64Env(const char *name, uint64_t default_value) {
   const char *env = std::getenv(name);
   if (!env)
@@ -1070,6 +1192,10 @@ void MPIIOBackend::reportPhase0Stats() const {
       remote_pread_event_count.load(std::memory_order_relaxed);
   const uint64_t remote_bytes =
       remote_pread_bytes_total.load(std::memory_order_relaxed);
+  const uint64_t short_reads =
+      short_read_count.load(std::memory_order_relaxed);
+  const uint64_t short_read_bytes =
+      short_read_bytes_total.load(std::memory_order_relaxed);
   const uint64_t fallback_count =
       two_phase_fallback_count.load(std::memory_order_relaxed);
   const uint64_t batch_count =
@@ -1082,6 +1208,10 @@ void MPIIOBackend::reportPhase0Stats() const {
       two_phase_planner_batch_count.load(std::memory_order_relaxed);
   const uint64_t planner_segments =
       two_phase_planner_segment_count.load(std::memory_order_relaxed);
+  const uint64_t planner_affinity =
+      two_phase_planner_affinity_count.load(std::memory_order_relaxed);
+  const uint64_t planner_rebalanced =
+      two_phase_planner_rebalanced_count.load(std::memory_order_relaxed);
   const uint64_t planner_scalar_fallbacks =
       two_phase_planner_scalar_fallback_count.load(std::memory_order_relaxed);
   const uint64_t planner_errors =
@@ -1098,24 +1228,32 @@ void MPIIOBackend::reportPhase0Stats() const {
 
   io_log("Two-phase stats: pread_requests=%llu remote_pread_events=%llu "
          "remote_pread_bytes_total=%llu remote_pread_avg_bytes=%.2f "
+         "short_reads=%llu short_read_bytes=%llu "
          "batch_count=%llu coalesced_reads=%llu coalesced_bytes=%llu "
          "coalesced_avg_bytes=%.2f planner_batches=%llu "
-         "planner_segments=%llu planner_scalar_fallbacks=%llu "
+         "planner_segments=%llu planner_affinity=%llu "
+         "planner_rebalanced=%llu planner_scalar_fallbacks=%llu "
          "planner_errors=%llu fallbacks=%llu two_phase_enabled=%d "
-         "two_phase_active=%d window_us=%llu max_batch_bytes=%llu\n",
+         "two_phase_active=%d two_phase_policy=%s window_us=%llu "
+         "max_batch_bytes=%llu\n",
          static_cast<unsigned long long>(pread_reqs),
          static_cast<unsigned long long>(remote_events),
          static_cast<unsigned long long>(remote_bytes), avg_remote_bytes,
+         static_cast<unsigned long long>(short_reads),
+         static_cast<unsigned long long>(short_read_bytes),
          static_cast<unsigned long long>(batch_count),
          static_cast<unsigned long long>(coalesced_reads),
          static_cast<unsigned long long>(coalesced_bytes), avg_coalesced_bytes,
          static_cast<unsigned long long>(planner_batches),
          static_cast<unsigned long long>(planner_segments),
+         static_cast<unsigned long long>(planner_affinity),
+         static_cast<unsigned long long>(planner_rebalanced),
          static_cast<unsigned long long>(planner_scalar_fallbacks),
          static_cast<unsigned long long>(planner_errors),
          static_cast<unsigned long long>(fallback_count),
          static_cast<int>(two_phase_enabled),
          static_cast<int>(isTwoPhaseActive()),
+         twoPhasePolicyToString(two_phase_policy),
          static_cast<unsigned long long>(two_phase_window_us),
          static_cast<unsigned long long>(two_phase_max_batch_bytes));
 }
