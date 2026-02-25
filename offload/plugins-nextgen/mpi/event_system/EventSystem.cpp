@@ -226,8 +226,14 @@ MPIRequestManagerTy::~MPIRequestManagerTy() {
 /// Send a message to \p OtherRank asynchronously.
 void MPIRequestManagerTy::send(const void *Buffer, int Size,
                                MPI_Datatype Datatype) {
-  MPI_Isend(Buffer, Size, Datatype, OtherRank, Tag, Comm,
-            &Requests.emplace_back(MPI_REQUEST_NULL));
+  MPI_Request &Req = Requests.emplace_back(MPI_REQUEST_NULL);
+  int MPIError = ompfileWithMPICallLock([&]() {
+    return MPI_Isend(Buffer, Size, Datatype, OtherRank, Tag, Comm, &Req);
+  });
+  if (MPIError != MPI_SUCCESS) {
+    PendingMPIError = MPIError;
+    Req = MPI_REQUEST_NULL;
+  }
 }
 
 /// Divide the \p Buffer into fragments of size \p MPIFragmentSize and send them
@@ -248,8 +254,14 @@ void MPIRequestManagerTy::sendInBatchs(void *Buffer, int64_t Size) {
 /// Receive a message from \p OtherRank asynchronously.
 void MPIRequestManagerTy::receive(void *Buffer, int Size,
                                   MPI_Datatype Datatype) {
-  MPI_Irecv(Buffer, Size, Datatype, OtherRank, Tag, Comm,
-            &Requests.emplace_back(MPI_REQUEST_NULL));
+  MPI_Request &Req = Requests.emplace_back(MPI_REQUEST_NULL);
+  int MPIError = ompfileWithMPICallLock([&]() {
+    return MPI_Irecv(Buffer, Size, Datatype, OtherRank, Tag, Comm, &Req);
+  });
+  if (MPIError != MPI_SUCCESS) {
+    PendingMPIError = MPIError;
+    Req = MPI_REQUEST_NULL;
+  }
 }
 
 /// Asynchronously receive message fragments from \p OtherRank and reconstruct
@@ -269,6 +281,17 @@ void MPIRequestManagerTy::receiveInBatchs(void *Buffer, int64_t Size) {
 
 /// Coroutine that waits until all pending requests finish.
 EventTy MPIRequestManagerTy::wait() {
+  if (PendingMPIError != MPI_SUCCESS) {
+    ompfileTrace("MPIRequestManagerTy::wait pending mpi error this=%p "
+                 "mpi_error=%d req_count=%zu\n",
+                 static_cast<void *>(this), PendingMPIError, Requests.size());
+    co_return createError("MPI request setup failed with code %d",
+                          PendingMPIError);
+  }
+
+  if (Requests.empty())
+    co_return llvm::Error::success();
+
   int RequestsCompleted = false;
   uint64_t PollIterations = 0;
   ompfileTrace("MPIRequestManagerTy::wait enter this=%p req_count=%zu "
@@ -289,8 +312,10 @@ EventTy MPIRequestManagerTy::wait() {
       traceRequestSample(Requests);
     }
 
-    int MPIError = MPI_Testall(Requests.size(), Requests.data(),
-                               &RequestsCompleted, MPI_STATUSES_IGNORE);
+    int MPIError = ompfileWithMPICallLock([&]() {
+      return MPI_Testall(Requests.size(), Requests.data(), &RequestsCompleted,
+                         MPI_STATUSES_IGNORE);
+    });
 
     if (MPIError != MPI_SUCCESS) {
       char ErrBuf[MPI_MAX_ERROR_STRING] = {0};
@@ -1029,13 +1054,15 @@ EventTy EventSystemTy::createExchangeEvent(int SrcDevice, const void *SrcBuffer,
   MPI_Request SrcRequest = MPI_REQUEST_NULL;
   MPI_Request DstRequest = MPI_REQUEST_NULL;
 
-  int MPIError = MPI_Isend(SrcEventNotificationInfo, 3, MPI_INT, SrcRank,
-                           static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                           GateThreadComm, &SrcRequest);
-
-  MPIError &= MPI_Isend(DstEventNotificationInfo, 3, MPI_INT, DstRank,
-                        static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                        GateThreadComm, &DstRequest);
+  int MPIError = ompfileWithMPICallLock([&]() {
+    int Rc = MPI_Isend(SrcEventNotificationInfo, 3, MPI_INT, SrcRank,
+                       static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                       GateThreadComm, &SrcRequest);
+    Rc &= MPI_Isend(DstEventNotificationInfo, 3, MPI_INT, DstRank,
+                    static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                    GateThreadComm, &DstRequest);
+    return Rc;
+  });
 
   if (MPIError != MPI_SUCCESS)
     co_return createError(

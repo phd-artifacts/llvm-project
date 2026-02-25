@@ -21,6 +21,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -48,6 +49,28 @@ template <typename... ArgsTy>
 static llvm::Error createError(const char *ErrFmt, ArgsTy... Args) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), ErrFmt,
                                  Args...);
+}
+
+inline bool ompfileSerializeMPICallsEnabled() {
+  static const bool Enabled = []() {
+    const char *Env = std::getenv("LIBOMPFILE_MPI_SERIALIZE");
+    return !(Env && Env[0] == '0' && Env[1] == '\0');
+  }();
+  return Enabled;
+}
+
+inline std::mutex &ompfileMPICallMutex() {
+  static std::mutex M;
+  return M;
+}
+
+template <typename FnTy>
+inline decltype(auto) ompfileWithMPICallLock(FnTy &&Fn) {
+  if (!ompfileSerializeMPICallsEnabled())
+    return std::forward<FnTy>(Fn)();
+
+  std::lock_guard<std::mutex> Lock(ompfileMPICallMutex());
+  return std::forward<FnTy>(Fn)();
 }
 
 /// The event type (type of action it will performed).
@@ -154,6 +177,8 @@ enum OmpFileBatchRequestFlags : uint32_t {
 enum OmpFileBatchPlanFlags : uint32_t {
   OMPFILE_BATCH_PLAN_BATCH_API = 1u << 0,
   OMPFILE_BATCH_PLAN_SCALAR_FALLBACK = 1u << 1,
+  OMPFILE_BATCH_PLAN_FILE_AFFINITY = 1u << 2,
+  OMPFILE_BATCH_PLAN_REBALANCED = 1u << 3,
 };
 
 struct OmpFileIOBatchSegment {
@@ -368,6 +393,8 @@ class MPIRequestManagerTy {
   const int Tag;
   /// Pending MPI requests.
   llvm::SmallVector<MPI_Request> Requests;
+  /// First MPI API error seen while creating pending requests.
+  int PendingMPIError = MPI_SUCCESS;
   /// Maximum buffer Size to use during data transfer.
   Int64Envar MPIFragmentSize;
 
@@ -393,9 +420,11 @@ public:
 
   MPIRequestManagerTy(MPIRequestManagerTy &&Other) noexcept
       : Comm(Other.Comm), Tag(Other.Tag), Requests(Other.Requests),
+        PendingMPIError(Other.PendingMPIError),
         MPIFragmentSize(Other.MPIFragmentSize), OtherRank(Other.OtherRank),
         DeviceId(Other.DeviceId), EventType(Other.EventType) {
     Other.Requests = {};
+    Other.PendingMPIError = MPI_SUCCESS;
   }
 
   MPIRequestManagerTy &operator=(MPIRequestManagerTy &&Other) = delete;
@@ -706,9 +735,11 @@ EventTy EventSystemTy::NotificationEvent(EventFuncTy EventFunc, EventTypeTy Even
   int EventNotificationInfo[] = {static_cast<int>(EventType), EventTag,
                                 RemoteDeviceId};
   MPI_Request NotificationRequest = MPI_REQUEST_NULL;
-  int MPIError = MPI_Isend(EventNotificationInfo, 3, MPI_INT, RemoteRank,
-                          static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                          GateThreadComm, &NotificationRequest);
+  int MPIError = ompfileWithMPICallLock([&]() {
+    return MPI_Isend(EventNotificationInfo, 3, MPI_INT, RemoteRank,
+                     static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                     GateThreadComm, &NotificationRequest);
+  });
 
   if (MPIError != MPI_SUCCESS)
     co_return createError("MPI failed during event notification with error %d",
