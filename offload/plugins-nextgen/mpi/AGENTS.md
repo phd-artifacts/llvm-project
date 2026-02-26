@@ -58,5 +58,14 @@ This scope covers MPP event routing, scheduler selection, and proxy-side I/O dis
 
 ## MkDocs sync requirements
 - Any MPP control-plane/event behavior change must update MkDocs in the same workstream.
+- In each implementation step, update `docs/roadmap.md` and
+  append/update `docs/journal.md`.
+- Journal entries must use short meeting-style bullets:
+  - goal
+  - edited code (high-level)
+  - changes
+  - tests
+  - current limitations and unresolved problems
 - Update roadmap with current stage, known limitations, sorgan speedups/slowdowns, and current/expected challenges.
 - Update flow/architecture diagrams when event routing, scheduler planning, or proxy execution paths change.
+- Always highlight current limitations and unresolved problems.

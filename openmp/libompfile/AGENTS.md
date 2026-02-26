@@ -69,6 +69,14 @@ This scope covers libompfile backend behavior and MPP shim usage.
 
 ## MkDocs sync requirements
 - Any libompfile runtime behavior change must update MkDocs in the same workstream.
+- In each implementation step, update `docs/roadmap.md` and
+  append/update `docs/journal.md`.
+- Journal entries must use short meeting-style bullets:
+  - goal
+  - edited code (high-level)
+  - changes
+  - tests
+  - current limitations and unresolved problems
 - Keep `docs/roadmap.md` marked with:
   - current phase/stage
   - limitations and instability conditions
@@ -79,3 +87,4 @@ This scope covers libompfile backend behavior and MPP shim usage.
   - disk access pattern description
   - execution flow description
   - software architecture description
+- Always highlight current limitations and unresolved problems.
