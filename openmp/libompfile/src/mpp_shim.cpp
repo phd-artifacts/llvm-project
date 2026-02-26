@@ -282,9 +282,10 @@ bool pwriteEx(int handle, int64_t offset, const void *buffer, size_t size,
               size_t &bytes_written) {
   const uint64_t call_id = nextShimCallId();
   bytes_written = 0;
-  io_trace("mpp_shim::pwrite enter call=%llu handle=%d offset=%lld size=%zu\n",
+  io_trace("mpp_shim::pwrite enter call=%llu handle=%d offset=%lld size=%zu "
+           "buffer=%p\n",
            static_cast<unsigned long long>(call_id), handle,
-           static_cast<long long>(offset), size);
+           static_cast<long long>(offset), size, buffer);
   if (!buffer && size > 0)
     return false;
 

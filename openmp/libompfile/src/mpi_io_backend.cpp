@@ -1042,10 +1042,16 @@ int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
                                          remaining, call_bytes_written);
     }
     if (!pwrite_ok) {
+      const int saved_errno = errno;
+      io_trace("MPIIOBackend::writeAtRemoteHandle pwriteEx fail "
+               "remote_handle=%d offset=%ld remaining=%zu cursor=%p errno=%d\n",
+               remote_handle, current_offset, remaining,
+               static_cast<const void *>(cursor), saved_errno);
       if (errno == EIO && remaining > 0) {
         short_write_count.fetch_add(1, std::memory_order_relaxed);
         short_write_bytes_total.fetch_add(remaining, std::memory_order_relaxed);
       }
+      errno = saved_errno;
       return -1;
     }
     if (call_bytes_written > remaining) {
@@ -1114,7 +1120,10 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
     size_t bytes_written = 0;
     if (writeAtRemoteHandle(remote_handle, offset, data, size, bytes_written) !=
         0) {
-      io_log("MPP pwrite failed for file %d\n", file_id);
+      io_log("MPP pwrite failed for file %d (remote_handle=%d offset=%lld "
+             "size=%zu errno=%d)\n",
+             file_id, remote_handle, static_cast<long long>(offset), size,
+             errno);
       return -1;
     }
     assert(bytes_written == size && "Remote pwrite must complete full request");
@@ -1139,7 +1148,10 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
     size_t bytes_written = 0;
     if (writeAtRemoteHandle(remote_handle, offset, data, size, bytes_written) !=
         0) {
-      io_log("MPP pwrite failed for file %d\n", file_id);
+      io_log("MPP pwrite failed for file %d (remote_handle=%d offset=%lld "
+             "size=%zu errno=%d)\n",
+             file_id, remote_handle, static_cast<long long>(offset), size,
+             errno);
       return -1;
     }
     assert(bytes_written == size && "Remote pwrite must complete full request");
