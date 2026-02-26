@@ -508,7 +508,7 @@ EventTy ompfilePread(MPIRequestManagerTy RequestManager, int RemoteHandle,
                      int *IoRet, int *RemoteErrno, uint64_t *Bytes);
 EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
                       int64_t Offset, const void *Buffer, uint64_t Size,
-                      int *IoRet, int *RemoteErrno);
+                      int *IoRet, int *RemoteErrno, uint64_t *Bytes);
 EventTy ompfileSchedRequest(MPIRequestManagerTy RequestManager,
                             const OmpFileIORequest *Request, const char *Path,
                             OmpFileIOPlan *Plan);

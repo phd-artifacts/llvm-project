@@ -687,7 +687,11 @@ EventTy ompfilePread(MPIRequestManagerTy RequestManager, int RemoteHandle,
 
 EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
                       int64_t Offset, const void *Buffer, uint64_t Size,
-                      int *IoRet, int *RemoteErrno) {
+                      int *IoRet, int *RemoteErrno, uint64_t *Bytes) {
+  if (!IoRet || !RemoteErrno || !Bytes)
+    co_return createError("OMPFile pwrite missing output buffers.");
+  *Bytes = 0;
+
   RequestManager.send(&RemoteHandle, 1, MPI_INT);
   RequestManager.send(&Offset, 1, MPI_INT64_T);
   RequestManager.send(&Size, 1, MPI_UINT64_T);
@@ -696,6 +700,7 @@ EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
 
   RequestManager.receive(IoRet, 1, MPI_INT);
   RequestManager.receive(RemoteErrno, 1, MPI_INT);
+  RequestManager.receive(Bytes, 1, MPI_UINT64_T);
 
   if (auto Error = co_await RequestManager; Error)
     co_return Error;

@@ -1656,10 +1656,14 @@ int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
   return ompfile_mpp_pread_ex(Handle, Offset, Buffer, Size, &BytesRead);
 }
 
-int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer, uint64_t Size) {
+int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
+                          uint64_t Size, uint64_t *BytesWritten) {
   using namespace llvm::omp::target::plugin;
   if (!Buffer && Size > 0)
     return OFFLOAD_FAIL;
+  if (!BytesWritten)
+    return OFFLOAD_FAIL;
+  *BytesWritten = 0;
 
   MPIPluginTy *Plugin = ActiveMPIPlugin.load();
   if (!Plugin)
@@ -1673,10 +1677,11 @@ int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer, uint64_t 
 
   int IoRet = -1;
   int RemoteErrno = 0;
+  uint64_t Bytes = 0;
   EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
       OriginEvents::ompfilePwrite, EventTypeTy::OMPFILE_PWRITE,
       /*DstDeviceID=*/0, Handle, Offset, Buffer, Size, &IoRet,
-      &RemoteErrno);
+      &RemoteErrno, &Bytes);
   if (Event.empty())
     return OFFLOAD_FAIL;
 
@@ -1688,7 +1693,25 @@ int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer, uint64_t 
     errno = RemoteErrno;
     return OFFLOAD_FAIL;
   }
+  if (Bytes > Size) {
+    errno = EPROTO;
+    return OFFLOAD_FAIL;
+  }
+  *BytesWritten = Bytes;
 
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,
+                       uint64_t Size) {
+  uint64_t BytesWritten = 0;
+  if (ompfile_mpp_pwrite_ex(Handle, Offset, Buffer, Size, &BytesWritten) !=
+      OFFLOAD_SUCCESS)
+    return OFFLOAD_FAIL;
+  if (BytesWritten != Size) {
+    errno = EIO;
+    return OFFLOAD_FAIL;
+  }
   return OFFLOAD_SUCCESS;
 }
 

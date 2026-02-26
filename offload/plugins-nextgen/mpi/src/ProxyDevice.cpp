@@ -1110,16 +1110,23 @@ struct ProxyDevice {
       co_return Error;
 
     ssize_t BytesWritten = 0;
+    uint64_t BytesWrittenOut = 0;
     int Errno = 0;
     if (Size > 0) {
       BytesWritten = ::pwrite(Fd, Buffer.data(), Size, static_cast<off_t>(Offset));
-      if (BytesWritten < 0)
+      if (BytesWritten < 0) {
         Errno = errno;
+      } else {
+        BytesWrittenOut = static_cast<uint64_t>(BytesWritten);
+        if (BytesWrittenOut < Size)
+          Errno = EIO;
+      }
     }
 
-    int Ret = (BytesWritten < 0) ? -1 : 0;
+    int Ret = (BytesWritten < 0 || BytesWrittenOut < Size) ? -1 : 0;
     RequestManager.send(&Ret, 1, MPI_INT);
     RequestManager.send(&Errno, 1, MPI_INT);
+    RequestManager.send(&BytesWrittenOut, 1, MPI_UINT64_T);
     RequestManager.send(nullptr, 0, MPI_BYTE);
     co_return (co_await RequestManager);
   }
@@ -1500,18 +1507,24 @@ struct ProxyDevice {
   }
 
   bool pwriteOnRank(int Rank, int RemoteHandle, int64_t Offset,
-                    const void *Buffer, uint64_t Size) {
+                    const void *Buffer, uint64_t Size,
+                    uint64_t *BytesWrittenOut) {
     if (!Buffer && Size > 0) {
       errno = EINVAL;
       return false;
     }
+    if (BytesWrittenOut)
+      *BytesWrittenOut = 0;
 
     if (Rank == EventSystem.LocalRank) {
       const ssize_t BytesWritten =
           ::pwrite(RemoteHandle, Buffer, Size, static_cast<off_t>(Offset));
       if (BytesWritten < 0)
         return false;
-      if (static_cast<uint64_t>(BytesWritten) < Size) {
+      const uint64_t Bytes = static_cast<uint64_t>(BytesWritten);
+      if (BytesWrittenOut)
+        *BytesWrittenOut = Bytes;
+      if (Bytes < Size) {
         errno = EIO;
         return false;
       }
@@ -1520,14 +1533,25 @@ struct ProxyDevice {
 
     int IoRet = -1;
     int RemoteErrno = 0;
+    uint64_t Bytes = 0;
     EventTy Event = createRankEvent(
         OriginEvents::ompfilePwrite, EventTypeTy::OMPFILE_PWRITE, Rank,
         /*TargetDeviceId=*/0, RemoteHandle, Offset, Buffer, Size, &IoRet,
-        &RemoteErrno);
+        &RemoteErrno, &Bytes);
     if (!waitForEvent(Event, "pwrite"))
       return false;
     if (IoRet != 0) {
       errno = RemoteErrno;
+      return false;
+    }
+    if (Bytes > Size) {
+      errno = EPROTO;
+      return false;
+    }
+    if (BytesWrittenOut)
+      *BytesWrittenOut = Bytes;
+    if (Bytes < Size) {
+      errno = EIO;
       return false;
     }
     return true;
@@ -1685,12 +1709,29 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
-  int mppPwrite(int Handle, int64_t Offset, const void *Buffer, uint64_t Size) {
+  int mppPwriteEx(int Handle, int64_t Offset, const void *Buffer, uint64_t Size,
+                  uint64_t *BytesWritten) {
+    if (!BytesWritten)
+      return OFFLOAD_FAIL;
+    *BytesWritten = 0;
     OmpFileHandleEntry Entry{};
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
-    if (!pwriteOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size))
+    if (!pwriteOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
+                      BytesWritten))
       return OFFLOAD_FAIL;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppPwrite(int Handle, int64_t Offset, const void *Buffer, uint64_t Size) {
+    uint64_t BytesWritten = 0;
+    if (mppPwriteEx(Handle, Offset, Buffer, Size, &BytesWritten) !=
+        OFFLOAD_SUCCESS)
+      return OFFLOAD_FAIL;
+    if (BytesWritten != Size) {
+      errno = EIO;
+      return OFFLOAD_FAIL;
+    }
     return OFFLOAD_SUCCESS;
   }
 
@@ -2315,6 +2356,14 @@ int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppPwrite(Handle, Offset, Buffer, Size);
+}
+
+int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
+                          uint64_t Size, uint64_t *BytesWritten) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppPwriteEx(Handle, Offset, Buffer, Size, BytesWritten);
 }
 
 int ompfile_mpp_poll(uint64_t Token, int *Done) {
