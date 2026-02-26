@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -239,15 +240,29 @@ void MPIRequestManagerTy::send(const void *Buffer, int Size,
 /// Divide the \p Buffer into fragments of size \p MPIFragmentSize and send them
 /// to \p OtherRank asynchronously.
 void MPIRequestManagerTy::sendInBatchs(void *Buffer, int64_t Size) {
+  if (Size <= 0)
+    return;
+
+  const int64_t FragmentSize = MPIFragmentSize.get();
+  if (FragmentSize <= 0) {
+    PendingMPIError = MPI_ERR_COUNT;
+    return;
+  }
+
+  constexpr int64_t MaxMPIChunk =
+      static_cast<int64_t>(std::numeric_limits<int>::max());
+
   // Operates over many fragments of the original buffer of at most
   // MPI_FRAGMENT_SIZE bytes.
   char *BufferByteArray = reinterpret_cast<char *>(Buffer);
   int64_t RemainingBytes = Size;
+  int64_t Offset = 0;
   while (RemainingBytes > 0) {
-    send(&BufferByteArray[Size - RemainingBytes],
-         static_cast<int>(std::min(RemainingBytes, MPIFragmentSize.get())),
-         MPI_BYTE);
-    RemainingBytes -= MPIFragmentSize.get();
+    const int64_t Chunk = std::min({RemainingBytes, FragmentSize, MaxMPIChunk});
+    assert(Chunk > 0 && "MPI fragment chunk must be positive.");
+    send(&BufferByteArray[Offset], static_cast<int>(Chunk), MPI_BYTE);
+    Offset += Chunk;
+    RemainingBytes -= Chunk;
   }
 }
 
@@ -267,15 +282,29 @@ void MPIRequestManagerTy::receive(void *Buffer, int Size,
 /// Asynchronously receive message fragments from \p OtherRank and reconstruct
 /// them into \p Buffer.
 void MPIRequestManagerTy::receiveInBatchs(void *Buffer, int64_t Size) {
+  if (Size <= 0)
+    return;
+
+  const int64_t FragmentSize = MPIFragmentSize.get();
+  if (FragmentSize <= 0) {
+    PendingMPIError = MPI_ERR_COUNT;
+    return;
+  }
+
+  constexpr int64_t MaxMPIChunk =
+      static_cast<int64_t>(std::numeric_limits<int>::max());
+
   // Operates over many fragments of the original buffer of at most
   // MPI_FRAGMENT_SIZE bytes.
   char *BufferByteArray = reinterpret_cast<char *>(Buffer);
   int64_t RemainingBytes = Size;
+  int64_t Offset = 0;
   while (RemainingBytes > 0) {
-    receive(&BufferByteArray[Size - RemainingBytes],
-            static_cast<int>(std::min(RemainingBytes, MPIFragmentSize.get())),
-            MPI_BYTE);
-    RemainingBytes -= MPIFragmentSize.get();
+    const int64_t Chunk = std::min({RemainingBytes, FragmentSize, MaxMPIChunk});
+    assert(Chunk > 0 && "MPI fragment chunk must be positive.");
+    receive(&BufferByteArray[Offset], static_cast<int>(Chunk), MPI_BYTE);
+    Offset += Chunk;
+    RemainingBytes -= Chunk;
   }
 }
 
@@ -1086,6 +1115,12 @@ EventTy EventSystemTy::createExchangeEvent(int SrcDevice, const void *SrcBuffer,
 /// Tag values smaller than 'FIRST_EVENT' are reserved for control
 /// messages between the event systems of different MPI processes.
 int EventSystemTy::createNewEventTag() {
+  if (MPITagMaxValue <= static_cast<int>(ControlTagsTy::FIRST_EVENT)) {
+    REPORT("Invalid MPI tag upper bound (%d); using fallback tag %d.\n",
+           MPITagMaxValue, static_cast<int>(ControlTagsTy::FIRST_EVENT));
+    return static_cast<int>(ControlTagsTy::FIRST_EVENT);
+  }
+
   int tag = 0;
 
   do {
@@ -1096,6 +1131,13 @@ int EventSystemTy::createNewEventTag() {
 }
 
 MPI_Comm &EventSystemTy::getNewEventComm(int MPITag) {
+  if (EventCommPool.empty()) {
+    REPORT("Event communicator pool is empty; falling back to GateThreadComm.\n");
+    assert(GateThreadComm != MPI_COMM_NULL &&
+           "GateThreadComm must be valid when EventCommPool is empty");
+    return GateThreadComm;
+  }
+
   // Retrieve a comm using a round-robin strategy around the event's mpi tag.
   return EventCommPool[MPITag % EventCommPool.size()];
 }
@@ -1125,20 +1167,16 @@ bool EventSystemTy::createLocalMPIContext() {
 
   if (IsMPIInitialized)
     MPI_Query_thread(&ThreadLevel);
-  else
+  else {
     MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &ThreadLevel);
+    OwnsMPIInitialization = true;
+  }
 
   CHECK(ThreadLevel == MPI_THREAD_MULTIPLE,
         "MPI plugin requires a MPI implementation with %s thread level. "
         "Implementation only supports up to %s.\n",
         threadLevelToString(MPI_THREAD_MULTIPLE),
         threadLevelToString(ThreadLevel));
-
-  if (IsMPIInitialized && ThreadLevel == MPI_THREAD_MULTIPLE) {
-    MPI_Comm_rank(MPI_COMM_WORLD, &LocalRank);
-    MPI_Comm_size(MPI_COMM_WORLD, &WorldSize);
-    return true;
-  }
 
   // Create gate thread comm.
   MPIError = MPI_Comm_dup(MPI_COMM_WORLD, &GateThreadComm);
@@ -1147,7 +1185,14 @@ bool EventSystemTy::createLocalMPIContext() {
   configureCommErrhandlerForDebug(GateThreadComm, "GateThreadComm");
 
   // Create event comm pool.
-  EventCommPool.resize(NumMPIComms.get(), MPI_COMM_NULL);
+  int64_t NumComms = NumMPIComms.get();
+  if (NumComms <= 0) {
+    REPORT("Invalid OMPTARGET_NUM_MPI_COMMS=%lld; forcing 1.\n",
+           static_cast<long long>(NumComms));
+    NumComms = 1;
+  }
+  EventCommPool.resize(NumComms, MPI_COMM_NULL);
+  assert(!EventCommPool.empty() && "Event communicator pool must be non-empty");
   for (auto &Comm : EventCommPool) {
     MPIError = MPI_Comm_dup(MPI_COMM_WORLD, &Comm);
     CHECK(MPIError == MPI_SUCCESS,
@@ -1199,16 +1244,19 @@ bool EventSystemTy::destroyLocalMPIContext() {
   EventCommPool.resize(0);
 
   // Finalize the global MPI session.
-  int IsFinalized = false;
-  MPIError = MPI_Finalized(&IsFinalized);
+  if (OwnsMPIInitialization) {
+    int IsFinalized = false;
+    MPIError = MPI_Finalized(&IsFinalized);
 
-  if (IsFinalized) {
-    DP("MPI was already finalized externally.\n");
-  } else {
-    MPIError = MPI_Finalize();
-    CHECK(MPIError == MPI_SUCCESS, "Failed to finalize MPI with error: %d\n",
-          MPIError);
+    if (IsFinalized) {
+      DP("MPI was already finalized externally.\n");
+    } else {
+      MPIError = MPI_Finalize();
+      CHECK(MPIError == MPI_SUCCESS, "Failed to finalize MPI with error: %d\n",
+            MPIError);
+    }
   }
+  OwnsMPIInitialization = false;
 
   return true;
 }

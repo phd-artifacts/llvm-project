@@ -648,6 +648,10 @@ class EventSystemTy {
   /// Allows for parallel use of network resources.
   Int64Envar NumMPIComms;
 
+  /// True when the event system called MPI_Init_thread itself and therefore
+  /// owns MPI_Finalize during teardown.
+  bool OwnsMPIInitialization = false;
+
 private:
   /// Creates a new unique event tag for a new event.
   int createNewEventTag();

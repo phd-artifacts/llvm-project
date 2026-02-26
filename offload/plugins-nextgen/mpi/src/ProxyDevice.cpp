@@ -16,9 +16,11 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+#include <limits.h>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <sys/stat.h>
 
 #include "EventSystem.h"
 #include "OmpFileHeadnodeManager.h"
@@ -875,6 +877,9 @@ struct ProxyDevice {
       int Fd = ::open(Path, Flags, static_cast<mode_t>(Mode));
       if (Fd < 0)
         ErrnoOut = errno;
+      traceOmpFile("openWithOptionalCache nocache path=%s flags=0x%x mode=%o "
+                   "fd=%d errno=%d\n",
+                   Path, Flags, Mode, Fd, ErrnoOut);
       return Fd;
     }
 
@@ -884,6 +889,10 @@ struct ProxyDevice {
     if (It != OmpFileOpenCacheByKey.end()) {
       It->second.RefCount += 1;
       OmpFileStatsOpenCacheHits.fetch_add(1, std::memory_order_relaxed);
+      traceOmpFile("openWithOptionalCache hit path=%s flags=0x%x mode=%o "
+                   "fd=%d refcount=%llu\n",
+                   Path, Flags, Mode, It->second.Fd,
+                   static_cast<unsigned long long>(It->second.RefCount));
       return It->second.Fd;
     }
 
@@ -891,11 +900,17 @@ struct ProxyDevice {
     int Fd = ::open(Path, Flags, static_cast<mode_t>(Mode));
     if (Fd < 0) {
       ErrnoOut = errno;
+      traceOmpFile("openWithOptionalCache miss-fail path=%s flags=0x%x mode=%o "
+                   "errno=%d\n",
+                   Path, Flags, Mode, ErrnoOut);
       return -1;
     }
 
     OmpFileOpenCacheByKey.emplace(Key, OmpFileOpenCacheEntry{Fd, 1});
     OmpFileOpenCacheFdToKey[Fd] = Key;
+    traceOmpFile("openWithOptionalCache miss-open path=%s flags=0x%x mode=%o "
+                 "fd=%d refcount=1\n",
+                 Path, Flags, Mode, Fd);
     return Fd;
   }
 
@@ -908,6 +923,8 @@ struct ProxyDevice {
       int Ret = ::close(Fd);
       if (Ret != 0)
         ErrnoOut = errno;
+      traceOmpFile("closeWithOptionalCache nocache fd=%d ret=%d errno=%d\n", Fd,
+                   Ret, ErrnoOut);
       return Ret;
     }
 
@@ -921,12 +938,17 @@ struct ProxyDevice {
           OmpFileOpenCacheEntry &Entry = KeyIt->second;
           if (Entry.RefCount == 0) {
             ErrnoOut = EBADF;
+            traceOmpFile("closeWithOptionalCache bad-ref fd=%d\n", Fd);
             return -1;
           }
 
           Entry.RefCount -= 1;
           if (Entry.RefCount > 0 || OmpFileOpenCacheKeepOpen) {
             OmpFileStatsCloseDeferred.fetch_add(1, std::memory_order_relaxed);
+            traceOmpFile("closeWithOptionalCache defer fd=%d refcount=%llu "
+                         "keep_open=%d\n",
+                         Fd, static_cast<unsigned long long>(Entry.RefCount),
+                         static_cast<int>(OmpFileOpenCacheKeepOpen.get()));
             return 0;
           }
 
@@ -949,6 +971,8 @@ struct ProxyDevice {
     int Ret = ::close(Fd);
     if (Ret != 0)
       ErrnoOut = errno;
+    traceOmpFile("closeWithOptionalCache close fd=%d ret=%d errno=%d\n", Fd,
+                 Ret, ErrnoOut);
     return Ret;
   }
 
@@ -1086,6 +1110,12 @@ struct ProxyDevice {
     RequestManager.send(&PayloadSize, 1, MPI_UINT64_T);
     if (PayloadSize > 0)
       RequestManager.sendInBatchs(Buffer.data(), PayloadSize);
+    traceOmpFile("event ompfilePread fd=%d offset=%lld size=%llu buf=%p "
+                 "ret=%d errno=%d bytes=%llu\n",
+                 Fd, static_cast<long long>(Offset),
+                 static_cast<unsigned long long>(Size),
+                 static_cast<void *>(Buffer.data()), Ret, Errno,
+                 static_cast<unsigned long long>(PayloadSize));
 
     RequestManager.send(nullptr, 0, MPI_BYTE);
     co_return (co_await RequestManager);
@@ -1127,6 +1157,12 @@ struct ProxyDevice {
     RequestManager.send(&Ret, 1, MPI_INT);
     RequestManager.send(&Errno, 1, MPI_INT);
     RequestManager.send(&BytesWrittenOut, 1, MPI_UINT64_T);
+    traceOmpFile("event ompfilePwrite fd=%d offset=%lld size=%llu buf=%p "
+                 "ret=%d errno=%d bytes=%llu\n",
+                 Fd, static_cast<long long>(Offset),
+                 static_cast<unsigned long long>(Size),
+                 static_cast<void *>(Buffer.data()), Ret, Errno,
+                 static_cast<unsigned long long>(BytesWrittenOut));
     RequestManager.send(nullptr, 0, MPI_BYTE);
     co_return (co_await RequestManager);
   }
@@ -1718,8 +1754,20 @@ struct ProxyDevice {
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
     if (!pwriteOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
-                      BytesWritten))
+                      BytesWritten)) {
+      traceOmpFile("mppPwriteEx fail local=%d rank=%d remote=%d offset=%lld "
+                   "size=%llu errno=%d\n",
+                   Handle, Entry.Rank, Entry.RemoteHandle,
+                   static_cast<long long>(Offset),
+                   static_cast<unsigned long long>(Size), errno);
       return OFFLOAD_FAIL;
+    }
+    traceOmpFile("mppPwriteEx success local=%d rank=%d remote=%d offset=%lld "
+                 "size=%llu bytes=%llu\n",
+                 Handle, Entry.Rank, Entry.RemoteHandle,
+                 static_cast<long long>(Offset),
+                 static_cast<unsigned long long>(Size),
+                 static_cast<unsigned long long>(*BytesWritten));
     return OFFLOAD_SUCCESS;
   }
 
