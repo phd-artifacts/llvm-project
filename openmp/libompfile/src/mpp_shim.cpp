@@ -19,6 +19,7 @@ using MppCloseFn = int (*)(int);
 using MppPreadFn = int (*)(int, int64_t, void *, uint64_t);
 using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
+using MppPwriteExFn = int (*)(int, int64_t, const void *, uint64_t, uint64_t *);
 using MppSchedRequestFn = int (*)(const ompfile::OmpFileIORequest *,
                                   const char *, ompfile::OmpFileIOPlan *);
 using MppSchedBatchRequestFn = int (*)(const ompfile::OmpFileIOBatchRequest *,
@@ -36,6 +37,7 @@ struct MppApi {
   MppPreadFn pread = nullptr;
   MppPreadExFn pread_ex = nullptr;
   MppPwriteFn pwrite = nullptr;
+  MppPwriteExFn pwrite_ex = nullptr;
   MppSchedRequestFn sched_request = nullptr;
   MppSchedBatchRequestFn sched_batch_request = nullptr;
   MppPollFn poll = nullptr;
@@ -58,6 +60,8 @@ MppApi loadMppApi() {
       dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_ex"));
   loaded.pwrite = reinterpret_cast<MppPwriteFn>(dlsym(RTLD_DEFAULT,
                                                         "ompfile_mpp_pwrite"));
+  loaded.pwrite_ex = reinterpret_cast<MppPwriteExFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_pwrite_ex"));
   loaded.sched_request = reinterpret_cast<MppSchedRequestFn>(dlsym(
       RTLD_DEFAULT, "ompfile_mpp_sched_request"));
   loaded.sched_batch_request =
@@ -112,6 +116,8 @@ bool init() {
                         reinterpret_cast<void *>(api.pread_ex));
   io_trace_symbol_owner("ompfile_mpp_pwrite",
                         reinterpret_cast<void *>(api.pwrite));
+  io_trace_symbol_owner("ompfile_mpp_pwrite_ex",
+                        reinterpret_cast<void *>(api.pwrite_ex));
   io_trace_symbol_owner("ompfile_mpp_sched_request",
                         reinterpret_cast<void *>(api.sched_request));
   io_trace_symbol_owner("ompfile_mpp_sched_request_batch",
@@ -272,8 +278,10 @@ bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
   return true;
 }
 
-bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {
+bool pwriteEx(int handle, int64_t offset, const void *buffer, size_t size,
+              size_t &bytes_written) {
   const uint64_t call_id = nextShimCallId();
+  bytes_written = 0;
   io_trace("mpp_shim::pwrite enter call=%llu handle=%d offset=%lld size=%zu\n",
            static_cast<unsigned long long>(call_id), handle,
            static_cast<long long>(offset), size);
@@ -284,20 +292,50 @@ bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {
     return false;
 
   auto &api = getMppApi();
-  if (!api.pwrite)
+  if (!api.pwrite && !api.pwrite_ex)
     api = loadMppApi();
 
-  if (!api.pwrite) {
-    io_log("MPP shim not available (ompfile_mpp_pwrite missing).\n");
+  if (!api.pwrite && !api.pwrite_ex) {
+    io_log("MPP shim not available (ompfile_mpp_pwrite{,_ex} missing).\n");
     io_trace("mpp_shim::pwrite missing symbol call=%llu\n",
              static_cast<unsigned long long>(call_id));
     return false;
   }
 
+  if (api.pwrite_ex) {
+    uint64_t remote_bytes_written = 0;
+    const int rc =
+        api.pwrite_ex(handle, offset, buffer, size, &remote_bytes_written);
+    io_trace("mpp_shim::pwrite_ex exit call=%llu rc=%d bytes=%llu\n",
+             static_cast<unsigned long long>(call_id), rc,
+             static_cast<unsigned long long>(remote_bytes_written));
+    if (rc != 0)
+      return false;
+    if (remote_bytes_written >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+      return false;
+    bytes_written = static_cast<size_t>(remote_bytes_written);
+    return true;
+  }
+
   const int rc = api.pwrite(handle, offset, buffer, size);
-  io_trace("mpp_shim::pwrite exit call=%llu rc=%d\n",
+  io_trace("mpp_shim::pwrite legacy exit call=%llu rc=%d\n",
            static_cast<unsigned long long>(call_id), rc);
-  return rc == 0;
+  if (rc != 0)
+    return false;
+  bytes_written = size;
+  return true;
+}
+
+bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {
+  size_t bytes_written = 0;
+  if (!pwriteEx(handle, offset, buffer, size, bytes_written))
+    return false;
+  if (bytes_written != size) {
+    errno = EIO;
+    return false;
+  }
+  return true;
 }
 
 bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,

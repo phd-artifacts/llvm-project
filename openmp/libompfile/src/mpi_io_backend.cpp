@@ -73,35 +73,42 @@ MPIIOBackend::MPIIOBackend() {
     }
   }
 
+  const char *scheduler_env = std::getenv("LIBOMPFILE_SCHEDULER");
+  const bool scheduler_headnode =
+      scheduler_env && std::strcmp(scheduler_env, "HEADNODE") == 0;
+
   two_phase_policy = parseTwoPhasePolicy(std::getenv("LIBOMPFILE_OPT_TWO_PHASE"));
   if (two_phase_policy == TwoPhasePolicy::Enabled) {
     two_phase_enabled = true;
   } else if (two_phase_policy == TwoPhasePolicy::Auto) {
-    const char *scheduler_env = std::getenv("LIBOMPFILE_SCHEDULER");
-    const bool scheduler_headnode =
-        scheduler_env && std::strcmp(scheduler_env, "HEADNODE") == 0;
     two_phase_enabled = remote_only && scheduler_headnode;
   } else {
     two_phase_enabled = false;
   }
   two_phase_window_us =
-      parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_WINDOW_US", 0);
+      parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_WINDOW_US",
+                     two_phase_enabled ? kDefaultTwoPhaseWindowUs : 0);
   two_phase_max_batch_bytes =
-      parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_MAX_BATCH_BYTES", 0);
+      parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_MAX_BATCH_BYTES",
+                     two_phase_enabled ? kDefaultTwoPhaseMaxBatchBytes : 0);
 
   io_log("Two-phase guard config: policy=%s enabled=%d window_us=%llu "
-         "max_batch_bytes=%llu\n",
+         "max_batch_bytes=%llu scheduler=%s remote_only=%d\n",
          twoPhasePolicyToString(two_phase_policy),
          static_cast<int>(two_phase_enabled),
          static_cast<unsigned long long>(two_phase_window_us),
-         static_cast<unsigned long long>(two_phase_max_batch_bytes));
+         static_cast<unsigned long long>(two_phase_max_batch_bytes),
+         scheduler_env ? scheduler_env : "(unset)",
+         static_cast<int>(remote_only));
 
   if (isTwoPhaseActive()) {
     io_log("Two-phase batching active (leader/follower mode).\n");
   } else if (two_phase_enabled) {
     io_log("Two-phase requested but inactive (requires remote-only MPP mode).\n");
   } else if (two_phase_policy == TwoPhasePolicy::Auto) {
-    io_log("Two-phase auto policy resolved to disabled for this run.\n");
+    io_log("Two-phase auto policy resolved to disabled for this run: "
+           "remote_only=%d scheduler_headnode=%d.\n",
+           static_cast<int>(remote_only), static_cast<int>(scheduler_headnode));
   }
 
   int rank = -1;
@@ -225,6 +232,14 @@ int MPIIOBackend::write(int file_id, const void *data, size_t size) {
     errno = ENOTSUP;
     return -1;
   }
+  if (!data && size > 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
 
   io_log("Writing %zu bytes to file %d\n", size, file_id);
 
@@ -239,10 +254,30 @@ int MPIIOBackend::write(int file_id, const void *data, size_t size) {
     file = it->second;
   }
 
-  int ret = MPI_File_write(file, data, size, MPI_BYTE, MPI_STATUS_IGNORE);
+  MPI_Status status{};
+  const int ret = MPI_File_write(file, data, static_cast<int>(size), MPI_BYTE,
+                                 &status);
 
   if (ret != MPI_SUCCESS) {
     io_log("Error: Write failed\n");
+    return -1;
+  }
+
+  int count = 0;
+  if (MPI_Get_count(&status, MPI_BYTE, &count) != MPI_SUCCESS || count < 0) {
+    errno = EIO;
+    return -1;
+  }
+  const size_t bytes_written = static_cast<size_t>(count);
+  if (bytes_written > size) {
+    errno = EPROTO;
+    return -1;
+  }
+  if (bytes_written < size) {
+    const size_t short_bytes = size - bytes_written;
+    short_write_count.fetch_add(1, std::memory_order_relaxed);
+    short_write_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
+    errno = EIO;
     return -1;
   }
 
@@ -418,6 +453,18 @@ bool MPIIOBackend::hasUsablePlannedRead(
 int MPIIOBackend::readAtWithContext(
     const ompfile::OmpFileReadRequestContext &context, void *data,
     size_t size) {
+  if (context.Offset <
+          static_cast<int64_t>(std::numeric_limits<long>::min()) ||
+      context.Offset >
+          static_cast<int64_t>(std::numeric_limits<long>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  if (context.Size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+
   const int file_id = context.FileHandle;
   const long offset = static_cast<long>(context.Offset);
   assert(size == static_cast<size_t>(context.Size) || context.Size == 0);
@@ -926,13 +973,19 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
           static_cast<size_t>(request->Offset - item.Start);
       assert(scatter_offset <= buffer.size() &&
              "Scatter offset must stay within coalesced read buffer.");
+      if (!request->Buffer && request->Size > 0) {
+        completeTwoPhaseRequest(*request, -1, EINVAL);
+        continue;
+      }
       if (scatter_offset > buffer.size() ||
           request->Size > (buffer.size() - scatter_offset)) {
         completeTwoPhaseRequest(*request, -1, EPROTO);
         continue;
       }
-      std::memcpy(request->Buffer, buffer.data() + scatter_offset,
-                  request->Size);
+      if (request->Size > 0) {
+        std::memcpy(request->Buffer, buffer.data() + scatter_offset,
+                    request->Size);
+      }
       completeTwoPhaseRequest(*request, 0, 0);
     }
     io_trace("MPIIOBackend::processTwoPhaseGroup coalesced read success "
@@ -966,9 +1019,82 @@ bool MPIIOBackend::isTwoPhaseActive() const {
   return two_phase_enabled && mpp_open_enabled && mpp_io_enabled;
 }
 
+int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
+                                      const void *data, size_t size,
+                                      size_t &bytes_written) {
+  bytes_written = 0;
+  if (size == 0)
+    return 0;
+
+  const char *cursor = static_cast<const char *>(data);
+  long current_offset = offset;
+  size_t remaining = size;
+
+  while (remaining > 0) {
+    remote_pwrite_event_count.fetch_add(1, std::memory_order_relaxed);
+    remote_pwrite_bytes_total.fetch_add(remaining, std::memory_order_relaxed);
+
+    bool pwrite_ok = false;
+    size_t call_bytes_written = 0;
+    {
+      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      pwrite_ok = ompfile::mpp::pwriteEx(remote_handle, current_offset, cursor,
+                                         remaining, call_bytes_written);
+    }
+    if (!pwrite_ok) {
+      if (errno == EIO && remaining > 0) {
+        short_write_count.fetch_add(1, std::memory_order_relaxed);
+        short_write_bytes_total.fetch_add(remaining, std::memory_order_relaxed);
+      }
+      return -1;
+    }
+    if (call_bytes_written > remaining) {
+      errno = EPROTO;
+      return -1;
+    }
+    if (call_bytes_written == 0) {
+      short_write_count.fetch_add(1, std::memory_order_relaxed);
+      short_write_bytes_total.fetch_add(remaining, std::memory_order_relaxed);
+      errno = EIO;
+      return -1;
+    }
+
+    bytes_written += call_bytes_written;
+    if (call_bytes_written < remaining) {
+      short_write_count.fetch_add(1, std::memory_order_relaxed);
+      short_write_bytes_total.fetch_add(remaining - call_bytes_written,
+                                        std::memory_order_relaxed);
+    }
+
+    if (call_bytes_written >
+            static_cast<size_t>(std::numeric_limits<long>::max()) ||
+        current_offset > std::numeric_limits<long>::max() -
+                             static_cast<long>(call_bytes_written)) {
+      errno = EOVERFLOW;
+      return -1;
+    }
+    current_offset += static_cast<long>(call_bytes_written);
+    cursor += call_bytes_written;
+    remaining -= call_bytes_written;
+  }
+
+  assert(bytes_written == size &&
+         "writeAtRemoteHandle must account for all requested bytes.");
+  return 0;
+}
+
 int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
                           size_t size) {
   const bool remote_only = mpp_open_enabled && mpp_io_enabled;
+  pwrite_request_count.fetch_add(1, std::memory_order_relaxed);
+  if (offset < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (!data && size > 0) {
+    errno = EINVAL;
+    return -1;
+  }
 
   io_log("Writing %zu bytes to file %d at offset %lld\n", size, file_id,
          static_cast<long long>(offset));
@@ -985,15 +1111,13 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
       io_log("Error: Missing remote handle for file %d\n", file_id);
       return -1;
     }
-    bool pwrite_ok = false;
-    {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-      pwrite_ok = ompfile::mpp::pwrite(remote_handle, offset, data, size);
-    }
-    if (!pwrite_ok) {
+    size_t bytes_written = 0;
+    if (writeAtRemoteHandle(remote_handle, offset, data, size, bytes_written) !=
+        0) {
       io_log("MPP pwrite failed for file %d\n", file_id);
       return -1;
     }
+    assert(bytes_written == size && "Remote pwrite must complete full request");
 
     io_log("MPP write at offset completed.\n");
     return 0;
@@ -1012,15 +1136,13 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
       io_log("Error: Missing remote handle for file %d\n", file_id);
       return -1;
     }
-    bool pwrite_ok = false;
-    {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-      pwrite_ok = ompfile::mpp::pwrite(remote_handle, offset, data, size);
-    }
-    if (!pwrite_ok) {
+    size_t bytes_written = 0;
+    if (writeAtRemoteHandle(remote_handle, offset, data, size, bytes_written) !=
+        0) {
       io_log("MPP pwrite failed for file %d\n", file_id);
       return -1;
     }
+    assert(bytes_written == size && "Remote pwrite must complete full request");
 
     io_log("MPP write at offset completed.\n");
     return 0;
@@ -1037,11 +1159,35 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
     file = it->second;
   }
 
+  if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+
   // Perform the actual write at the specified offset
-  int ret =
-      MPI_File_write_at(file, offset, data, size, MPI_BYTE, MPI_STATUS_IGNORE);
+  MPI_Status status{};
+  const int ret = MPI_File_write_at(file, offset, data, static_cast<int>(size),
+                                    MPI_BYTE, &status);
   if (ret != MPI_SUCCESS) {
     io_log("Error: Write at offset failed\n");
+    return -1;
+  }
+
+  int count = 0;
+  if (MPI_Get_count(&status, MPI_BYTE, &count) != MPI_SUCCESS || count < 0) {
+    errno = EIO;
+    return -1;
+  }
+  const size_t bytes_written = static_cast<size_t>(count);
+  if (bytes_written > size) {
+    errno = EPROTO;
+    return -1;
+  }
+  if (bytes_written < size) {
+    const size_t short_bytes = size - bytes_written;
+    short_write_count.fetch_add(1, std::memory_order_relaxed);
+    short_write_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
+    errno = EIO;
     return -1;
   }
 
@@ -1132,12 +1278,20 @@ bool MPIIOBackend::parseBoolEnv(const char *name, bool default_value) {
 MPIIOBackend::TwoPhasePolicy
 MPIIOBackend::parseTwoPhasePolicy(const char *env_value) {
   if (!env_value || env_value[0] == '\0')
-    return TwoPhasePolicy::Disabled;
+    return TwoPhasePolicy::Auto;
 
   if (std::strcmp(env_value, "1") == 0)
     return TwoPhasePolicy::Enabled;
   if (std::strcmp(env_value, "0") == 0)
     return TwoPhasePolicy::Disabled;
+  if (std::strcmp(env_value, "enabled") == 0 ||
+      std::strcmp(env_value, "ENABLED") == 0) {
+    return TwoPhasePolicy::Enabled;
+  }
+  if (std::strcmp(env_value, "disabled") == 0 ||
+      std::strcmp(env_value, "DISABLED") == 0) {
+    return TwoPhasePolicy::Disabled;
+  }
   if (std::strcmp(env_value, "auto") == 0 ||
       std::strcmp(env_value, "AUTO") == 0) {
     return TwoPhasePolicy::Auto;
@@ -1192,10 +1346,20 @@ void MPIIOBackend::reportPhase0Stats() const {
       remote_pread_event_count.load(std::memory_order_relaxed);
   const uint64_t remote_bytes =
       remote_pread_bytes_total.load(std::memory_order_relaxed);
+  const uint64_t pwrite_reqs =
+      pwrite_request_count.load(std::memory_order_relaxed);
+  const uint64_t remote_pwrite_events =
+      remote_pwrite_event_count.load(std::memory_order_relaxed);
+  const uint64_t remote_pwrite_bytes =
+      remote_pwrite_bytes_total.load(std::memory_order_relaxed);
   const uint64_t short_reads =
       short_read_count.load(std::memory_order_relaxed);
   const uint64_t short_read_bytes =
       short_read_bytes_total.load(std::memory_order_relaxed);
+  const uint64_t short_writes =
+      short_write_count.load(std::memory_order_relaxed);
+  const uint64_t short_write_bytes =
+      short_write_bytes_total.load(std::memory_order_relaxed);
   const uint64_t fallback_count =
       two_phase_fallback_count.load(std::memory_order_relaxed);
   const uint64_t batch_count =
@@ -1221,6 +1385,11 @@ void MPIIOBackend::reportPhase0Stats() const {
       remote_events == 0 ? 0.0
                          : static_cast<double>(remote_bytes) /
                                static_cast<double>(remote_events);
+  const double avg_remote_pwrite_bytes =
+      remote_pwrite_events == 0
+          ? 0.0
+          : static_cast<double>(remote_pwrite_bytes) /
+                static_cast<double>(remote_pwrite_events);
   const double avg_coalesced_bytes =
       coalesced_reads == 0 ? 0.0
                            : static_cast<double>(coalesced_bytes) /
@@ -1228,7 +1397,10 @@ void MPIIOBackend::reportPhase0Stats() const {
 
   io_log("Two-phase stats: pread_requests=%llu remote_pread_events=%llu "
          "remote_pread_bytes_total=%llu remote_pread_avg_bytes=%.2f "
+         "pwrite_requests=%llu remote_pwrite_events=%llu "
+         "remote_pwrite_bytes_total=%llu remote_pwrite_avg_bytes=%.2f "
          "short_reads=%llu short_read_bytes=%llu "
+         "short_writes=%llu short_write_bytes=%llu "
          "batch_count=%llu coalesced_reads=%llu coalesced_bytes=%llu "
          "coalesced_avg_bytes=%.2f planner_batches=%llu "
          "planner_segments=%llu planner_affinity=%llu "
@@ -1239,8 +1411,14 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(pread_reqs),
          static_cast<unsigned long long>(remote_events),
          static_cast<unsigned long long>(remote_bytes), avg_remote_bytes,
+         static_cast<unsigned long long>(pwrite_reqs),
+         static_cast<unsigned long long>(remote_pwrite_events),
+         static_cast<unsigned long long>(remote_pwrite_bytes),
+         avg_remote_pwrite_bytes,
          static_cast<unsigned long long>(short_reads),
          static_cast<unsigned long long>(short_read_bytes),
+         static_cast<unsigned long long>(short_writes),
+         static_cast<unsigned long long>(short_write_bytes),
          static_cast<unsigned long long>(batch_count),
          static_cast<unsigned long long>(coalesced_reads),
          static_cast<unsigned long long>(coalesced_bytes), avg_coalesced_bytes,

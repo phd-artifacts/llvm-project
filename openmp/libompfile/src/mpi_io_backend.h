@@ -34,13 +34,20 @@ private:
   bool mpp_io_enabled = false;
   TwoPhasePolicy two_phase_policy = TwoPhasePolicy::Disabled;
   bool two_phase_enabled = false;
+  static constexpr uint64_t kDefaultTwoPhaseWindowUs = 2000;
+  static constexpr uint64_t kDefaultTwoPhaseMaxBatchBytes = 1024 * 1024;
   uint64_t two_phase_window_us = 0;
   uint64_t two_phase_max_batch_bytes = 0;
   std::atomic<uint64_t> pread_request_count{0};
   std::atomic<uint64_t> remote_pread_event_count{0};
   std::atomic<uint64_t> remote_pread_bytes_total{0};
+  std::atomic<uint64_t> pwrite_request_count{0};
+  std::atomic<uint64_t> remote_pwrite_event_count{0};
+  std::atomic<uint64_t> remote_pwrite_bytes_total{0};
   std::atomic<uint64_t> short_read_count{0};
   std::atomic<uint64_t> short_read_bytes_total{0};
+  std::atomic<uint64_t> short_write_count{0};
+  std::atomic<uint64_t> short_write_bytes_total{0};
   std::atomic<uint64_t> two_phase_fallback_count{0};
   std::atomic<uint64_t> two_phase_batch_count{0};
   std::atomic<uint64_t> two_phase_coalesced_read_count{0};
@@ -89,6 +96,8 @@ public:
   int writeAt(int file_id, long offset, const void *data, size_t size) override;
 
 private:
+  int writeAtRemoteHandle(int remote_handle, long offset, const void *data,
+                          size_t size, size_t &bytes_written);
   int readAtFallback(int file_id, long offset, void *data, size_t size);
   int readAtFallbackWithBytes(int file_id, long offset, void *data, size_t size,
                               size_t &bytes_read);
