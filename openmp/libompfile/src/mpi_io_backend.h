@@ -32,6 +32,13 @@ private:
   std::mutex mpp_call_mutex;
   bool mpp_open_enabled = false;
   bool mpp_io_enabled = false;
+  bool mpp_requested = false;
+  bool mpp_remote_only = false;
+  bool mpp_init_succeeded = false;
+  bool allow_fallback = false;
+  bool strict_mpp_required = false;
+  bool strict_mpp_init_failed = false;
+  mutable std::atomic<bool> strict_failure_logged{false};
   TwoPhasePolicy two_phase_policy = TwoPhasePolicy::Disabled;
   bool two_phase_enabled = false;
   static constexpr uint64_t kDefaultTwoPhaseWindowUs = 2000;
@@ -116,6 +123,7 @@ private:
   static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
   static bool shouldReportStats();
+  int failStrictMpp(const char *op_name) const;
   void traceHandleStateLocked(const char *where, int file_id,
                               int remote_handle) const;
   void traceHandleState(const char *where, int file_id, int remote_handle);

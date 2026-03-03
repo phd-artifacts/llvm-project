@@ -54,6 +54,16 @@ static const char *backendTypeToString(IOBackendTy backend_type) {
   return "UNKNOWN";
 }
 
+static bool envFlagEnabled(const char *name) {
+  const char *value = std::getenv(name);
+  return value && value[0] == '1' && value[1] == '\0';
+}
+
+static bool isMppRemoteOnlyEnabled() {
+  return envFlagEnabled("LIBOMPFILE_MPP_OPEN") &&
+         envFlagEnabled("LIBOMPFILE_MPP_IO");
+}
+
 class IOScheduler {
 public:
   virtual ~IOScheduler() {}
@@ -97,10 +107,31 @@ private:
 class HeadnodeScheduler final : public IOScheduler {
 public:
   explicit HeadnodeScheduler(IOBackend &backend)
-      : backend(backend), client_rank(resolveClientRank()) {}
+      : backend(backend), client_rank(resolveClientRank()),
+        mpp_remote_only_enabled(isMppRemoteOnlyEnabled()),
+        allow_fallback(envFlagEnabled("LIBOMPFILE_ALLOWFALLBACK")),
+        strict_mpp_required(mpp_remote_only_enabled && !allow_fallback),
+        mpp_sched_active(mpp_remote_only_enabled && ompfile::mpp::init()) {
+    if (!mpp_remote_only_enabled) {
+      io_log("HEADNODE scheduler requested but MPP remote-only mode is "
+             "disabled (requires LIBOMPFILE_MPP_OPEN=1 and "
+             "LIBOMPFILE_MPP_IO=1); using LOCAL dispatch.\n");
+    } else if (!mpp_sched_active) {
+      if (allow_fallback) {
+        io_log("HEADNODE scheduler requested but MPP init failed; "
+               "LIBOMPFILE_ALLOWFALLBACK=1, using LOCAL dispatch.\n");
+      } else {
+        io_log("HEADNODE scheduler requested but MPP init failed; fallback is "
+               "disabled, all scheduler operations will fail.\n");
+      }
+    }
+  }
 
   int open(const char *filename) override {
-    scheduleOpen(filename);
+    if (!ensureSchedulerReady("open", /*log_once=*/true))
+      return -1;
+    if (mpp_sched_active && !scheduleOpen(filename))
+      return failStrict("open");
     const int file_handle = backend.open(filename);
     if (file_handle >= 0 && filename)
       rememberOpenPath(file_handle, filename);
@@ -108,36 +139,62 @@ public:
   }
 
   int write(int file_handle, const void *data, size_t size) override {
-    scheduleWrite(file_handle, /*offset=*/0, size);
+    if (!ensureSchedulerReady("write", /*log_once=*/true))
+      return -1;
+    if (mpp_sched_active && !scheduleWrite(file_handle, /*offset=*/0, size))
+      return failStrict("write");
     return backend.write(file_handle, data, size);
   }
 
   int read(int file_handle, void *data, size_t size) override {
-    scheduleRead(file_handle, /*offset=*/0, size);
+    if (!ensureSchedulerReady("read", /*log_once=*/true))
+      return -1;
+    if (mpp_sched_active && !scheduleRead(file_handle, /*offset=*/0, size))
+      return failStrict("read");
     return backend.read(file_handle, data, size);
   }
 
   int close(int file_handle) override {
-    scheduleClose(file_handle);
+    bool schedule_ok = true;
+    if (!ensureSchedulerReady("close", /*log_once=*/true))
+      schedule_ok = false;
+    if (mpp_sched_active)
+      schedule_ok = scheduleClose(file_handle);
     const int rc = backend.close(file_handle);
     if (rc == 0)
       forgetOpenPath(file_handle);
+    if (!schedule_ok && strict_mpp_required)
+      return failStrict("close");
     return rc;
   }
 
   int seek(int file_handle, long offset) override {
+    if (!ensureSchedulerReady("seek", /*log_once=*/true))
+      return -1;
     return backend.seek(file_handle, offset);
   }
 
   int readAt(int file_handle, long offset, void *data, size_t size) override {
+    if (!mpp_sched_active) {
+      if (!ensureSchedulerReady("readAt", /*log_once=*/true))
+        return -1;
+      return backend.readAt(file_handle, offset, data, size);
+    }
     ompfile::OmpFileReadRequestContext context{};
-    buildReadContext(file_handle, offset, size, context);
+    if (!buildReadContext(file_handle, offset, size, context))
+      return failStrict("readAt");
     return backend.readAtWithContext(context, data, size);
   }
 
   int writeAt(int file_handle, long offset, const void *data,
               size_t size) override {
-    scheduleWrite(file_handle, offset, size);
+    if (!mpp_sched_active) {
+      if (!ensureSchedulerReady("writeAt", /*log_once=*/true))
+        return -1;
+      return backend.writeAt(file_handle, offset, data, size);
+    }
+    if (!scheduleWrite(file_handle, offset, size))
+      return failStrict("writeAt");
     return backend.writeAt(file_handle, offset, data, size);
   }
 
@@ -149,7 +206,12 @@ private:
 
   IOBackend &backend;
   int client_rank = -1;
+  const bool mpp_remote_only_enabled = false;
+  const bool allow_fallback = false;
+  const bool strict_mpp_required = false;
+  const bool mpp_sched_active = false;
   std::atomic<uint64_t> request_id{1};
+  std::atomic<bool> strict_failure_logged{false};
   std::mutex tracked_file_mutex;
   std::mutex sched_request_mutex;
   std::unordered_map<int, TrackedFileMetadata> tracked_file_map;
@@ -162,6 +224,36 @@ private:
     int rank = -1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     return rank;
+  }
+
+  int failStrict(const char *op_name) {
+    errno = EIO;
+    if (!strict_failure_logged.exchange(true, std::memory_order_relaxed)) {
+      io_log("HEADNODE scheduler operation '%s' failed because MPP is required "
+             "and fallback is disabled. Set LIBOMPFILE_ALLOWFALLBACK=1 to "
+             "restore local fallback.\n",
+             op_name ? op_name : "(unknown)");
+    }
+    io_trace("HeadnodeScheduler::failStrict scheduler=%p op=%s\n",
+             static_cast<void *>(this), op_name ? op_name : "(unknown)");
+    return -1;
+  }
+
+  bool ensureSchedulerReady(const char *op_name, bool log_once) {
+    if (!strict_mpp_required)
+      return true;
+    if (mpp_sched_active)
+      return true;
+    if (!log_once || !strict_failure_logged.load(std::memory_order_relaxed)) {
+      io_trace("HeadnodeScheduler::ensureSchedulerReady fail scheduler=%p op=%s "
+               "strict=%d mpp_remote_only=%d mpp_sched_active=%d\n",
+               static_cast<void *>(this), op_name ? op_name : "(unknown)",
+               static_cast<int>(strict_mpp_required),
+               static_cast<int>(mpp_remote_only_enabled),
+               static_cast<int>(mpp_sched_active));
+    }
+    failStrict(op_name);
+    return false;
   }
 
   static uint64_t computePathKey(const char *path) {
@@ -209,6 +301,8 @@ private:
 
   bool schedRequest(const ompfile::OmpFileIORequest &req,
                     const char *path, ompfile::OmpFileIOPlan *plan_out) {
+    if (!mpp_sched_active)
+      return false;
     ompfile::OmpFileIOPlan plan{};
     io_trace("HeadnodeScheduler::schedRequest enter scheduler=%p req_id=%llu "
              "op=%s client_rank=%d file=%d offset=%lld size=%llu path_size=%u "
@@ -222,8 +316,14 @@ private:
     {
       const std::lock_guard<std::mutex> lock(sched_request_mutex);
       if (!ompfile::mpp::schedRequest(req, path, plan)) {
-        io_log("HEADNODE scheduler request failed (global manager unavailable); "
-               "falling back to LOCAL.\n");
+        if (strict_mpp_required) {
+          errno = EIO;
+          io_log("HEADNODE scheduler request failed (global manager "
+                 "unavailable); fallback is disabled.\n");
+        } else {
+          io_log("HEADNODE scheduler request failed (global manager "
+                 "unavailable); falling back to LOCAL.\n");
+        }
         io_trace("HeadnodeScheduler::schedRequest mpp call failed req_id=%llu\n",
                  static_cast<unsigned long long>(req.RequestId));
         return false;
@@ -248,9 +348,9 @@ private:
     return true;
   }
 
-  void scheduleOpen(const char *path) {
+  bool scheduleOpen(const char *path) {
     if (!path)
-      return;
+      return true;
     ompfile::OmpFileIORequest req{};
     req.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
     req.Op = ompfile::OmpFileIOOp::OPEN;
@@ -259,10 +359,10 @@ private:
     io_trace("HeadnodeScheduler::scheduleOpen scheduler=%p req_id=%llu path=%s\n",
              static_cast<void *>(this),
              static_cast<unsigned long long>(req.RequestId), path);
-    (void)schedRequest(req, path, nullptr);
+    return schedRequest(req, path, nullptr) || !strict_mpp_required;
   }
 
-  void scheduleClose(int file_handle) {
+  bool scheduleClose(int file_handle) {
     ompfile::OmpFileIORequest req{};
     req.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
     req.Op = ompfile::OmpFileIOOp::CLOSE;
@@ -272,10 +372,10 @@ private:
              "file=%d\n",
              static_cast<void *>(this),
              static_cast<unsigned long long>(req.RequestId), file_handle);
-    (void)schedRequest(req, nullptr, nullptr);
+    return schedRequest(req, nullptr, nullptr) || !strict_mpp_required;
   }
 
-  void buildReadContext(int file_handle, long offset, size_t size,
+  bool buildReadContext(int file_handle, long offset, size_t size,
                         ompfile::OmpFileReadRequestContext &context) {
     context = {};
     context.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
@@ -310,15 +410,17 @@ private:
     if (schedRequest(req, nullptr, &plan)) {
       context.ContextFlags |= ompfile::OMPFILE_READ_CTX_HAS_PLAN;
       context.Plan = plan;
+      return true;
     }
+    return !strict_mpp_required;
   }
 
-  void scheduleRead(int file_handle, long offset, size_t size) {
+  bool scheduleRead(int file_handle, long offset, size_t size) {
     ompfile::OmpFileReadRequestContext context{};
-    buildReadContext(file_handle, offset, size, context);
+    return buildReadContext(file_handle, offset, size, context);
   }
 
-  void scheduleWrite(int file_handle, long offset, size_t size) {
+  bool scheduleWrite(int file_handle, long offset, size_t size) {
     ompfile::OmpFileIORequest req{};
     req.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
     req.Op = ompfile::OmpFileIOOp::PWRITE;
@@ -326,7 +428,7 @@ private:
     req.FileHandle = file_handle;
     req.Offset = static_cast<int64_t>(offset);
     req.Size = static_cast<uint64_t>(size);
-    (void)schedRequest(req, nullptr, nullptr);
+    return schedRequest(req, nullptr, nullptr) || !strict_mpp_required;
   }
 };
 

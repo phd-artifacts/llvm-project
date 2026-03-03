@@ -49,8 +49,12 @@ MPIIOBackend::MPIIOBackend() {
     }
   }
 
-  const bool remote_only = mpp_open_enabled && mpp_io_enabled;
-  if (!remote_only) {
+  mpp_requested = mpp_open_enabled || mpp_io_enabled;
+  mpp_remote_only = mpp_open_enabled && mpp_io_enabled;
+  allow_fallback = parseBoolEnv("LIBOMPFILE_ALLOWFALLBACK", false);
+  strict_mpp_required = mpp_requested && !allow_fallback;
+
+  if (!mpp_remote_only) {
     MPI_Comm source_comm = MPI_COMM_WORLD;
     const char *comm_self_env = std::getenv("LIBOMPFILE_MPI_COMM_SELF");
     if (comm_self_env && comm_self_env[0] == '1' && comm_self_env[1] == '\0') {
@@ -65,11 +69,24 @@ MPIIOBackend::MPIIOBackend() {
     io_log("Remote-only MPP mode: skipping MPI communicator duplication.\n");
   }
 
-  if (ompfile::mpp::init()) {
-    const char *env = std::getenv("LIBOMPFILE_MPP_PING");
-    if (env && env[0] == '1' && env[1] == '\0') {
-      if (!ompfile::mpp::ping())
-        io_log("MPP shim ping failed.\n");
+  if (mpp_requested) {
+    if (ompfile::mpp::init()) {
+      mpp_init_succeeded = true;
+      const char *env = std::getenv("LIBOMPFILE_MPP_PING");
+      if (env && env[0] == '1' && env[1] == '\0') {
+        if (!ompfile::mpp::ping())
+          io_log("MPP shim ping failed.\n");
+      }
+    } else {
+      strict_mpp_init_failed = strict_mpp_required;
+      if (strict_mpp_required) {
+        io_log("MPP mode requested but MPP init failed and "
+               "LIBOMPFILE_ALLOWFALLBACK is disabled; all I/O calls will "
+               "fail.\n");
+      } else {
+        io_log("MPP mode requested but MPP init failed; MPP operations may "
+               "fallback or fail.\n");
+      }
     }
   }
 
@@ -81,7 +98,7 @@ MPIIOBackend::MPIIOBackend() {
   if (two_phase_policy == TwoPhasePolicy::Enabled) {
     two_phase_enabled = true;
   } else if (two_phase_policy == TwoPhasePolicy::Auto) {
-    two_phase_enabled = remote_only && scheduler_headnode;
+    two_phase_enabled = mpp_remote_only && scheduler_headnode;
   } else {
     two_phase_enabled = false;
   }
@@ -99,7 +116,7 @@ MPIIOBackend::MPIIOBackend() {
          static_cast<unsigned long long>(two_phase_window_us),
          static_cast<unsigned long long>(two_phase_max_batch_bytes),
          scheduler_env ? scheduler_env : "(unset)",
-         static_cast<int>(remote_only));
+         static_cast<int>(mpp_remote_only));
 
   if (isTwoPhaseActive()) {
     io_log("Two-phase batching active (leader/follower mode).\n");
@@ -108,7 +125,8 @@ MPIIOBackend::MPIIOBackend() {
   } else if (two_phase_policy == TwoPhasePolicy::Auto) {
     io_log("Two-phase auto policy resolved to disabled for this run: "
            "remote_only=%d scheduler_headnode=%d.\n",
-           static_cast<int>(remote_only), static_cast<int>(scheduler_headnode));
+           static_cast<int>(mpp_remote_only),
+           static_cast<int>(scheduler_headnode));
   }
 
   int rank = -1;
@@ -117,11 +135,18 @@ MPIIOBackend::MPIIOBackend() {
   if (mpi_initialized_for_rank)
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   io_trace("MPIIOBackend ctor this=%p rank=%d external_mpi=%d mpp_open=%d "
-           "mpp_io=%d two_phase_policy=%s two_phase_enabled=%d "
+           "mpp_io=%d mpp_requested=%d mpp_remote_only=%d mpp_init_ok=%d "
+           "allow_fallback=%d strict_mpp_required=%d strict_init_failed=%d "
+           "two_phase_policy=%s two_phase_enabled=%d "
            "two_phase_window_us=%llu "
            "two_phase_max_batch_bytes=%llu\n",
            static_cast<void *>(this), rank, externally_initialized,
            static_cast<int>(mpp_open_enabled), static_cast<int>(mpp_io_enabled),
+           static_cast<int>(mpp_requested), static_cast<int>(mpp_remote_only),
+           static_cast<int>(mpp_init_succeeded),
+           static_cast<int>(allow_fallback),
+           static_cast<int>(strict_mpp_required),
+           static_cast<int>(strict_mpp_init_failed),
            twoPhasePolicyToString(two_phase_policy),
            static_cast<int>(two_phase_enabled),
            static_cast<unsigned long long>(two_phase_window_us),
@@ -145,8 +170,10 @@ MPIIOBackend::~MPIIOBackend() {
 }
 
 int MPIIOBackend::open(const char *filename) {
+  if (strict_mpp_init_failed)
+    return failStrictMpp("open");
   int file_id = getNextFileHandle();
-  const bool remote_only = mpp_open_enabled && mpp_io_enabled;
+  const bool remote_only = mpp_remote_only;
 
   io_log("Opening file %s with file_id %d\n", filename, file_id);
   io_trace("MPIIOBackend::open enter this=%p file_id=%d remote_only=%d "
@@ -226,6 +253,8 @@ int MPIIOBackend::open(const char *filename) {
 }
 
 int MPIIOBackend::write(int file_id, const void *data, size_t size) {
+  if (strict_mpp_init_failed)
+    return failStrictMpp("write");
   if (mpp_open_enabled && mpp_io_enabled) {
     io_log("Error: write() without explicit offset is unsupported in "
            "remote-only MPP mode.\n");
@@ -287,8 +316,10 @@ int MPIIOBackend::write(int file_id, const void *data, size_t size) {
 }
 
 int MPIIOBackend::close(int file_id) {
+  if (strict_mpp_init_failed)
+    return failStrictMpp("close");
   io_log("Closing file %d\n", file_id);
-  const bool remote_only = mpp_open_enabled && mpp_io_enabled;
+  const bool remote_only = mpp_remote_only;
   int remote_handle = -1;
   bool has_remote_handle = false;
   MPI_File mpi_file = MPI_FILE_NULL;
@@ -367,10 +398,20 @@ int MPIIOBackend::close(int file_id) {
 }
 
 int MPIIOBackend::read(int file_id, void *data, size_t size) {
+  if (strict_mpp_init_failed)
+    return failStrictMpp("read");
   if (mpp_open_enabled && mpp_io_enabled) {
     io_log("Error: read() without explicit offset is unsupported in "
            "remote-only MPP mode.\n");
     errno = ENOTSUP;
+    return -1;
+  }
+  if (!data && size > 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    errno = EOVERFLOW;
     return -1;
   }
 
@@ -387,11 +428,30 @@ int MPIIOBackend::read(int file_id, void *data, size_t size) {
     file = it->second;
   }
 
-  int ret = MPI_File_read(file, data, size, MPI_BYTE, MPI_STATUS_IGNORE);
-
+  MPI_Status status{};
+  const int ret =
+      MPI_File_read(file, data, static_cast<int>(size), MPI_BYTE, &status);
   if (ret != MPI_SUCCESS) {
     io_log("Error: Read failed\n");
+    errno = EIO;
     return -1;
+  }
+
+  int count = 0;
+  if (MPI_Get_count(&status, MPI_BYTE, &count) != MPI_SUCCESS || count < 0) {
+    errno = EIO;
+    return -1;
+  }
+  const size_t bytes_read = static_cast<size_t>(count);
+  if (bytes_read > size) {
+    errno = EPROTO;
+    return -1;
+  }
+  if (bytes_read < size && data) {
+    const size_t short_bytes = size - bytes_read;
+    short_read_count.fetch_add(1, std::memory_order_relaxed);
+    short_read_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
+    std::memset(static_cast<char *>(data) + bytes_read, 0, short_bytes);
   }
 
   io_log("Read completed\n");
@@ -400,6 +460,8 @@ int MPIIOBackend::read(int file_id, void *data, size_t size) {
 }
 
 int MPIIOBackend::seek(int file_id, long offset) {
+  if (strict_mpp_init_failed)
+    return failStrictMpp("seek");
   if (mpp_open_enabled && mpp_io_enabled) {
     io_log("Error: seek() is unsupported in remote-only MPP mode.\n");
     errno = ENOTSUP;
@@ -453,6 +515,8 @@ bool MPIIOBackend::hasUsablePlannedRead(
 int MPIIOBackend::readAtWithContext(
     const ompfile::OmpFileReadRequestContext &context, void *data,
     size_t size) {
+  if (strict_mpp_init_failed)
+    return failStrictMpp("pread");
   if (context.Offset <
           static_cast<int64_t>(std::numeric_limits<long>::min()) ||
       context.Offset >
@@ -1091,7 +1155,9 @@ int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
 
 int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
                           size_t size) {
-  const bool remote_only = mpp_open_enabled && mpp_io_enabled;
+  if (strict_mpp_init_failed)
+    return failStrictMpp("pwrite");
+  const bool remote_only = mpp_remote_only;
   pwrite_request_count.fetch_add(1, std::memory_order_relaxed);
   if (offset < 0) {
     errno = EINVAL;
@@ -1270,6 +1336,22 @@ void MPIIOBackend::traceHandleState(const char *where, int file_id,
     return;
   const std::lock_guard<std::mutex> lock(handle_mutex);
   traceHandleStateLocked(where, file_id, remote_handle);
+}
+
+int MPIIOBackend::failStrictMpp(const char *op_name) const {
+  errno = EIO;
+  if (!strict_failure_logged.exchange(true, std::memory_order_relaxed)) {
+    io_log("Error: '%s' failed because MPP init did not complete and fallback "
+           "is disabled. Set LIBOMPFILE_ALLOWFALLBACK=1 to allow fallback "
+           "behavior.\n",
+           op_name ? op_name : "(unknown)");
+  }
+  io_trace("MPIIOBackend::failStrictMpp this=%p op=%s mpp_requested=%d "
+           "allow_fallback=%d strict_mpp_init_failed=%d\n",
+           static_cast<const void *>(this), op_name ? op_name : "(unknown)",
+           static_cast<int>(mpp_requested), static_cast<int>(allow_fallback),
+           static_cast<int>(strict_mpp_init_failed));
+  return -1;
 }
 
 bool MPIIOBackend::parseBoolEnv(const char *name, bool default_value) {
