@@ -176,16 +176,9 @@ int OmpFileHeadnodeManager::pickRankForPathKeyUnlocked(uint64_t PathKey,
   }
 
   AffinityHit = true;
-  const uint64_t PreferredLoad = inFlightForRankUnlocked(PreferredRank);
-  const uint64_t MinLoad = minInFlightUnlocked();
-  if (PreferredLoad <= MinLoad + MaxAffinityLoadSkew)
-    return PreferredRank;
-
-  if (LeastLoadedRank != PreferredRank) {
-    It->second = LeastLoadedRank;
-    Rebalanced = true;
-  }
-  return LeastLoadedRank;
+  // Keep an existing path pinned to the same worker so cached opens and
+  // follow-on reads/writes observe a single aggregator for that file.
+  return PreferredRank;
 }
 
 OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Request,
