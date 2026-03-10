@@ -111,7 +111,9 @@ public:
         mpp_remote_only_enabled(isMppRemoteOnlyEnabled()),
         allow_fallback(envFlagEnabled("LIBOMPFILE_ALLOWFALLBACK")),
         strict_mpp_required(mpp_remote_only_enabled && !allow_fallback),
-        mpp_sched_active(mpp_remote_only_enabled && ompfile::mpp::init()) {
+        mpp_sched_active(mpp_remote_only_enabled && ompfile::mpp::init()),
+        two_phase_batch_preferred(mpp_sched_active &&
+                                  shouldPreferBatchReadPlanner()) {
     if (!mpp_remote_only_enabled) {
       io_log("HEADNODE scheduler requested but MPP remote-only mode is "
              "disabled (requires LIBOMPFILE_MPP_OPEN=1 and "
@@ -121,9 +123,13 @@ public:
         io_log("HEADNODE scheduler requested but MPP init failed; "
                "LIBOMPFILE_ALLOWFALLBACK=1, using LOCAL dispatch.\n");
       } else {
-        io_log("HEADNODE scheduler requested but MPP init failed; fallback is "
-               "disabled, all scheduler operations will fail.\n");
+      io_log("HEADNODE scheduler requested but MPP init failed; fallback is "
+             "disabled, all scheduler operations will fail.\n");
       }
+    }
+    if (two_phase_batch_preferred) {
+      io_log("HEADNODE scheduler: two-phase batch planner active; skipping "
+             "scalar per-request scheduleRead path.\n");
     }
   }
 
@@ -210,6 +216,7 @@ private:
   const bool allow_fallback = false;
   const bool strict_mpp_required = false;
   const bool mpp_sched_active = false;
+  const bool two_phase_batch_preferred = false;
   std::atomic<uint64_t> request_id{1};
   std::atomic<bool> strict_failure_logged{false};
   std::mutex tracked_file_mutex;
@@ -224,6 +231,29 @@ private:
     int rank = -1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     return rank;
+  }
+
+  static bool shouldPreferBatchReadPlanner() {
+    const char *raw = std::getenv("LIBOMPFILE_OPT_TWO_PHASE");
+    if (!raw || !raw[0])
+      return true; // auto policy under HEADNODE+remote-only
+
+    if ((raw[0] == '0' && raw[1] == '\0') ||
+        std::strcmp(raw, "disabled") == 0 ||
+        std::strcmp(raw, "DISABLED") == 0)
+      return false;
+
+    if ((raw[0] == '1' && raw[1] == '\0') ||
+        std::strcmp(raw, "enabled") == 0 ||
+        std::strcmp(raw, "ENABLED") == 0 ||
+        std::strcmp(raw, "auto") == 0 ||
+        std::strcmp(raw, "AUTO") == 0)
+      return true;
+
+    io_log("Invalid LIBOMPFILE_OPT_TWO_PHASE='%s' for HEADNODE scheduler; "
+           "keeping scalar scheduleRead path.\n",
+           raw);
+    return false;
   }
 
   int failStrict(const char *op_name) {
@@ -406,13 +436,22 @@ private:
                  0,
              static_cast<unsigned long long>(context.PathKey));
 
-    ompfile::OmpFileIOPlan plan{};
-    if (schedRequest(req, nullptr, &plan)) {
-      context.ContextFlags |= ompfile::OMPFILE_READ_CTX_HAS_PLAN;
-      context.Plan = plan;
+    if (two_phase_batch_preferred) {
+      io_trace("HeadnodeScheduler::buildReadContext skip-scalar req_id=%llu "
+               "file=%d offset=%lld size=%llu\n",
+               static_cast<unsigned long long>(context.RequestId), file_handle,
+               static_cast<long long>(offset),
+               static_cast<unsigned long long>(size));
       return true;
     }
-    return !strict_mpp_required;
+
+    ompfile::OmpFileIOPlan plan{};
+    if (!schedRequest(req, nullptr, &plan))
+      return !strict_mpp_required;
+
+    context.ContextFlags |= ompfile::OMPFILE_READ_CTX_HAS_PLAN;
+    context.Plan = plan;
+    return true;
   }
 
   bool scheduleRead(int file_handle, long offset, size_t size) {

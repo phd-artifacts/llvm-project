@@ -26,6 +26,7 @@ private:
   int externally_initialized;
   std::unordered_map<int, MPI_File> file_handle_map;
   std::unordered_map<int, int> remote_file_handle_map;
+  std::unordered_map<int, uint64_t> file_path_key_map;
   std::unordered_set<int> logical_handle_set;
   std::atomic<int> next_file_handle{0};
   std::mutex handle_mutex;
@@ -43,8 +44,10 @@ private:
   bool two_phase_enabled = false;
   static constexpr uint64_t kDefaultTwoPhaseWindowUs = 2000;
   static constexpr uint64_t kDefaultTwoPhaseMaxBatchBytes = 1024 * 1024;
+  static constexpr uint64_t kDefaultTwoPhaseSieveBytes = 4096;
   uint64_t two_phase_window_us = 0;
   uint64_t two_phase_max_batch_bytes = 0;
+  uint64_t two_phase_sieve_bytes = 0;
   std::atomic<uint64_t> pread_request_count{0};
   std::atomic<uint64_t> remote_pread_event_count{0};
   std::atomic<uint64_t> remote_pread_bytes_total{0};
@@ -65,6 +68,7 @@ private:
   std::atomic<uint64_t> two_phase_planner_rebalanced_count{0};
   std::atomic<uint64_t> two_phase_planner_scalar_fallback_count{0};
   std::atomic<uint64_t> two_phase_planner_error_count{0};
+  std::atomic<uint64_t> two_phase_cache_hit_count{0};
   std::atomic<uint64_t> two_phase_planner_batch_id{1};
   std::atomic<uint64_t> two_phase_request_id{1};
   bool two_phase_batch_in_progress = false;
@@ -87,6 +91,11 @@ private:
   std::mutex two_phase_mutex;
   std::condition_variable two_phase_queue_cv;
   std::deque<TwoPhaseReadRequest *> two_phase_queue;
+  struct TwoPhaseReadCacheEntry {
+    long Start = 0;
+    std::vector<char> Data;
+  };
+  std::unordered_map<uint64_t, TwoPhaseReadCacheEntry> two_phase_read_cache;
 
 public:
   MPIIOBackend();
@@ -122,7 +131,19 @@ private:
   static const char *twoPhasePolicyToString(TwoPhasePolicy policy);
   static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
+  static uint64_t computePathKey(const char *path);
   static bool shouldReportStats();
+  bool getFilePathKey(int file_id, uint64_t &path_key_out);
+  void rememberFilePathKey(int file_id, const char *path);
+  void forgetFilePathKey(int file_id);
+  uint64_t resolveTwoPhaseKey(
+      const ompfile::OmpFileReadRequestContext &context);
+  bool tryServeTwoPhaseReadCache(uint64_t key, long offset, void *data,
+                                 size_t size);
+  void updateTwoPhaseReadCache(uint64_t key, long start,
+                               const std::vector<char> &data);
+  void invalidateTwoPhaseReadCacheKey(uint64_t key);
+  void invalidateTwoPhaseReadCacheForFile(int file_id);
   int failStrictMpp(const char *op_name) const;
   void traceHandleStateLocked(const char *where, int file_id,
                               int remote_handle) const;

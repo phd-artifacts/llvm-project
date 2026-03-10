@@ -108,13 +108,17 @@ MPIIOBackend::MPIIOBackend() {
   two_phase_max_batch_bytes =
       parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_MAX_BATCH_BYTES",
                      two_phase_enabled ? kDefaultTwoPhaseMaxBatchBytes : 0);
+  two_phase_sieve_bytes =
+      parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_SIEVE_BYTES",
+                     two_phase_enabled ? kDefaultTwoPhaseSieveBytes : 0);
 
   io_log("Two-phase guard config: policy=%s enabled=%d window_us=%llu "
-         "max_batch_bytes=%llu scheduler=%s remote_only=%d\n",
+         "max_batch_bytes=%llu sieve_bytes=%llu scheduler=%s remote_only=%d\n",
          twoPhasePolicyToString(two_phase_policy),
          static_cast<int>(two_phase_enabled),
          static_cast<unsigned long long>(two_phase_window_us),
          static_cast<unsigned long long>(two_phase_max_batch_bytes),
+         static_cast<unsigned long long>(two_phase_sieve_bytes),
          scheduler_env ? scheduler_env : "(unset)",
          static_cast<int>(mpp_remote_only));
 
@@ -139,7 +143,7 @@ MPIIOBackend::MPIIOBackend() {
            "allow_fallback=%d strict_mpp_required=%d strict_init_failed=%d "
            "two_phase_policy=%s two_phase_enabled=%d "
            "two_phase_window_us=%llu "
-           "two_phase_max_batch_bytes=%llu\n",
+           "two_phase_max_batch_bytes=%llu two_phase_sieve_bytes=%llu\n",
            static_cast<void *>(this), rank, externally_initialized,
            static_cast<int>(mpp_open_enabled), static_cast<int>(mpp_io_enabled),
            static_cast<int>(mpp_requested), static_cast<int>(mpp_remote_only),
@@ -150,7 +154,8 @@ MPIIOBackend::MPIIOBackend() {
            twoPhasePolicyToString(two_phase_policy),
            static_cast<int>(two_phase_enabled),
            static_cast<unsigned long long>(two_phase_window_us),
-           static_cast<unsigned long long>(two_phase_max_batch_bytes));
+           static_cast<unsigned long long>(two_phase_max_batch_bytes),
+           static_cast<unsigned long long>(two_phase_sieve_bytes));
 
 }
 
@@ -200,6 +205,7 @@ int MPIIOBackend::open(const char *filename) {
       traceHandleStateLocked("open.remote_only.insert", file_id, remote_handle);
     }
     io_log("Remote-only open completed for file_id %d\n", file_id);
+    rememberFilePathKey(file_id, filename);
     traceHandleState("open.remote_only.done", file_id, remote_handle);
     return file_id;
   }
@@ -248,6 +254,7 @@ int MPIIOBackend::open(const char *filename) {
       traceHandleStateLocked("open.mpp.remote.insert", file_id, remote_handle);
     }
   }
+  rememberFilePathKey(file_id, filename);
   traceHandleState("open.done", file_id, -1);
   return file_id;
 }
@@ -269,6 +276,7 @@ int MPIIOBackend::write(int file_id, const void *data, size_t size) {
     errno = EOVERFLOW;
     return -1;
   }
+  invalidateTwoPhaseReadCacheForFile(file_id);
 
   io_log("Writing %zu bytes to file %d\n", size, file_id);
 
@@ -278,6 +286,7 @@ int MPIIOBackend::write(int file_id, const void *data, size_t size) {
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
+      errno = EBADF;
       return -1;
     }
     file = it->second;
@@ -319,6 +328,8 @@ int MPIIOBackend::close(int file_id) {
   if (strict_mpp_init_failed)
     return failStrictMpp("close");
   io_log("Closing file %d\n", file_id);
+  invalidateTwoPhaseReadCacheForFile(file_id);
+  forgetFilePathKey(file_id);
   const bool remote_only = mpp_remote_only;
   int remote_handle = -1;
   bool has_remote_handle = false;
@@ -331,6 +342,7 @@ int MPIIOBackend::close(int file_id) {
     if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
       traceHandleStateLocked("close.invalid_handle", file_id, -1);
+      errno = EBADF;
       return -1;
     }
 
@@ -423,6 +435,7 @@ int MPIIOBackend::read(int file_id, void *data, size_t size) {
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
+      errno = EBADF;
       return -1;
     }
     file = it->second;
@@ -476,6 +489,7 @@ int MPIIOBackend::seek(int file_id, long offset) {
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
+      errno = EBADF;
       return -1;
     }
     file = it->second;
@@ -654,6 +668,7 @@ int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
       io_log("Error: Missing remote handle for file %d\n", file_id);
       traceHandleState("readAtFallback.mpp_io.missing_remote", file_id,
                        remote_handle);
+      errno = EBADF;
       return -1;
     }
     remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
@@ -691,6 +706,7 @@ int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
+      errno = EBADF;
       return -1;
     }
     file = it->second;
@@ -733,17 +749,32 @@ int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
 int MPIIOBackend::readAtTwoPhase(
     const ompfile::OmpFileReadRequestContext &context, void *data,
     size_t size) {
+  // Keep zero-length reads on the validated fallback path so invalid handles
+  // still fail consistently with the non-cached pread flow.
+  if (size == 0)
+    return readAtFallback(context.FileHandle, static_cast<long>(context.Offset),
+                          data, size);
+
+  const uint64_t request_key = resolveTwoPhaseKey(context);
+  const long request_offset = static_cast<long>(context.Offset);
+  if (tryServeTwoPhaseReadCache(request_key, request_offset, data, size)) {
+    io_trace("MPIIOBackend::readAtTwoPhase cache-hit file=%d offset=%ld "
+             "size=%zu key=%llu\n",
+             context.FileHandle, request_offset, size,
+             static_cast<unsigned long long>(request_key));
+    return 0;
+  }
+
   TwoPhaseReadRequest request{};
   request.DebugRequestId =
       two_phase_request_id.fetch_add(1, std::memory_order_relaxed);
   request.FileHandle = context.FileHandle;
   request.ClientRank = context.ClientRank;
-  request.Offset = static_cast<long>(context.Offset);
+  request.Offset = request_offset;
   request.Size = size;
   request.Buffer = data;
-  request.PathKey = context.PathKey;
-  request.HasPathKey =
-      (context.ContextFlags & ompfile::OMPFILE_READ_CTX_HAS_PATH_KEY) != 0;
+  request.PathKey = request_key;
+  request.HasPathKey = true;
 
   const auto enqueue_ts = std::chrono::steady_clock::now();
   std::vector<TwoPhaseReadRequest *> batch;
@@ -846,20 +877,6 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
            group.front()->FileHandle, group.front()->Offset,
            group.front()->Size);
 
-  if (group.size() == 1) {
-    TwoPhaseReadRequest *request = group.front();
-    size_t bytes_read = 0;
-    const int rc = readAtFallbackWithBytes(request->FileHandle, request->Offset,
-                                           request->Buffer, request->Size,
-                                           bytes_read);
-    completeTwoPhaseRequest(*request, rc, rc == 0 ? 0 : errno);
-    io_trace("MPIIOBackend::processTwoPhaseGroup singleton req=%llu rc=%d "
-             "errno=%d bytes_read=%zu\n",
-             static_cast<unsigned long long>(request->DebugRequestId), rc,
-             rc == 0 ? 0 : errno, bytes_read);
-    return;
-  }
-
   std::sort(group.begin(), group.end(),
             [](const TwoPhaseReadRequest *lhs, const TwoPhaseReadRequest *rhs) {
               if (lhs->Offset != rhs->Offset)
@@ -926,6 +943,34 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
   if (coalesced.empty())
     return;
 
+  auto computeTargetReadSize = [this](long start, long end) -> size_t {
+    assert(start >= 0 && end >= start &&
+           "Coalesced read range must be monotonic.");
+    size_t read_size = static_cast<size_t>(end - start);
+    if (two_phase_sieve_bytes == 0)
+      return read_size;
+
+    uint64_t target_size = std::max<uint64_t>(
+        static_cast<uint64_t>(read_size), two_phase_sieve_bytes);
+    if (two_phase_max_batch_bytes > 0) {
+      target_size = std::min<uint64_t>(target_size, two_phase_max_batch_bytes);
+    }
+    const uint64_t size_t_max = static_cast<uint64_t>(
+        std::numeric_limits<size_t>::max());
+    target_size = std::min<uint64_t>(target_size, size_t_max);
+    const uint64_t long_max = static_cast<uint64_t>(
+        std::numeric_limits<long>::max());
+    const uint64_t start_u64 = static_cast<uint64_t>(start);
+    if (start_u64 >= long_max)
+      return read_size;
+    const uint64_t max_extent = long_max - start_u64;
+    target_size = std::min<uint64_t>(target_size, max_extent);
+
+    if (target_size < static_cast<uint64_t>(read_size))
+      return read_size;
+    return static_cast<size_t>(target_size);
+  };
+
   ompfile::OmpFileIOBatchRequest batch_request{};
   batch_request.AbiVersion = ompfile::OMPFILE_SCHED_BATCH_ABI_VERSION;
   batch_request.SegmentCount = static_cast<uint32_t>(coalesced.size());
@@ -943,7 +988,8 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     segment.FileHandle = item.Requests.front()->FileHandle;
     segment.ClientRank = item.Requests.front()->ClientRank;
     segment.Offset = item.Start;
-    segment.Size = static_cast<uint64_t>(item.End - item.Start);
+    segment.Size = static_cast<uint64_t>(
+        computeTargetReadSize(item.Start, item.End));
     segment.PathKey = item.Requests.front()->HasPathKey
                           ? item.Requests.front()->PathKey
                           : static_cast<uint64_t>(0);
@@ -1013,7 +1059,7 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       continue;
     }
 
-    const size_t read_size = static_cast<size_t>(item.End - item.Start);
+    const size_t read_size = computeTargetReadSize(item.Start, item.End);
     two_phase_coalesced_bytes_total.fetch_add(read_size,
                                               std::memory_order_relaxed);
     std::vector<char> buffer(read_size);
@@ -1031,6 +1077,9 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
         completeTwoPhaseRequest(*request, rc, errnum);
       continue;
     }
+
+    const uint64_t cache_key = getTwoPhaseGroupKey(*item.Requests.front());
+    updateTwoPhaseReadCache(cache_key, item.Start, buffer);
 
     for (TwoPhaseReadRequest *request : item.Requests) {
       const size_t scatter_offset =
@@ -1053,9 +1102,11 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       completeTwoPhaseRequest(*request, 0, 0);
     }
     io_trace("MPIIOBackend::processTwoPhaseGroup coalesced read success "
-             "start=%ld end=%ld size=%zu bytes_read=%zu scattered=%zu\n",
-             item.Start, item.End, read_size, bytes_read,
-             item.Requests.size());
+             "start=%ld end=%ld buffered_end=%ld size=%zu bytes_read=%zu "
+             "scattered=%zu\n",
+             item.Start, item.End,
+             item.Start + static_cast<long>(read_size),
+             read_size, bytes_read, item.Requests.size());
   }
 }
 
@@ -1167,6 +1218,7 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
     errno = EINVAL;
     return -1;
   }
+  invalidateTwoPhaseReadCacheForFile(file_id);
 
   io_log("Writing %zu bytes to file %d at offset %lld\n", size, file_id,
          static_cast<long long>(offset));
@@ -1181,6 +1233,7 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
     }
     if (remote_handle < 0) {
       io_log("Error: Missing remote handle for file %d\n", file_id);
+      errno = EBADF;
       return -1;
     }
     size_t bytes_written = 0;
@@ -1209,6 +1262,7 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
     }
     if (remote_handle < 0) {
       io_log("Error: Missing remote handle for file %d\n", file_id);
+      errno = EBADF;
       return -1;
     }
     size_t bytes_written = 0;
@@ -1232,6 +1286,7 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
+      errno = EBADF;
       return -1;
     }
     file = it->second;
@@ -1275,6 +1330,110 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
 
 int MPIIOBackend::getNextFileHandle() {
   return next_file_handle.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t MPIIOBackend::computePathKey(const char *path) {
+  constexpr uint64_t offset_basis = 1469598103934665603ULL;
+  constexpr uint64_t prime = 1099511628211ULL;
+  uint64_t hash = offset_basis;
+  if (!path)
+    return hash;
+
+  for (const unsigned char *p =
+           reinterpret_cast<const unsigned char *>(path);
+       *p != '\0'; ++p) {
+    hash ^= static_cast<uint64_t>(*p);
+    hash *= prime;
+  }
+  return hash;
+}
+
+bool MPIIOBackend::getFilePathKey(int file_id, uint64_t &path_key_out) {
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto it = file_path_key_map.find(file_id);
+  if (it == file_path_key_map.end())
+    return false;
+  path_key_out = it->second;
+  return true;
+}
+
+void MPIIOBackend::rememberFilePathKey(int file_id, const char *path) {
+  const uint64_t path_key = computePathKey(path);
+  {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    file_path_key_map[file_id] = path_key;
+  }
+  invalidateTwoPhaseReadCacheKey(path_key);
+}
+
+void MPIIOBackend::forgetFilePathKey(int file_id) {
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  file_path_key_map.erase(file_id);
+}
+
+uint64_t MPIIOBackend::resolveTwoPhaseKey(
+    const ompfile::OmpFileReadRequestContext &context) {
+  if ((context.ContextFlags & ompfile::OMPFILE_READ_CTX_HAS_PATH_KEY) != 0) {
+    return context.PathKey;
+  }
+
+  uint64_t path_key = 0;
+  if (getFilePathKey(context.FileHandle, path_key))
+    return path_key;
+
+  return static_cast<uint64_t>(static_cast<uint32_t>(context.FileHandle));
+}
+
+bool MPIIOBackend::tryServeTwoPhaseReadCache(uint64_t key, long offset,
+                                             void *data, size_t size) {
+  if (!data || size == 0)
+    return false;
+
+  const std::lock_guard<std::mutex> lock(two_phase_mutex);
+  const auto it = two_phase_read_cache.find(key);
+  if (it == two_phase_read_cache.end())
+    return false;
+
+  const TwoPhaseReadCacheEntry &entry = it->second;
+  if (offset < entry.Start)
+    return false;
+  const uint64_t delta = static_cast<uint64_t>(offset - entry.Start);
+  if (delta > static_cast<uint64_t>(entry.Data.size()))
+    return false;
+  if (size > entry.Data.size() - static_cast<size_t>(delta))
+    return false;
+
+  std::memcpy(data, entry.Data.data() + static_cast<size_t>(delta), size);
+  two_phase_cache_hit_count.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+void MPIIOBackend::updateTwoPhaseReadCache(uint64_t key, long start,
+                                           const std::vector<char> &data) {
+  if (data.empty())
+    return;
+
+  TwoPhaseReadCacheEntry entry{};
+  entry.Start = start;
+  entry.Data = data;
+
+  const std::lock_guard<std::mutex> lock(two_phase_mutex);
+  two_phase_read_cache[key] = std::move(entry);
+}
+
+void MPIIOBackend::invalidateTwoPhaseReadCacheKey(uint64_t key) {
+  const std::lock_guard<std::mutex> lock(two_phase_mutex);
+  two_phase_read_cache.erase(key);
+}
+
+void MPIIOBackend::invalidateTwoPhaseReadCacheForFile(int file_id) {
+  uint64_t path_key = 0;
+  if (getFilePathKey(file_id, path_key)) {
+    invalidateTwoPhaseReadCacheKey(path_key);
+    return;
+  }
+  invalidateTwoPhaseReadCacheKey(
+      static_cast<uint64_t>(static_cast<uint32_t>(file_id)));
 }
 
 void MPIIOBackend::traceHandleStateLocked(const char *where, int file_id,
@@ -1474,6 +1633,8 @@ void MPIIOBackend::reportPhase0Stats() const {
       two_phase_planner_scalar_fallback_count.load(std::memory_order_relaxed);
   const uint64_t planner_errors =
       two_phase_planner_error_count.load(std::memory_order_relaxed);
+  const uint64_t cache_hits =
+      two_phase_cache_hit_count.load(std::memory_order_relaxed);
 
   const double avg_remote_bytes =
       remote_events == 0 ? 0.0
@@ -1499,9 +1660,9 @@ void MPIIOBackend::reportPhase0Stats() const {
          "coalesced_avg_bytes=%.2f planner_batches=%llu "
          "planner_segments=%llu planner_affinity=%llu "
          "planner_rebalanced=%llu planner_scalar_fallbacks=%llu "
-         "planner_errors=%llu fallbacks=%llu two_phase_enabled=%d "
+         "planner_errors=%llu cache_hits=%llu fallbacks=%llu two_phase_enabled=%d "
          "two_phase_active=%d two_phase_policy=%s window_us=%llu "
-         "max_batch_bytes=%llu\n",
+         "max_batch_bytes=%llu sieve_bytes=%llu\n",
          static_cast<unsigned long long>(pread_reqs),
          static_cast<unsigned long long>(remote_events),
          static_cast<unsigned long long>(remote_bytes), avg_remote_bytes,
@@ -1522,10 +1683,12 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(planner_rebalanced),
          static_cast<unsigned long long>(planner_scalar_fallbacks),
          static_cast<unsigned long long>(planner_errors),
+         static_cast<unsigned long long>(cache_hits),
          static_cast<unsigned long long>(fallback_count),
          static_cast<int>(two_phase_enabled),
          static_cast<int>(isTwoPhaseActive()),
          twoPhasePolicyToString(two_phase_policy),
          static_cast<unsigned long long>(two_phase_window_us),
-         static_cast<unsigned long long>(two_phase_max_batch_bytes));
+         static_cast<unsigned long long>(two_phase_max_batch_bytes),
+         static_cast<unsigned long long>(two_phase_sieve_bytes));
 }
