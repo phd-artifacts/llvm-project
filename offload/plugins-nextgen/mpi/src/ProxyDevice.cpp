@@ -126,7 +126,10 @@ struct ProxyDevice {
         EventPollingRate("OMPTARGET_EVENT_POLLING_RATE", 1),
         OmpFileOpenCacheEnable("LIBOMPFILE_OPT_OPEN_CACHE", false),
         OmpFileOpenCacheKeepOpen("LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN", true),
-        OmpFileOptStats("LIBOMPFILE_OPT_STATS", false) {
+        OmpFileOptStats("LIBOMPFILE_OPT_STATS", false),
+        OmpFileForceBlockingPwrite("LIBOMPFILE_MPP_FORCE_BLOCKING_PWRITE",
+                                   false),
+        OmpFileMPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6) {
 #ifdef OMPT_SUPPORT
     // Initialize OMPT first
     llvm::omp::target::ompt::connectLibrary();
@@ -143,9 +146,11 @@ struct ProxyDevice {
     if (OmpFileOptStats || OmpFileOpenCacheEnable) {
       fprintf(stderr,
               "MPIProxyDevice --> OMPFile cache config rank=%d enabled=%d "
-              "keep_open=%d stats=%d\n",
+              "keep_open=%d stats=%d blocking_pwrite=%d fragment_size=%lld\n",
               EventSystem.LocalRank, (int)OmpFileOpenCacheEnable.get(),
-              (int)OmpFileOpenCacheKeepOpen.get(), (int)OmpFileOptStats.get());
+              (int)OmpFileOpenCacheKeepOpen.get(), (int)OmpFileOptStats.get(),
+              (int)OmpFileForceBlockingPwrite.get(),
+              static_cast<long long>(OmpFileMPIFragmentSize.get()));
     }
     {
       const std::lock_guard<std::mutex> Lock(ActiveProxyDeviceMutex);
@@ -1010,6 +1015,16 @@ struct ProxyDevice {
         OmpFileStatsCloseSyscalls.load(std::memory_order_relaxed);
     uint64_t CloseDeferred =
         OmpFileStatsCloseDeferred.load(std::memory_order_relaxed);
+    uint64_t PwriteAsyncEvents =
+        OmpFileStatsPwriteAsyncEvents.load(std::memory_order_relaxed);
+    uint64_t PwriteAsyncFragments =
+        OmpFileStatsPwriteAsyncFragments.load(std::memory_order_relaxed);
+    uint64_t PwriteBlockingFallbacks =
+        OmpFileStatsPwriteBlockingFallbacks.load(std::memory_order_relaxed);
+    uint64_t PwritePayloadBytes =
+        OmpFileStatsPwritePayloadBytes.load(std::memory_order_relaxed);
+    uint64_t PwriteFailures =
+        OmpFileStatsPwriteFailures.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
 
     {
@@ -1021,14 +1036,31 @@ struct ProxyDevice {
             "MPIProxyDevice --> OMPFile stats [%s] rank=%d "
             "open_req=%llu open_sys=%llu open_hits=%llu "
             "close_req=%llu close_sys=%llu close_deferred=%llu "
-            "cache_entries=%zu\n",
+            "cache_entries=%zu pwrite_async_events=%llu "
+            "pwrite_async_fragments=%llu pwrite_blocking_fallbacks=%llu "
+            "pwrite_payload_bytes=%llu pwrite_failures=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
             static_cast<unsigned long long>(OpenSys),
             static_cast<unsigned long long>(OpenHits),
             static_cast<unsigned long long>(CloseReq),
             static_cast<unsigned long long>(CloseSys),
-            static_cast<unsigned long long>(CloseDeferred), CacheEntries);
+            static_cast<unsigned long long>(CloseDeferred), CacheEntries,
+            static_cast<unsigned long long>(PwriteAsyncEvents),
+            static_cast<unsigned long long>(PwriteAsyncFragments),
+            static_cast<unsigned long long>(PwriteBlockingFallbacks),
+            static_cast<unsigned long long>(PwritePayloadBytes),
+            static_cast<unsigned long long>(PwriteFailures));
+  }
+
+  uint64_t computePwriteFragmentCount(uint64_t Size) const {
+    if (Size == 0)
+      return 0;
+    const int64_t FragmentSize = OmpFileMPIFragmentSize.get();
+    if (FragmentSize <= 0)
+      return 0;
+    return (Size + static_cast<uint64_t>(FragmentSize) - 1) /
+           static_cast<uint64_t>(FragmentSize);
   }
 
   EventTy ompfileOpen(MPIRequestManagerTy RequestManager) {
@@ -1126,24 +1158,35 @@ struct ProxyDevice {
     int64_t Offset = 0;
     uint64_t Size = 0;
 
-    if (auto Error = RequestManager.receiveBlocking(&Fd, 1, MPI_INT); Error)
-      co_return Error;
-    if (auto Error =
-            RequestManager.receiveBlocking(&Offset, 1, MPI_INT64_T);
-        Error)
-      co_return Error;
-    if (auto Error =
-            RequestManager.receiveBlocking(&Size, 1, MPI_UINT64_T);
-        Error)
+    RequestManager.receive(&Fd, 1, MPI_INT);
+    RequestManager.receive(&Offset, 1, MPI_INT64_T);
+    RequestManager.receive(&Size, 1, MPI_UINT64_T);
+    if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
     std::vector<char> Buffer;
     if (Size > 0) {
       Buffer.resize(Size);
-      if (auto Error = RequestManager.receiveInBatchsBlocking(Buffer.data(),
-                                                              Size);
-          Error)
-        co_return Error;
+      OmpFileStatsPwritePayloadBytes.fetch_add(Size, std::memory_order_relaxed);
+      if (OmpFileForceBlockingPwrite.get()) {
+        OmpFileStatsPwriteBlockingFallbacks.fetch_add(
+            1, std::memory_order_relaxed);
+        if (auto Error =
+                RequestManager.receiveInBatchsBlocking(Buffer.data(), Size);
+            Error) {
+          OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
+          co_return Error;
+        }
+      } else {
+        OmpFileStatsPwriteAsyncEvents.fetch_add(1, std::memory_order_relaxed);
+        OmpFileStatsPwriteAsyncFragments.fetch_add(
+            computePwriteFragmentCount(Size), std::memory_order_relaxed);
+        RequestManager.receiveInBatchs(Buffer.data(), Size);
+        if (auto Error = co_await RequestManager; Error) {
+          OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
+          co_return Error;
+        }
+      }
     }
 
     ssize_t BytesWritten = 0;
@@ -1161,23 +1204,26 @@ struct ProxyDevice {
     }
 
     int Ret = (BytesWritten < 0 || BytesWrittenOut < Size) ? -1 : 0;
-    if (auto Error = RequestManager.sendBlocking(&Ret, 1, MPI_INT); Error)
+    if (Ret != 0)
+      OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
+    RequestManager.send(&Ret, 1, MPI_INT);
+    RequestManager.send(&Errno, 1, MPI_INT);
+    RequestManager.send(&BytesWrittenOut, 1, MPI_UINT64_T);
+    if (auto Error = co_await RequestManager; Error) {
+      OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
       co_return Error;
-    if (auto Error = RequestManager.sendBlocking(&Errno, 1, MPI_INT); Error)
-      co_return Error;
-    if (auto Error =
-            RequestManager.sendBlocking(&BytesWrittenOut, 1, MPI_UINT64_T);
-        Error)
-      co_return Error;
+    }
     traceOmpFile("event ompfilePwrite fd=%d offset=%lld size=%llu buf=%p "
-                 "ret=%d errno=%d bytes=%llu\n",
+                 "ret=%d errno=%d bytes=%llu transport=%s fragments=%llu\n",
                  Fd, static_cast<long long>(Offset),
                  static_cast<unsigned long long>(Size),
                  static_cast<void *>(Buffer.data()), Ret, Errno,
-                 static_cast<unsigned long long>(BytesWrittenOut));
-    if (auto Error = RequestManager.sendBlocking(nullptr, 0, MPI_BYTE); Error)
-      co_return Error;
-    co_return llvm::Error::success();
+                 static_cast<unsigned long long>(BytesWrittenOut),
+                 OmpFileForceBlockingPwrite.get() ? "blocking_debug" : "async",
+                 static_cast<unsigned long long>(
+                     computePwriteFragmentCount(Size)));
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
   }
 
 
@@ -2322,6 +2368,8 @@ private:
   BoolEnvar OmpFileOpenCacheEnable;
   BoolEnvar OmpFileOpenCacheKeepOpen;
   BoolEnvar OmpFileOptStats;
+  BoolEnvar OmpFileForceBlockingPwrite;
+  Int64Envar OmpFileMPIFragmentSize;
   // Mutex for AsyncInfoTable
   std::mutex TableMutex;
   std::atomic<uint64_t> NextSchedRequestId{1};
@@ -2337,6 +2385,11 @@ private:
   std::atomic<uint64_t> OmpFileStatsCloseRequests{0};
   std::atomic<uint64_t> OmpFileStatsCloseSyscalls{0};
   std::atomic<uint64_t> OmpFileStatsCloseDeferred{0};
+  std::atomic<uint64_t> OmpFileStatsPwriteAsyncEvents{0};
+  std::atomic<uint64_t> OmpFileStatsPwriteAsyncFragments{0};
+  std::atomic<uint64_t> OmpFileStatsPwriteBlockingFallbacks{0};
+  std::atomic<uint64_t> OmpFileStatsPwritePayloadBytes{0};
+  std::atomic<uint64_t> OmpFileStatsPwriteFailures{0};
   std::mutex MppEventMutex;
   std::unordered_map<uint64_t, EventTy> MppEvents;
   std::unordered_set<uint64_t> CompletedMppTokens;
