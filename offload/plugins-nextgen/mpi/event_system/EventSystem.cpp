@@ -237,6 +237,17 @@ void MPIRequestManagerTy::send(const void *Buffer, int Size,
   }
 }
 
+llvm::Error MPIRequestManagerTy::sendBlocking(const void *Buffer, int Size,
+                                              MPI_Datatype Datatype) {
+  int MPIError = ompfileWithMPICallLock([&]() {
+    return MPI_Send(const_cast<void *>(Buffer), Size, Datatype, OtherRank, Tag,
+                    Comm);
+  });
+  if (MPIError != MPI_SUCCESS)
+    return createError("Blocking MPI send failed with code %d", MPIError);
+  return llvm::Error::success();
+}
+
 /// Divide the \p Buffer into fragments of size \p MPIFragmentSize and send them
 /// to \p OtherRank asynchronously.
 void MPIRequestManagerTy::sendInBatchs(void *Buffer, int64_t Size) {
@@ -279,6 +290,17 @@ void MPIRequestManagerTy::receive(void *Buffer, int Size,
   }
 }
 
+llvm::Error MPIRequestManagerTy::receiveBlocking(void *Buffer, int Size,
+                                                 MPI_Datatype Datatype) {
+  int MPIError = ompfileWithMPICallLock([&]() {
+    return MPI_Recv(Buffer, Size, Datatype, OtherRank, Tag, Comm,
+                    MPI_STATUS_IGNORE);
+  });
+  if (MPIError != MPI_SUCCESS)
+    return createError("Blocking MPI receive failed with code %d", MPIError);
+  return llvm::Error::success();
+}
+
 /// Asynchronously receive message fragments from \p OtherRank and reconstruct
 /// them into \p Buffer.
 void MPIRequestManagerTy::receiveInBatchs(void *Buffer, int64_t Size) {
@@ -306,6 +328,40 @@ void MPIRequestManagerTy::receiveInBatchs(void *Buffer, int64_t Size) {
     Offset += Chunk;
     RemainingBytes -= Chunk;
   }
+}
+
+llvm::Error MPIRequestManagerTy::receiveInBatchsBlocking(void *Buffer,
+                                                         int64_t Size) {
+  if (Size <= 0)
+    return llvm::Error::success();
+  if (!Buffer)
+    return createError("Blocking batch receive missing destination buffer.");
+
+  const int64_t FragmentSize = MPIFragmentSize.get();
+  if (FragmentSize <= 0)
+    return createError("Invalid MPI fragment size %lld for blocking receive.",
+                       static_cast<long long>(FragmentSize));
+
+  constexpr int64_t MaxMPIChunk =
+      static_cast<int64_t>(std::numeric_limits<int>::max());
+
+  char *BufferByteArray = reinterpret_cast<char *>(Buffer);
+  int64_t RemainingBytes = Size;
+  int64_t Offset = 0;
+  while (RemainingBytes > 0) {
+    const int64_t Chunk = std::min({RemainingBytes, FragmentSize, MaxMPIChunk});
+    assert(Chunk > 0 && "MPI fragment chunk must be positive.");
+    int MPIError = ompfileWithMPICallLock([&]() {
+      return MPI_Recv(&BufferByteArray[Offset], static_cast<int>(Chunk),
+                      MPI_BYTE, OtherRank, Tag, Comm, MPI_STATUS_IGNORE);
+    });
+    if (MPIError != MPI_SUCCESS)
+      return createError("Blocking MPI receive failed with code %d", MPIError);
+    Offset += Chunk;
+    RemainingBytes -= Chunk;
+  }
+
+  return llvm::Error::success();
 }
 
 /// Coroutine that waits until all pending requests finish.

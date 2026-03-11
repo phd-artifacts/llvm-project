@@ -1126,18 +1126,25 @@ struct ProxyDevice {
     int64_t Offset = 0;
     uint64_t Size = 0;
 
-    RequestManager.receive(&Fd, 1, MPI_INT);
-    RequestManager.receive(&Offset, 1, MPI_INT64_T);
-    RequestManager.receive(&Size, 1, MPI_UINT64_T);
+    if (auto Error = RequestManager.receiveBlocking(&Fd, 1, MPI_INT); Error)
+      co_return Error;
+    if (auto Error =
+            RequestManager.receiveBlocking(&Offset, 1, MPI_INT64_T);
+        Error)
+      co_return Error;
+    if (auto Error =
+            RequestManager.receiveBlocking(&Size, 1, MPI_UINT64_T);
+        Error)
+      co_return Error;
 
     std::vector<char> Buffer;
     if (Size > 0) {
       Buffer.resize(Size);
-      RequestManager.receiveInBatchs(Buffer.data(), Size);
+      if (auto Error = RequestManager.receiveInBatchsBlocking(Buffer.data(),
+                                                              Size);
+          Error)
+        co_return Error;
     }
-
-    if (auto Error = co_await RequestManager; Error)
-      co_return Error;
 
     ssize_t BytesWritten = 0;
     uint64_t BytesWrittenOut = 0;
@@ -1154,17 +1161,23 @@ struct ProxyDevice {
     }
 
     int Ret = (BytesWritten < 0 || BytesWrittenOut < Size) ? -1 : 0;
-    RequestManager.send(&Ret, 1, MPI_INT);
-    RequestManager.send(&Errno, 1, MPI_INT);
-    RequestManager.send(&BytesWrittenOut, 1, MPI_UINT64_T);
+    if (auto Error = RequestManager.sendBlocking(&Ret, 1, MPI_INT); Error)
+      co_return Error;
+    if (auto Error = RequestManager.sendBlocking(&Errno, 1, MPI_INT); Error)
+      co_return Error;
+    if (auto Error =
+            RequestManager.sendBlocking(&BytesWrittenOut, 1, MPI_UINT64_T);
+        Error)
+      co_return Error;
     traceOmpFile("event ompfilePwrite fd=%d offset=%lld size=%llu buf=%p "
                  "ret=%d errno=%d bytes=%llu\n",
                  Fd, static_cast<long long>(Offset),
                  static_cast<unsigned long long>(Size),
                  static_cast<void *>(Buffer.data()), Ret, Errno,
                  static_cast<unsigned long long>(BytesWrittenOut));
-    RequestManager.send(nullptr, 0, MPI_BYTE);
-    co_return (co_await RequestManager);
+    if (auto Error = RequestManager.sendBlocking(nullptr, 0, MPI_BYTE); Error)
+      co_return Error;
+    co_return llvm::Error::success();
   }
 
 

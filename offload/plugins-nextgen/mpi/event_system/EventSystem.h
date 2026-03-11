@@ -410,7 +410,7 @@ public:
   MPIRequestManagerTy(MPI_Comm Comm, int Tag, int OtherRank, int DeviceId,
                       llvm::SmallVector<MPI_Request> InitialRequests =
                           {}) // TODO: Change to initializer_list
-      : Comm(Comm), Tag(Tag), Requests(InitialRequests),
+      : Comm(Comm), Tag(Tag), Requests(std::move(InitialRequests)),
         MPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6),
         OtherRank(OtherRank), DeviceId(DeviceId), EventType(-1) {}
 
@@ -419,7 +419,7 @@ public:
   MPIRequestManagerTy &operator=(const MPIRequestManagerTy &) = delete;
 
   MPIRequestManagerTy(MPIRequestManagerTy &&Other) noexcept
-      : Comm(Other.Comm), Tag(Other.Tag), Requests(Other.Requests),
+      : Comm(Other.Comm), Tag(Other.Tag), Requests(std::move(Other.Requests)),
         PendingMPIError(Other.PendingMPIError),
         MPIFragmentSize(Other.MPIFragmentSize), OtherRank(Other.OtherRank),
         DeviceId(Other.DeviceId), EventType(Other.EventType) {
@@ -434,6 +434,9 @@ public:
   /// Sends a buffer of given datatype items with determined size to target.
   void send(const void *Buffer, int Size, MPI_Datatype Datatype);
 
+  /// Sends a message to target using a blocking MPI call.
+  llvm::Error sendBlocking(const void *Buffer, int Size, MPI_Datatype Datatype);
+
   /// Send a buffer with determined size to target in batchs.
   void sendInBatchs(void *Buffer, int64_t Size);
 
@@ -441,8 +444,16 @@ public:
   /// target.
   void receive(void *Buffer, int Size, MPI_Datatype Datatype);
 
+  /// Receives a message from target using a blocking MPI call.
+  llvm::Error receiveBlocking(void *Buffer, int Size, MPI_Datatype Datatype);
+
   /// Receives a buffer with determined size from target in batchs.
   void receiveInBatchs(void *Buffer, int64_t Size);
+
+  /// Receives a buffer with determined size from target using blocking MPI
+  /// calls. This is used for payload paths that need to avoid coroutine-owned
+  /// non-blocking receive state.
+  llvm::Error receiveInBatchsBlocking(void *Buffer, int64_t Size);
 
   /// Coroutine that waits on all internal pending requests.
   EventTy wait();
