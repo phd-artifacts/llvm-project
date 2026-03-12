@@ -3,10 +3,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdarg>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <sstream>
 #include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
@@ -59,6 +61,95 @@ uint64_t nextProxyTraceSeq() {
 unsigned long proxyThreadIdHash() {
   return static_cast<unsigned long>(
       std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+std::string trimWhitespace(std::string Value) {
+  const size_t Begin = Value.find_first_not_of(" \t\r\n");
+  if (Begin == std::string::npos)
+    return {};
+  const size_t End = Value.find_last_not_of(" \t\r\n");
+  return Value.substr(Begin, End - Begin + 1);
+}
+
+std::string shortHostname(std::string Host) {
+  Host = trimWhitespace(std::move(Host));
+  const size_t DotPos = Host.find('.');
+  if (DotPos != std::string::npos)
+    Host.resize(DotPos);
+  return Host;
+}
+
+std::string getLocalShortHostname() {
+  char Buffer[HOST_NAME_MAX + 1] = {};
+  if (gethostname(Buffer, sizeof(Buffer) - 1) != 0)
+    return "unknown";
+  return shortHostname(Buffer);
+}
+
+std::string envStringOrDefault(const char *Name, const char *DefaultValue) {
+  const char *Value = std::getenv(Name);
+  if (!Value || Value[0] == '\0')
+    return DefaultValue ? std::string(DefaultValue) : std::string();
+  return Value;
+}
+
+uint64_t envUint64OrDefault(const char *Name, uint64_t DefaultValue) {
+  const char *Value = std::getenv(Name);
+  if (!Value || Value[0] == '\0')
+    return DefaultValue;
+  char *End = nullptr;
+  errno = 0;
+  unsigned long long Parsed = std::strtoull(Value, &End, 10);
+  if (errno != 0 || End == Value || (End && *End != '\0'))
+    return DefaultValue;
+  return static_cast<uint64_t>(Parsed);
+}
+
+bool hostsMatch(const std::string &Expected, const std::string &Observed) {
+  return shortHostname(Expected) == shortHostname(Observed);
+}
+
+bool resolveTopologyStageRoot(const std::string &TopologyFile,
+                              const std::string &LocalHost,
+                              std::string &StageRoot, uint64_t &EntryCount,
+                              std::string &Error) {
+  StageRoot.clear();
+  EntryCount = 0;
+  Error.clear();
+  if (TopologyFile.empty()) {
+    Error = "topology-unset";
+    return false;
+  }
+
+  std::ifstream Input(TopologyFile);
+  if (!Input) {
+    Error = "open-failed";
+    return false;
+  }
+
+  std::string Line;
+  while (std::getline(Input, Line)) {
+    Line = trimWhitespace(std::move(Line));
+    if (Line.empty() || Line[0] == '#')
+      continue;
+
+    std::istringstream Stream(Line);
+    std::string Host;
+    std::string Path;
+    if (!(Stream >> Host >> Path))
+      continue;
+
+    ++EntryCount;
+    if (hostsMatch(Host, LocalHost))
+      StageRoot = Path;
+  }
+
+  if (StageRoot.empty()) {
+    Error = EntryCount == 0 ? "empty-topology" : "host-missing";
+    return false;
+  }
+
+  return true;
 }
 }
 
@@ -129,7 +220,17 @@ struct ProxyDevice {
         OmpFileOptStats("LIBOMPFILE_OPT_STATS", false),
         OmpFileForceBlockingPwrite("LIBOMPFILE_MPP_FORCE_BLOCKING_PWRITE",
                                    false),
-        OmpFileMPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6) {
+        OmpFileMPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6),
+        OmpFileStageMode(envStringOrDefault("LIBOMPFILE_STAGE_MODE", "off")),
+        OmpFileStageRootPolicy(
+            envStringOrDefault("LIBOMPFILE_STAGE_ROOT_POLICY", "topology")),
+        OmpFileTopologyFile(
+            envStringOrDefault("LIBOMPFILE_TOPOLOGY_FILE", "")),
+        OmpFileStorageEnvironment(
+            envStringOrDefault("LIBOMPFILE_STORAGE_ENVIRONMENT", "unspecified")),
+        OmpFileStageMinFreeBytes(
+            envUint64OrDefault("LIBOMPFILE_STAGE_MIN_FREE_BYTES", 0)),
+        OmpFileStageLocalHost(getLocalShortHostname()) {
 #ifdef OMPT_SUPPORT
     // Initialize OMPT first
     llvm::omp::target::ompt::connectLibrary();
@@ -143,6 +244,9 @@ struct ProxyDevice {
       DP("Initialized global OMPFile headnode manager on rank %d\n",
          EventSystem.LocalRank);
     }
+    OmpFileTopologyLoaded = resolveTopologyStageRoot(
+        OmpFileTopologyFile, OmpFileStageLocalHost, OmpFileStageRoot,
+        OmpFileTopologyEntries, OmpFileTopologyLoadError);
     if (OmpFileOptStats || OmpFileOpenCacheEnable) {
       fprintf(stderr,
               "MPIProxyDevice --> OMPFile cache config rank=%d enabled=%d "
@@ -151,6 +255,29 @@ struct ProxyDevice {
               (int)OmpFileOpenCacheKeepOpen.get(), (int)OmpFileOptStats.get(),
               (int)OmpFileForceBlockingPwrite.get(),
               static_cast<long long>(OmpFileMPIFragmentSize.get()));
+    }
+    if (OmpFileOptStats || OmpFileOpenCacheEnable ||
+        OmpFileStageMode != "off" || !OmpFileTopologyFile.empty()) {
+      fprintf(stderr,
+              "MPIProxyDevice --> OMPFile stage config rank=%d "
+              "stage_mode=%s stage_root_policy=%s topology_file_set=%d "
+              "topology_file=%s topology_loaded=%d topology_entries=%llu "
+              "stage_root=%s storage_environment=%s "
+              "stage_min_free_bytes=%llu local_host=%s load_error=%s\n",
+              EventSystem.LocalRank, OmpFileStageMode.c_str(),
+              OmpFileStageRootPolicy.c_str(),
+              static_cast<int>(!OmpFileTopologyFile.empty()),
+              OmpFileTopologyFile.empty() ? "(unset)"
+                                          : OmpFileTopologyFile.c_str(),
+              static_cast<int>(OmpFileTopologyLoaded),
+              static_cast<unsigned long long>(OmpFileTopologyEntries),
+              OmpFileStageRoot.empty() ? "(unset)" : OmpFileStageRoot.c_str(),
+              OmpFileStorageEnvironment.c_str(),
+              static_cast<unsigned long long>(OmpFileStageMinFreeBytes),
+              OmpFileStageLocalHost.c_str(),
+              OmpFileTopologyLoadError.empty()
+                  ? "(none)"
+                  : OmpFileTopologyLoadError.c_str());
     }
     {
       const std::lock_guard<std::mutex> Lock(ActiveProxyDeviceMutex);
@@ -1025,6 +1152,16 @@ struct ProxyDevice {
         OmpFileStatsPwritePayloadBytes.load(std::memory_order_relaxed);
     uint64_t PwriteFailures =
         OmpFileStatsPwriteFailures.load(std::memory_order_relaxed);
+    uint64_t StagedReadHits =
+        OmpFileStatsStagedReadHits.load(std::memory_order_relaxed);
+    uint64_t StagedReadBytes =
+        OmpFileStatsStagedReadBytes.load(std::memory_order_relaxed);
+    uint64_t StagingInvalidations =
+        OmpFileStatsStagingInvalidations.load(std::memory_order_relaxed);
+    uint64_t StagingWriteBypass =
+        OmpFileStatsStagingWriteBypassCount.load(std::memory_order_relaxed);
+    uint64_t StagingEvictions =
+        OmpFileStatsStagingEvictions.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
 
     {
@@ -1038,7 +1175,13 @@ struct ProxyDevice {
             "close_req=%llu close_sys=%llu close_deferred=%llu "
             "cache_entries=%zu pwrite_async_events=%llu "
             "pwrite_async_fragments=%llu pwrite_blocking_fallbacks=%llu "
-            "pwrite_payload_bytes=%llu pwrite_failures=%llu\n",
+            "pwrite_payload_bytes=%llu pwrite_failures=%llu "
+            "topology_file_set=%d topology_loaded=%d topology_entries=%llu "
+            "stage_mode=%s stage_root_policy=%s stage_root=%s "
+            "storage_environment=%s stage_min_free_bytes=%llu "
+            "staged_read_hits=%llu staged_read_bytes=%llu "
+            "staging_invalidations=%llu staging_write_bypass_count=%llu "
+            "staging_evictions=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
             static_cast<unsigned long long>(OpenSys),
@@ -1050,7 +1193,19 @@ struct ProxyDevice {
             static_cast<unsigned long long>(PwriteAsyncFragments),
             static_cast<unsigned long long>(PwriteBlockingFallbacks),
             static_cast<unsigned long long>(PwritePayloadBytes),
-            static_cast<unsigned long long>(PwriteFailures));
+            static_cast<unsigned long long>(PwriteFailures),
+            static_cast<int>(!OmpFileTopologyFile.empty()),
+            static_cast<int>(OmpFileTopologyLoaded),
+            static_cast<unsigned long long>(OmpFileTopologyEntries),
+            OmpFileStageMode.c_str(), OmpFileStageRootPolicy.c_str(),
+            OmpFileStageRoot.empty() ? "(unset)" : OmpFileStageRoot.c_str(),
+            OmpFileStorageEnvironment.c_str(),
+            static_cast<unsigned long long>(OmpFileStageMinFreeBytes),
+            static_cast<unsigned long long>(StagedReadHits),
+            static_cast<unsigned long long>(StagedReadBytes),
+            static_cast<unsigned long long>(StagingInvalidations),
+            static_cast<unsigned long long>(StagingWriteBypass),
+            static_cast<unsigned long long>(StagingEvictions));
   }
 
   uint64_t computePwriteFragmentCount(uint64_t Size) const {
@@ -1163,6 +1318,10 @@ struct ProxyDevice {
     RequestManager.receive(&Size, 1, MPI_UINT64_T);
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
+
+    if (OmpFileStageMode != "off")
+      OmpFileStatsStagingWriteBypassCount.fetch_add(1,
+                                                    std::memory_order_relaxed);
 
     std::vector<char> Buffer;
     if (Size > 0) {
@@ -2370,6 +2529,16 @@ private:
   BoolEnvar OmpFileOptStats;
   BoolEnvar OmpFileForceBlockingPwrite;
   Int64Envar OmpFileMPIFragmentSize;
+  std::string OmpFileStageMode;
+  std::string OmpFileStageRootPolicy;
+  std::string OmpFileTopologyFile;
+  std::string OmpFileStorageEnvironment;
+  uint64_t OmpFileStageMinFreeBytes = 0;
+  bool OmpFileTopologyLoaded = false;
+  uint64_t OmpFileTopologyEntries = 0;
+  std::string OmpFileStageRoot;
+  std::string OmpFileStageLocalHost;
+  std::string OmpFileTopologyLoadError;
   // Mutex for AsyncInfoTable
   std::mutex TableMutex;
   std::atomic<uint64_t> NextSchedRequestId{1};
@@ -2390,6 +2559,11 @@ private:
   std::atomic<uint64_t> OmpFileStatsPwriteBlockingFallbacks{0};
   std::atomic<uint64_t> OmpFileStatsPwritePayloadBytes{0};
   std::atomic<uint64_t> OmpFileStatsPwriteFailures{0};
+  std::atomic<uint64_t> OmpFileStatsStagedReadHits{0};
+  std::atomic<uint64_t> OmpFileStatsStagedReadBytes{0};
+  std::atomic<uint64_t> OmpFileStatsStagingInvalidations{0};
+  std::atomic<uint64_t> OmpFileStatsStagingWriteBypassCount{0};
+  std::atomic<uint64_t> OmpFileStatsStagingEvictions{0};
   std::mutex MppEventMutex;
   std::unordered_map<uint64_t, EventTy> MppEvents;
   std::unordered_set<uint64_t> CompletedMppTokens;
