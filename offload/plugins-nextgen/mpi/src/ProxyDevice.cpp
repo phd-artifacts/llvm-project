@@ -1,5 +1,6 @@
 #include <chrono>
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdarg>
@@ -23,6 +24,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 
 #include "EventSystem.h"
 #include "OmpFileHeadnodeManager.h"
@@ -192,9 +194,21 @@ struct ProxyDevice {
     int RemoteHandle = -1;
   };
 
+  struct OmpFileTrackedFdEntry {
+    std::string Path;
+    int Flags = 0;
+    int Mode = 0;
+  };
+
   struct OmpFileOpenCacheEntry {
     int Fd = -1;
     uint64_t RefCount = 0;
+  };
+
+  struct OmpFileStageEntry {
+    std::string SourcePath;
+    std::string StagePath;
+    int StageFd = -1;
   };
 
   void traceOmpFile(const char *Fmt, ...) const {
@@ -287,6 +301,7 @@ struct ProxyDevice {
 
   ~ProxyDevice() {
     drainOmpFileOpenCache();
+    drainOmpFileStageCache();
     reportOmpFileStats("proxy-dtor");
     {
       const std::lock_guard<std::mutex> Lock(ActiveProxyDeviceMutex);
@@ -986,6 +1001,256 @@ struct ProxyDevice {
     return true;
   }
 
+  bool isReadthroughStageEnabled() const {
+    return OmpFileStageMode == "readthrough" && OmpFileTopologyLoaded &&
+           !OmpFileStageRoot.empty();
+  }
+
+  bool shouldInvalidateStageOnOpen(int Flags) const {
+    if (Flags & (O_CREAT | O_EXCL | O_TRUNC))
+      return true;
+    const int AccessMode = Flags & O_ACCMODE;
+    return AccessMode == O_WRONLY || AccessMode == O_RDWR;
+  }
+
+  std::string makeStageFilePath(const std::string &SourcePath) const {
+    std::string BaseName = SourcePath;
+    const size_t SlashPos = BaseName.find_last_of('/');
+    if (SlashPos != std::string::npos)
+      BaseName = BaseName.substr(SlashPos + 1);
+    if (BaseName.empty())
+      BaseName = "root";
+    for (char &Ch : BaseName) {
+      if (!(std::isalnum(static_cast<unsigned char>(Ch)) || Ch == '.' ||
+            Ch == '_' || Ch == '-'))
+        Ch = '_';
+    }
+    return OmpFileStageRoot + "/" + BaseName + "-" +
+           std::to_string(std::hash<std::string>{}(SourcePath)) + ".stage";
+  }
+
+  bool ensureDirectoryTree(const std::string &Path, int &ErrnoOut) const {
+    ErrnoOut = 0;
+    if (Path.empty()) {
+      ErrnoOut = EINVAL;
+      return false;
+    }
+
+    size_t Pos = Path[0] == '/' ? 1 : 0;
+    while (Pos <= Path.size()) {
+      Pos = Path.find('/', Pos);
+      const std::string Prefix =
+          Path.substr(0, Pos == std::string::npos ? Path.size() : Pos);
+      if (!Prefix.empty()) {
+        if (::mkdir(Prefix.c_str(), 0775) != 0 && errno != EEXIST) {
+          ErrnoOut = errno;
+          return false;
+        }
+      }
+      if (Pos == std::string::npos)
+        break;
+      ++Pos;
+    }
+    return true;
+  }
+
+  bool hasStageFreeSpace(int &ErrnoOut) const {
+    ErrnoOut = 0;
+    if (OmpFileStageMinFreeBytes == 0)
+      return true;
+
+    struct statvfs FsStats {};
+    if (::statvfs(OmpFileStageRoot.c_str(), &FsStats) != 0) {
+      ErrnoOut = errno;
+      return false;
+    }
+
+    const uint64_t Available =
+        static_cast<uint64_t>(FsStats.f_bavail) *
+        static_cast<uint64_t>(FsStats.f_frsize);
+    if (Available < OmpFileStageMinFreeBytes) {
+      ErrnoOut = ENOSPC;
+      return false;
+    }
+    return true;
+  }
+
+  bool copyFileToStage(const std::string &SourcePath, const std::string &StagePath,
+                       int &ErrnoOut) const {
+    ErrnoOut = 0;
+    int SourceFd = ::open(SourcePath.c_str(), O_RDONLY);
+    if (SourceFd < 0) {
+      ErrnoOut = errno;
+      return false;
+    }
+
+    int StageFd = ::open(StagePath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0664);
+    if (StageFd < 0) {
+      ErrnoOut = errno;
+      (void)::close(SourceFd);
+      return false;
+    }
+
+    std::vector<char> Buffer(1 << 20);
+    bool Success = true;
+    while (true) {
+      const ssize_t BytesRead = ::read(SourceFd, Buffer.data(), Buffer.size());
+      if (BytesRead == 0)
+        break;
+      if (BytesRead < 0) {
+        ErrnoOut = errno;
+        Success = false;
+        break;
+      }
+
+      ssize_t WrittenTotal = 0;
+      while (WrittenTotal < BytesRead) {
+        const ssize_t BytesWritten =
+            ::write(StageFd, Buffer.data() + WrittenTotal,
+                    static_cast<size_t>(BytesRead - WrittenTotal));
+        if (BytesWritten <= 0) {
+          ErrnoOut = BytesWritten < 0 ? errno : EIO;
+          Success = false;
+          break;
+        }
+        WrittenTotal += BytesWritten;
+      }
+      if (!Success)
+        break;
+    }
+
+    if (Success && ::fsync(StageFd) != 0) {
+      ErrnoOut = errno;
+      Success = false;
+    }
+
+    (void)::close(StageFd);
+    (void)::close(SourceFd);
+    if (!Success)
+      (void)::unlink(StagePath.c_str());
+    return Success;
+  }
+
+  void trackOmpFileFd(int Fd, const std::string &Path, int Flags, int Mode) {
+    if (Fd < 0 || Path.empty())
+      return;
+    const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
+    OmpFileTrackedFds[Fd] = OmpFileTrackedFdEntry{Path, Flags, Mode};
+  }
+
+  bool getTrackedOmpFileFdPath(int Fd, std::string &Path) const {
+    const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
+    auto It = OmpFileTrackedFds.find(Fd);
+    if (It == OmpFileTrackedFds.end())
+      return false;
+    Path = It->second.Path;
+    return true;
+  }
+
+  void eraseTrackedOmpFileFd(int Fd) {
+    const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
+    OmpFileTrackedFds.erase(Fd);
+  }
+
+  void invalidateStageEntryLocked(const std::string &SourcePath,
+                                  bool CountInvalidation) {
+    auto It = OmpFileStageEntries.find(SourcePath);
+    if (It == OmpFileStageEntries.end())
+      return;
+    if (It->second.StageFd >= 0)
+      (void)::close(It->second.StageFd);
+    if (!It->second.StagePath.empty())
+      (void)::unlink(It->second.StagePath.c_str());
+    OmpFileStageEntries.erase(It);
+    OmpFileStatsStagingEvictions.fetch_add(1, std::memory_order_relaxed);
+    if (CountInvalidation)
+      OmpFileStatsStagingInvalidations.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void invalidateStageForPath(const std::string &SourcePath) {
+    if (SourcePath.empty())
+      return;
+    const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
+    invalidateStageEntryLocked(SourcePath, /*CountInvalidation=*/true);
+  }
+
+  bool ensureStageEntryForPath(const std::string &SourcePath, int &StageFd,
+                               int &ErrnoOut) {
+    StageFd = -1;
+    ErrnoOut = 0;
+    if (!isReadthroughStageEnabled() || SourcePath.empty()) {
+      ErrnoOut = ENOTSUP;
+      return false;
+    }
+
+    const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
+    auto It = OmpFileStageEntries.find(SourcePath);
+    if (It != OmpFileStageEntries.end()) {
+      StageFd = It->second.StageFd;
+      return true;
+    }
+
+    if (!ensureDirectoryTree(OmpFileStageRoot, ErrnoOut))
+      return false;
+    if (!hasStageFreeSpace(ErrnoOut))
+      return false;
+
+    const std::string StagePath = makeStageFilePath(SourcePath);
+    if (!copyFileToStage(SourcePath, StagePath, ErrnoOut))
+      return false;
+
+    StageFd = ::open(StagePath.c_str(), O_RDONLY);
+    if (StageFd < 0) {
+      ErrnoOut = errno;
+      (void)::unlink(StagePath.c_str());
+      return false;
+    }
+
+    OmpFileStageEntries.emplace(
+        SourcePath, OmpFileStageEntry{SourcePath, StagePath, StageFd});
+    traceOmpFile("stage populate source=%s stage=%s fd=%d\n",
+                 SourcePath.c_str(), StagePath.c_str(), StageFd);
+    return true;
+  }
+
+  bool preadWithOptionalStage(int Fd, int64_t Offset, void *Buffer, uint64_t Size,
+                              uint64_t *BytesReadOut, int &ErrnoOut) {
+    ErrnoOut = 0;
+    if (BytesReadOut)
+      *BytesReadOut = 0;
+
+    int ReadFd = Fd;
+    std::string SourcePath;
+    if (Size > 0 && isReadthroughStageEnabled() &&
+        getTrackedOmpFileFdPath(Fd, SourcePath)) {
+      int StageFd = -1;
+      int StageErrno = 0;
+      if (ensureStageEntryForPath(SourcePath, StageFd, StageErrno)) {
+        ReadFd = StageFd;
+      } else {
+        traceOmpFile("stage fallback source=%s errno=%d mode=%s topology=%d\n",
+                     SourcePath.c_str(), StageErrno, OmpFileStageMode.c_str(),
+                     static_cast<int>(OmpFileTopologyLoaded));
+      }
+    }
+
+    const ssize_t BytesRead =
+        ::pread(ReadFd, Buffer, Size, static_cast<off_t>(Offset));
+    if (BytesRead < 0) {
+      ErrnoOut = errno;
+      return false;
+    }
+
+    const uint64_t Bytes = static_cast<uint64_t>(BytesRead);
+    if (BytesReadOut)
+      *BytesReadOut = Bytes;
+    if (ReadFd != Fd && Bytes > 0) {
+      OmpFileStatsStagedReadHits.fetch_add(1, std::memory_order_relaxed);
+      OmpFileStatsStagedReadBytes.fetch_add(Bytes, std::memory_order_relaxed);
+    }
+    return true;
+  }
+
   std::string getOmpFileOpenCacheKey(const char *Path, int Flags, int Mode) const {
     std::string Key = Path ? Path : "";
     Key.push_back('\x1f');
@@ -1103,6 +1368,8 @@ struct ProxyDevice {
     int Ret = ::close(Fd);
     if (Ret != 0)
       ErrnoOut = errno;
+    else
+      eraseTrackedOmpFileFd(Fd);
     traceOmpFile("closeWithOptionalCache close fd=%d ret=%d errno=%d\n", Fd,
                  Ret, ErrnoOut);
     return Ret;
@@ -1125,7 +1392,19 @@ struct ProxyDevice {
     for (int Fd : FdsToClose) {
       OmpFileStatsCloseSyscalls.fetch_add(1, std::memory_order_relaxed);
       (void)::close(Fd);
+      eraseTrackedOmpFileFd(Fd);
     }
+  }
+
+  void drainOmpFileStageCache() {
+    const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
+    for (auto &It : OmpFileStageEntries) {
+      if (It.second.StageFd >= 0)
+        (void)::close(It.second.StageFd);
+      if (!It.second.StagePath.empty())
+        (void)::unlink(It.second.StagePath.c_str());
+    }
+    OmpFileStageEntries.clear();
   }
 
   void reportOmpFileStats(const char *Scope) {
@@ -1243,6 +1522,11 @@ struct ProxyDevice {
 
     int Errno = 0;
     int Fd = openWithOptionalCache(Path.c_str(), Flags, Mode, Errno);
+    if (Fd >= 0) {
+      trackOmpFileFd(Fd, Path, Flags, Mode);
+      if (shouldInvalidateStageOnOpen(Flags))
+        invalidateStageForPath(Path);
+    }
 
     RequestManager.send(&Fd, 1, MPI_INT);
     RequestManager.send(&Errno, 1, MPI_INT);
@@ -1281,16 +1565,12 @@ struct ProxyDevice {
     if (Size > 0)
       Buffer.resize(Size);
 
-    ssize_t BytesRead = 0;
     int Errno = 0;
-    if (Size > 0) {
-      BytesRead = ::pread(Fd, Buffer.data(), Size, static_cast<off_t>(Offset));
-      if (BytesRead < 0)
-        Errno = errno;
-    }
-
-    int Ret = (BytesRead < 0) ? -1 : 0;
-    uint64_t PayloadSize = (BytesRead > 0) ? static_cast<uint64_t>(BytesRead) : 0;
+    uint64_t PayloadSize = 0;
+    const bool Ok =
+        Size == 0 || preadWithOptionalStage(Fd, Offset, Buffer.data(), Size,
+                                            &PayloadSize, Errno);
+    int Ret = Ok ? 0 : -1;
 
     RequestManager.send(&Ret, 1, MPI_INT);
     RequestManager.send(&Errno, 1, MPI_INT);
@@ -1322,6 +1602,11 @@ struct ProxyDevice {
     if (OmpFileStageMode != "off")
       OmpFileStatsStagingWriteBypassCount.fetch_add(1,
                                                     std::memory_order_relaxed);
+    if (OmpFileStageMode != "off") {
+      std::string SourcePath;
+      if (getTrackedOmpFileFdPath(Fd, SourcePath))
+        invalidateStageForPath(SourcePath);
+    }
 
     std::vector<char> Buffer;
     if (Size > 0) {
@@ -1669,6 +1954,9 @@ struct ProxyDevice {
         errno = OpenErrno;
       if (Fd < 0)
         return false;
+      trackOmpFileFd(Fd, Path, Flags, Mode);
+      if (shouldInvalidateStageOnOpen(Flags))
+        invalidateStageForPath(Path);
       RemoteHandle = Fd;
       return true;
     }
@@ -1722,11 +2010,13 @@ struct ProxyDevice {
       *BytesReadOut = 0;
 
     if (Rank == EventSystem.LocalRank) {
-      const ssize_t BytesRead =
-          ::pread(RemoteHandle, Buffer, Size, static_cast<off_t>(Offset));
-      if (BytesRead < 0)
+      int ReadErrno = 0;
+      uint64_t Bytes = 0;
+      if (!preadWithOptionalStage(RemoteHandle, Offset, Buffer, Size, &Bytes,
+                                  ReadErrno)) {
+        errno = ReadErrno;
         return false;
-      const uint64_t Bytes = static_cast<uint64_t>(BytesRead);
+      }
       if (Bytes < Size)
         std::memset(static_cast<char *>(Buffer) + Bytes, 0,
                     static_cast<size_t>(Size - Bytes));
@@ -1771,6 +2061,13 @@ struct ProxyDevice {
       *BytesWrittenOut = 0;
 
     if (Rank == EventSystem.LocalRank) {
+      if (OmpFileStageMode != "off") {
+        OmpFileStatsStagingWriteBypassCount.fetch_add(1,
+                                                      std::memory_order_relaxed);
+        std::string SourcePath;
+        if (getTrackedOmpFileFdPath(RemoteHandle, SourcePath))
+          invalidateStageForPath(SourcePath);
+      }
       const ssize_t BytesWritten =
           ::pwrite(RemoteHandle, Buffer, Size, static_cast<off_t>(Offset));
       if (BytesWritten < 0)
@@ -2048,6 +2345,7 @@ struct ProxyDevice {
     traceOmpFile("mppFinalize enter handle_count=%zu\n", HandleCount);
     reportOmpFileStats("mpp-finalize-before-drain");
     drainOmpFileOpenCache();
+    drainOmpFileStageCache();
     {
       const std::lock_guard<std::mutex> Lock(MppEventMutex);
       MppEvents.clear();
@@ -2545,9 +2843,13 @@ private:
   std::mutex OmpFileHandleMutex;
   std::unordered_map<int, OmpFileHandleEntry> OmpFileHandles;
   std::atomic<int> NextOmpFileHandle{1};
+  mutable std::mutex OmpFileTrackedFdMutex;
+  std::unordered_map<int, OmpFileTrackedFdEntry> OmpFileTrackedFds;
   std::mutex OmpFileOpenCacheMutex;
   std::unordered_map<std::string, OmpFileOpenCacheEntry> OmpFileOpenCacheByKey;
   std::unordered_map<int, std::string> OmpFileOpenCacheFdToKey;
+  std::mutex OmpFileStageMutex;
+  std::unordered_map<std::string, OmpFileStageEntry> OmpFileStageEntries;
   std::atomic<uint64_t> OmpFileStatsOpenRequests{0};
   std::atomic<uint64_t> OmpFileStatsOpenSyscalls{0};
   std::atomic<uint64_t> OmpFileStatsOpenCacheHits{0};
