@@ -123,7 +123,7 @@ struct ProxyDevice {
   ProxyDevice()
       : NumExecEventHandlers("OMPTARGET_NUM_EXEC_EVENT_HANDLERS", 1),
         NumDataEventHandlers("OMPTARGET_NUM_DATA_EVENT_HANDLERS", 1),
-        EventPollingRate("OMPTARGET_EVENT_POLLING_RATE", 1),
+        EventPollingRate("OMPTARGET_EVENT_POLLING_RATE", 0),
         OmpFileOpenCacheEnable("LIBOMPFILE_OPT_OPEN_CACHE", false),
         OmpFileOpenCacheKeepOpen("LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN", true),
         OmpFileOptStats("LIBOMPFILE_OPT_STATS", false),

@@ -307,7 +307,7 @@ struct EventTy {
                                   assert(HandlePtr);
                                   CoHandleTy::from_address(HandlePtr).destroy();
                                 }),
-          IntEnvar("OMPTARGET_EVENT_POLLING_RATE", 1), EventTypeTy::SYNC};
+          IntEnvar("OMPTARGET_EVENT_POLLING_RATE", 0), EventTypeTy::SYNC};
     }
   };
 
