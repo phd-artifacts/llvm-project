@@ -111,21 +111,27 @@ bool hostsMatch(const std::string &Expected, const std::string &Observed) {
   return shortHostname(Expected) == shortHostname(Observed);
 }
 
-bool resolveTopologyStageRoot(const std::string &TopologyFile,
-                              const std::string &LocalHost,
-                              std::string &StageRoot, uint64_t &EntryCount,
-                              std::string &Error) {
-  StageRoot.clear();
-  EntryCount = 0;
-  Error.clear();
+struct ResolvedTopologyConfig {
+  std::string StageRoot;
+  std::string StageClass;
+  std::string SharedStoragePath;
+  std::string SharedStorageClass;
+  uint64_t EntryCount = 0;
+  std::string Error;
+};
+
+bool resolveTopologyConfig(const std::string &TopologyFile,
+                           const std::string &LocalHost,
+                           ResolvedTopologyConfig &Config) {
+  Config = {};
   if (TopologyFile.empty()) {
-    Error = "topology-unset";
+    Config.Error = "topology-unset";
     return false;
   }
 
   std::ifstream Input(TopologyFile);
   if (!Input) {
-    Error = "open-failed";
+    Config.Error = "open-failed";
     return false;
   }
 
@@ -136,18 +142,48 @@ bool resolveTopologyStageRoot(const std::string &TopologyFile,
       continue;
 
     std::istringstream Stream(Line);
-    std::string Host;
-    std::string Path;
-    if (!(Stream >> Host >> Path))
+    std::string Tag;
+    if (!(Stream >> Tag))
       continue;
 
-    ++EntryCount;
-    if (hostsMatch(Host, LocalHost))
-      StageRoot = Path;
+    if (Tag == "global") {
+      std::string SharedPath;
+      std::string SharedClass;
+      if (!(Stream >> SharedPath))
+        continue;
+      Stream >> SharedClass;
+      ++Config.EntryCount;
+      Config.SharedStoragePath = SharedPath;
+      Config.SharedStorageClass = SharedClass;
+      continue;
+    }
+
+    if (Tag == "host") {
+      std::string Host;
+      std::string Path;
+      std::string StageClass;
+      if (!(Stream >> Host >> Path))
+        continue;
+      Stream >> StageClass;
+      ++Config.EntryCount;
+      if (hostsMatch(Host, LocalHost)) {
+        Config.StageRoot = Path;
+        Config.StageClass = StageClass;
+      }
+      continue;
+    }
+
+    std::string Path;
+    if (!(Stream >> Path))
+      continue;
+
+    ++Config.EntryCount;
+    if (hostsMatch(Tag, LocalHost))
+      Config.StageRoot = Path;
   }
 
-  if (StageRoot.empty()) {
-    Error = EntryCount == 0 ? "empty-topology" : "host-missing";
+  if (Config.StageRoot.empty()) {
+    Config.Error = Config.EntryCount == 0 ? "empty-topology" : "host-missing";
     return false;
   }
 
@@ -211,6 +247,56 @@ struct ProxyDevice {
     int StageFd = -1;
   };
 
+  [[noreturn]] void fatalStageConfig(const char *Reason) {
+    fprintf(stderr,
+            "MPIProxyDevice --> fatal stage config rank=%d reason=%s "
+            "stage_mode=%s topology_file=%s local_host=%s stage_root=%s "
+            "stage_class=%s shared_storage_path=%s shared_storage_class=%s "
+            "load_error=%s\n",
+            EventSystem.LocalRank, Reason ? Reason : "(unknown)",
+            OmpFileStageMode.c_str(),
+            OmpFileTopologyFile.empty() ? "(unset)"
+                                        : OmpFileTopologyFile.c_str(),
+            OmpFileStageLocalHost.c_str(),
+            OmpFileStageRoot.empty() ? "(unset)" : OmpFileStageRoot.c_str(),
+            OmpFileSelectedStageClass.empty() ? "(unset)"
+                                              : OmpFileSelectedStageClass.c_str(),
+            OmpFileSharedStoragePath.empty()
+                ? "(unset)"
+                : OmpFileSharedStoragePath.c_str(),
+            OmpFileSharedStorageClass.empty()
+                ? "(unset)"
+                : OmpFileSharedStorageClass.c_str(),
+            OmpFileTopologyLoadError.empty()
+                ? "(none)"
+                : OmpFileTopologyLoadError.c_str());
+    std::fflush(stderr);
+    std::exit(EXIT_FAILURE);
+  }
+
+  bool validateStageConfigFast() {
+    if (OmpFileStageMode == "off")
+      return true;
+    if (OmpFileStageRootPolicy != "topology")
+      return true;
+    if (OmpFileTopologyFile.empty()) {
+      OmpFileTopologyLoadError = "topology-required";
+      return false;
+    }
+    if (!OmpFileTopologyLoaded || OmpFileStageRoot.empty())
+      return false;
+    int ErrnoOut = 0;
+    if (!ensureDirectoryTree(OmpFileStageRoot, ErrnoOut)) {
+      OmpFileTopologyLoadError = "stage-root-unusable";
+      return false;
+    }
+    if (!hasStageFreeSpace(ErrnoOut)) {
+      OmpFileTopologyLoadError = "stage-root-low-space";
+      return false;
+    }
+    return true;
+  }
+
   void traceOmpFile(const char *Fmt, ...) const {
     if (!ompfileProxyTraceEnabled())
       return;
@@ -258,9 +344,15 @@ struct ProxyDevice {
       DP("Initialized global OMPFile headnode manager on rank %d\n",
          EventSystem.LocalRank);
     }
-    OmpFileTopologyLoaded = resolveTopologyStageRoot(
-        OmpFileTopologyFile, OmpFileStageLocalHost, OmpFileStageRoot,
-        OmpFileTopologyEntries, OmpFileTopologyLoadError);
+    ResolvedTopologyConfig TopologyConfig;
+    OmpFileTopologyLoaded = resolveTopologyConfig(
+        OmpFileTopologyFile, OmpFileStageLocalHost, TopologyConfig);
+    OmpFileStageRoot = TopologyConfig.StageRoot;
+    OmpFileSelectedStageClass = TopologyConfig.StageClass;
+    OmpFileSharedStoragePath = TopologyConfig.SharedStoragePath;
+    OmpFileSharedStorageClass = TopologyConfig.SharedStorageClass;
+    OmpFileTopologyEntries = TopologyConfig.EntryCount;
+    OmpFileTopologyLoadError = TopologyConfig.Error;
     if (OmpFileOptStats || OmpFileOpenCacheEnable) {
       fprintf(stderr,
               "MPIProxyDevice --> OMPFile cache config rank=%d enabled=%d "
@@ -276,7 +368,8 @@ struct ProxyDevice {
               "MPIProxyDevice --> OMPFile stage config rank=%d "
               "stage_mode=%s stage_root_policy=%s topology_file_set=%d "
               "topology_file=%s topology_loaded=%d topology_entries=%llu "
-              "stage_root=%s storage_environment=%s "
+              "stage_root=%s stage_class=%s shared_storage_path=%s "
+              "shared_storage_class=%s storage_environment=%s "
               "stage_min_free_bytes=%llu local_host=%s load_error=%s\n",
               EventSystem.LocalRank, OmpFileStageMode.c_str(),
               OmpFileStageRootPolicy.c_str(),
@@ -286,6 +379,15 @@ struct ProxyDevice {
               static_cast<int>(OmpFileTopologyLoaded),
               static_cast<unsigned long long>(OmpFileTopologyEntries),
               OmpFileStageRoot.empty() ? "(unset)" : OmpFileStageRoot.c_str(),
+              OmpFileSelectedStageClass.empty()
+                  ? "(unset)"
+                  : OmpFileSelectedStageClass.c_str(),
+              OmpFileSharedStoragePath.empty()
+                  ? "(unset)"
+                  : OmpFileSharedStoragePath.c_str(),
+              OmpFileSharedStorageClass.empty()
+                  ? "(unset)"
+                  : OmpFileSharedStorageClass.c_str(),
               OmpFileStorageEnvironment.c_str(),
               static_cast<unsigned long long>(OmpFileStageMinFreeBytes),
               OmpFileStageLocalHost.c_str(),
@@ -293,6 +395,8 @@ struct ProxyDevice {
                   ? "(none)"
                   : OmpFileTopologyLoadError.c_str());
     }
+    if (!validateStageConfigFast())
+      fatalStageConfig("stage-preflight-failed");
     {
       const std::lock_guard<std::mutex> Lock(ActiveProxyDeviceMutex);
       ActiveProxyDevice = this;
@@ -1457,6 +1561,7 @@ struct ProxyDevice {
             "pwrite_payload_bytes=%llu pwrite_failures=%llu "
             "topology_file_set=%d topology_loaded=%d topology_entries=%llu "
             "stage_mode=%s stage_root_policy=%s stage_root=%s "
+            "stage_class=%s shared_storage_path=%s shared_storage_class=%s "
             "storage_environment=%s stage_min_free_bytes=%llu "
             "staged_read_hits=%llu staged_read_bytes=%llu "
             "staging_invalidations=%llu staging_write_bypass_count=%llu "
@@ -1478,6 +1583,15 @@ struct ProxyDevice {
             static_cast<unsigned long long>(OmpFileTopologyEntries),
             OmpFileStageMode.c_str(), OmpFileStageRootPolicy.c_str(),
             OmpFileStageRoot.empty() ? "(unset)" : OmpFileStageRoot.c_str(),
+            OmpFileSelectedStageClass.empty()
+                ? "(unset)"
+                : OmpFileSelectedStageClass.c_str(),
+            OmpFileSharedStoragePath.empty()
+                ? "(unset)"
+                : OmpFileSharedStoragePath.c_str(),
+            OmpFileSharedStorageClass.empty()
+                ? "(unset)"
+                : OmpFileSharedStorageClass.c_str(),
             OmpFileStorageEnvironment.c_str(),
             static_cast<unsigned long long>(OmpFileStageMinFreeBytes),
             static_cast<unsigned long long>(StagedReadHits),
@@ -2835,6 +2949,9 @@ private:
   bool OmpFileTopologyLoaded = false;
   uint64_t OmpFileTopologyEntries = 0;
   std::string OmpFileStageRoot;
+  std::string OmpFileSelectedStageClass;
+  std::string OmpFileSharedStoragePath;
+  std::string OmpFileSharedStorageClass;
   std::string OmpFileStageLocalHost;
   std::string OmpFileTopologyLoadError;
   // Mutex for AsyncInfoTable
