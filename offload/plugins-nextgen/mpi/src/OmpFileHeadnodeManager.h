@@ -63,6 +63,7 @@ public:
                         int LocalRank);
 
   void completeRequest(const OmpFileIOPlan &Plan);
+  std::vector<HandlerInfo> snapshotHandlersForTesting();
 
 private:
   OmpFileHeadnodeManager() = default;
@@ -74,6 +75,7 @@ private:
   uint64_t minInFlightUnlocked() const;
   uint64_t inFlightForRankUnlocked(int Rank) const;
   void bumpHandlerLoadUnlocked(int Rank);
+  void noteBatchPlanUnlocked(int Rank);
   void registerPathAffinityUnlocked(uint64_t PathKey, int Rank);
   int pickRankForPathKeyUnlocked(uint64_t PathKey, bool HasPathKey,
                                  int ClientRank, bool &AffinityHit,

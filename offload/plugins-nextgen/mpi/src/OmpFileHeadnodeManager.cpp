@@ -117,6 +117,15 @@ void OmpFileHeadnodeManager::bumpHandlerLoadUnlocked(int Rank) {
   }
 }
 
+void OmpFileHeadnodeManager::noteBatchPlanUnlocked(int Rank) {
+  for (HandlerInfo &H : Handlers) {
+    if (H.Rank == Rank) {
+      H.PlannedTotal += 1;
+      return;
+    }
+  }
+}
+
 void OmpFileHeadnodeManager::registerPathAffinityUnlocked(uint64_t PathKey,
                                                           int Rank) {
   if (PathKey == 0 || !isWorkerRankUnlocked(Rank))
@@ -343,7 +352,7 @@ bool OmpFileHeadnodeManager::planBatchRequest(
     } else {
       Entry.AggregatorRank = HandlerRank;
       Entry.RemoteHandle = -1;
-      bumpHandlerLoadUnlocked(HandlerRank);
+      noteBatchPlanUnlocked(HandlerRank);
       if (AffinityHit) {
         Entry.PlanFlags |= OMPFILE_BATCH_PLAN_FILE_AFFINITY;
         ++AffinityHits;
@@ -375,6 +384,13 @@ bool OmpFileHeadnodeManager::planBatchRequest(
   Stats.Rebalances += Rebalances;
   maybeReportBatchStatsUnlocked();
   return true;
+}
+
+std::vector<OmpFileHeadnodeManager::HandlerInfo>
+OmpFileHeadnodeManager::snapshotHandlersForTesting() {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  ensureHandlersUnlocked();
+  return Handlers;
 }
 
 void OmpFileHeadnodeManager::maybeReportBatchStatsUnlocked() {

@@ -1032,6 +1032,17 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
         if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_REBALANCED) != 0)
           two_phase_planner_rebalanced_count.fetch_add(
               1, std::memory_order_relaxed);
+        if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_REBALANCED) != 0) {
+          two_phase_planner_error_count.fetch_add(1, std::memory_order_relaxed);
+          item.Skip = true;
+          item.ErrorStatus = -1;
+          item.ErrorErrno = ENOTSUP;
+          io_log("Two-phase planner returned an unsupported rebalanced batch "
+                 "segment: batch_id=%llu segment_id=%llu aggregator=%d\n",
+                 static_cast<unsigned long long>(batch_request.BatchId),
+                 static_cast<unsigned long long>(entry.SegmentId),
+                 entry.AggregatorRank);
+        }
         if (entry.Status != 0) {
           item.Skip = true;
           item.ErrorStatus = -1;
