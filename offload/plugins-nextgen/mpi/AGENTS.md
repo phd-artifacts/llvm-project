@@ -2,6 +2,10 @@
 
 This scope covers MPP event routing, scheduler selection, and proxy-side I/O dispatch.
 
+## Scope intent
+- Keep this file focused on MPI-plugin runtime behavior.
+- Shared commit workflow, submodule hygiene, and MkDocs maintenance are canonical in root `AGENTS.md`.
+
 ## Relevant files
 - Runtime bridge exports:
   - `src/rtl.cpp`
@@ -37,35 +41,6 @@ This scope covers MPP event routing, scheduler selection, and proxy-side I/O dis
 - If scheduling seems ignored, verify `LIBOMPFILE_SCHEDULER=HEADNODE` in the process environment.
 - Use `LIBOMPFILE_OPT_STATS=1` to inspect open/close cache counters printed by proxy.
 
-## Commit instructions
-- Commit message format must follow Rodrigo Ceccato style:
-  - subject line: `[scope]: short message`
-  - scope describes the implementation change, not the subfolder name.
-  - preferred scopes in this area: `mpp-events`, `runtime`, `tests`, `docs`.
-  - use `[docs]:` only for docs-only commits.
-  - body: concise bullet list with what changed and why.
-  - do not use `Step 1:`, `Step 2:` style.
-  - preferred command form:
-    - `git commit -m "[mpp-events]: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
-- Commit MPI plugin changes in this submodule first:
-  - `cd /scratch/rodrigo.freitas/io-playground/llvm-infra/llvm-project`
-  - `git add offload/plugins-nextgen/mpi/...`
-  - `git commit -m "[mpp-events]: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
-- Then update the superproject pointer:
-  - `cd /scratch/rodrigo.freitas/io-playground`
-  - `git add llvm-infra/llvm-project`
-  - `git commit -m "[runtime]: short message" -m "- bullet 1\n- bullet 2\n\nWhy:\n- ..."`
-
-## MkDocs sync requirements
-- Any MPP control-plane/event behavior change must update MkDocs in the same workstream.
-- In each implementation step, update `docs/roadmap.md` and
-  append/update `docs/journal.md`.
-- Journal entries must use short meeting-style bullets:
-  - goal
-  - edited code (high-level)
-  - changes
-  - tests
-  - current limitations and unresolved problems
-- Update roadmap with current stage, known limitations, sorgan speedups/slowdowns, and current/expected challenges.
-- Update flow/architecture diagrams when event routing, scheduler planning, or proxy execution paths change.
-- Always highlight current limitations and unresolved problems.
+## Skills entrypoints
+- `skills/submodule-commit-flow/SKILL.md`
+- `skills/mkdocs-sync/SKILL.md`
