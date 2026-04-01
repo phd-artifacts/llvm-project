@@ -42,12 +42,19 @@ private:
   mutable std::atomic<bool> strict_failure_logged{false};
   TwoPhasePolicy two_phase_policy = TwoPhasePolicy::Disabled;
   bool two_phase_enabled = false;
+  TwoPhasePolicy write_batch_policy = TwoPhasePolicy::Disabled;
+  bool write_batch_enabled = false;
   static constexpr uint64_t kDefaultTwoPhaseWindowUs = 2000;
   static constexpr uint64_t kDefaultTwoPhaseMaxBatchBytes = 1024 * 1024;
   static constexpr uint64_t kDefaultTwoPhaseSieveBytes = 4096;
+  static constexpr uint64_t kDefaultWriteBatchWindowUs = 2000;
+  static constexpr uint64_t kDefaultWriteBatchMaxBatchBytes =
+      4 * 1024 * 1024;
   uint64_t two_phase_window_us = 0;
   uint64_t two_phase_max_batch_bytes = 0;
   uint64_t two_phase_sieve_bytes = 0;
+  uint64_t write_batch_window_us = 0;
+  uint64_t write_batch_max_batch_bytes = 0;
   std::atomic<uint64_t> pread_request_count{0};
   std::atomic<uint64_t> remote_pread_event_count{0};
   std::atomic<uint64_t> remote_pread_bytes_total{0};
@@ -71,7 +78,14 @@ private:
   std::atomic<uint64_t> two_phase_cache_hit_count{0};
   std::atomic<uint64_t> two_phase_planner_batch_id{1};
   std::atomic<uint64_t> two_phase_request_id{1};
+  std::atomic<uint64_t> write_batch_count{0};
+  std::atomic<uint64_t> write_batch_coalesced_write_count{0};
+  std::atomic<uint64_t> write_batch_coalesced_bytes_total{0};
+  std::atomic<uint64_t> write_batch_saved_events{0};
+  std::atomic<uint64_t> write_batch_failure_count{0};
+  std::atomic<uint64_t> write_batch_request_id{1};
   bool two_phase_batch_in_progress = false;
+  bool write_batch_in_progress = false;
 
   struct TwoPhaseReadRequest {
     uint64_t DebugRequestId = 0;
@@ -91,6 +105,20 @@ private:
   std::mutex two_phase_mutex;
   std::condition_variable two_phase_queue_cv;
   std::deque<TwoPhaseReadRequest *> two_phase_queue;
+
+  struct WriteBatchRequest {
+    uint64_t DebugRequestId = 0;
+    int FileHandle = -1;
+    long Offset = 0;
+    std::vector<char> Data;
+    int Status = 0;
+    int Errno = 0;
+    bool Done = false;
+  };
+
+  std::mutex write_batch_mutex;
+  std::condition_variable write_batch_queue_cv;
+  std::deque<WriteBatchRequest *> write_batch_queue;
   struct TwoPhaseReadCacheEntry {
     long Start = 0;
     std::vector<char> Data;
@@ -114,6 +142,7 @@ public:
 private:
   int writeAtRemoteHandle(int remote_handle, long offset, const void *data,
                           size_t size, size_t &bytes_written);
+  int writeAtBatched(int file_id, long offset, const void *data, size_t size);
   int readAtFallback(int file_id, long offset, void *data, size_t size);
   int readAtFallbackWithBytes(int file_id, long offset, void *data, size_t size,
                               size_t &bytes_read);
@@ -121,10 +150,16 @@ private:
                      void *data, size_t size);
   void processTwoPhaseBatch(std::vector<TwoPhaseReadRequest *> &batch);
   void processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &group);
+  void processWriteBatch(std::vector<WriteBatchRequest *> &batch);
+  void processWriteGroup(std::vector<WriteBatchRequest *> &group);
   uint64_t getTwoPhaseGroupKey(const TwoPhaseReadRequest &request) const;
+  uint64_t getWriteBatchGroupKey(const WriteBatchRequest &request) const;
   void completeTwoPhaseRequest(TwoPhaseReadRequest &request, int status,
                                int errnum);
+  void completeWriteBatchRequest(WriteBatchRequest &request, int status,
+                                 int errnum);
   bool isTwoPhaseActive() const;
+  bool isWriteBatchActive() const;
   bool hasUsablePlannedRead(const ompfile::OmpFileReadRequestContext &context) const;
   int getNextFileHandle();
   static TwoPhasePolicy parseTwoPhasePolicy(const char *env_value);

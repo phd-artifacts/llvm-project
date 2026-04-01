@@ -111,14 +111,35 @@ MPIIOBackend::MPIIOBackend() {
   two_phase_sieve_bytes =
       parseUint64Env("LIBOMPFILE_OPT_TWO_PHASE_SIEVE_BYTES",
                      two_phase_enabled ? kDefaultTwoPhaseSieveBytes : 0);
+  write_batch_policy =
+      parseTwoPhasePolicy(std::getenv("LIBOMPFILE_OPT_WRITE_BATCH"));
+  if (write_batch_policy == TwoPhasePolicy::Enabled) {
+    write_batch_enabled = true;
+  } else if (write_batch_policy == TwoPhasePolicy::Auto) {
+    write_batch_enabled = mpp_remote_only;
+  } else {
+    write_batch_enabled = false;
+  }
+  write_batch_window_us =
+      parseUint64Env("LIBOMPFILE_OPT_WRITE_BATCH_WINDOW_US",
+                     write_batch_enabled ? kDefaultWriteBatchWindowUs : 0);
+  write_batch_max_batch_bytes =
+      parseUint64Env("LIBOMPFILE_OPT_WRITE_BATCH_MAX_BATCH_BYTES",
+                     write_batch_enabled ? kDefaultWriteBatchMaxBatchBytes : 0);
 
   io_log("Two-phase guard config: policy=%s enabled=%d window_us=%llu "
-         "max_batch_bytes=%llu sieve_bytes=%llu scheduler=%s remote_only=%d\n",
+         "max_batch_bytes=%llu sieve_bytes=%llu write_batch_policy=%s "
+         "write_batch_enabled=%d write_batch_window_us=%llu "
+         "write_batch_max_batch_bytes=%llu scheduler=%s remote_only=%d\n",
          twoPhasePolicyToString(two_phase_policy),
          static_cast<int>(two_phase_enabled),
          static_cast<unsigned long long>(two_phase_window_us),
          static_cast<unsigned long long>(two_phase_max_batch_bytes),
          static_cast<unsigned long long>(two_phase_sieve_bytes),
+         twoPhasePolicyToString(write_batch_policy),
+         static_cast<int>(write_batch_enabled),
+         static_cast<unsigned long long>(write_batch_window_us),
+         static_cast<unsigned long long>(write_batch_max_batch_bytes),
          scheduler_env ? scheduler_env : "(unset)",
          static_cast<int>(mpp_remote_only));
 
@@ -156,6 +177,13 @@ MPIIOBackend::MPIIOBackend() {
            static_cast<unsigned long long>(two_phase_window_us),
            static_cast<unsigned long long>(two_phase_max_batch_bytes),
            static_cast<unsigned long long>(two_phase_sieve_bytes));
+  io_trace("MPIIOBackend ctor write-batch this=%p policy=%s enabled=%d "
+           "window_us=%llu max_batch_bytes=%llu\n",
+           static_cast<void *>(this),
+           twoPhasePolicyToString(write_batch_policy),
+           static_cast<int>(write_batch_enabled),
+           static_cast<unsigned long long>(write_batch_window_us),
+           static_cast<unsigned long long>(write_batch_max_batch_bytes));
 
 }
 
@@ -1128,6 +1156,11 @@ uint64_t MPIIOBackend::getTwoPhaseGroupKey(
   return static_cast<uint64_t>(static_cast<uint32_t>(request.FileHandle));
 }
 
+uint64_t MPIIOBackend::getWriteBatchGroupKey(
+    const WriteBatchRequest &request) const {
+  return static_cast<uint64_t>(static_cast<uint32_t>(request.FileHandle));
+}
+
 void MPIIOBackend::completeTwoPhaseRequest(TwoPhaseReadRequest &request,
                                            int status, int errnum) {
   const std::lock_guard<std::mutex> lock(two_phase_mutex);
@@ -1141,8 +1174,21 @@ void MPIIOBackend::completeTwoPhaseRequest(TwoPhaseReadRequest &request,
   two_phase_queue_cv.notify_all();
 }
 
+void MPIIOBackend::completeWriteBatchRequest(WriteBatchRequest &request,
+                                             int status, int errnum) {
+  const std::lock_guard<std::mutex> lock(write_batch_mutex);
+  request.Status = status;
+  request.Errno = errnum;
+  request.Done = true;
+  write_batch_queue_cv.notify_all();
+}
+
 bool MPIIOBackend::isTwoPhaseActive() const {
   return two_phase_enabled && mpp_open_enabled && mpp_io_enabled;
+}
+
+bool MPIIOBackend::isWriteBatchActive() const {
+  return write_batch_enabled && mpp_remote_only;
 }
 
 int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
@@ -1233,6 +1279,9 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
 
   io_log("Writing %zu bytes to file %d at offset %lld\n", size, file_id,
          static_cast<long long>(offset));
+
+  if (isWriteBatchActive())
+    return writeAtBatched(file_id, offset, data, size);
 
   if (remote_only) {
     int remote_handle = -1;
@@ -1337,6 +1386,184 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
 
   io_log("Write at offset completed\n");
   return 0;
+}
+
+int MPIIOBackend::writeAtBatched(int file_id, long offset, const void *data,
+                                 size_t size) {
+  WriteBatchRequest request{};
+  request.DebugRequestId =
+      write_batch_request_id.fetch_add(1, std::memory_order_relaxed);
+  request.FileHandle = file_id;
+  request.Offset = offset;
+  request.Data.resize(size);
+  if (size > 0)
+    std::memcpy(request.Data.data(), data, size);
+
+  std::vector<WriteBatchRequest *> batch;
+  std::unique_lock<std::mutex> lock(write_batch_mutex);
+  write_batch_queue.push_back(&request);
+  write_batch_queue_cv.notify_all();
+
+  while (!request.Done) {
+    if (!write_batch_in_progress) {
+      write_batch_in_progress = true;
+      if (write_batch_window_us > 0) {
+        write_batch_queue_cv.wait_for(
+            lock, std::chrono::microseconds(write_batch_window_us));
+      }
+
+      while (!write_batch_queue.empty()) {
+        batch.push_back(write_batch_queue.front());
+        write_batch_queue.pop_front();
+      }
+
+      lock.unlock();
+      processWriteBatch(batch);
+      batch.clear();
+      lock.lock();
+
+      write_batch_in_progress = false;
+      write_batch_queue_cv.notify_all();
+    } else {
+      write_batch_queue_cv.wait(lock, [this, &request] {
+        return request.Done || !write_batch_in_progress;
+      });
+    }
+  }
+
+  if (request.Status != 0) {
+    errno = request.Errno;
+    return -1;
+  }
+  return 0;
+}
+
+void MPIIOBackend::processWriteBatch(std::vector<WriteBatchRequest *> &batch) {
+  if (batch.empty())
+    return;
+
+  write_batch_count.fetch_add(1, std::memory_order_relaxed);
+  std::unordered_map<uint64_t, std::vector<WriteBatchRequest *>> grouped;
+  grouped.reserve(batch.size());
+  for (WriteBatchRequest *request : batch)
+    grouped[getWriteBatchGroupKey(*request)].push_back(request);
+
+  for (auto &entry : grouped)
+    processWriteGroup(entry.second);
+}
+
+void MPIIOBackend::processWriteGroup(std::vector<WriteBatchRequest *> &group) {
+  if (group.empty())
+    return;
+
+  std::sort(group.begin(), group.end(),
+            [](const WriteBatchRequest *lhs, const WriteBatchRequest *rhs) {
+              if (lhs->Offset != rhs->Offset)
+                return lhs->Offset < rhs->Offset;
+              return lhs->Data.size() < rhs->Data.size();
+            });
+
+  struct CoalescedWrite {
+    long Start = 0;
+    long End = 0;
+    std::vector<char> Data;
+    std::vector<WriteBatchRequest *> Requests;
+  };
+
+  std::vector<CoalescedWrite> coalesced;
+  coalesced.reserve(group.size());
+  for (WriteBatchRequest *request : group) {
+    if (request->Offset < 0) {
+      completeWriteBatchRequest(*request, -1, EINVAL);
+      continue;
+    }
+    if (request->Data.size() >
+            static_cast<size_t>(std::numeric_limits<long>::max()) ||
+        request->Offset >
+            std::numeric_limits<long>::max() -
+                static_cast<long>(request->Data.size())) {
+      completeWriteBatchRequest(*request, -1, EOVERFLOW);
+      continue;
+    }
+
+    const long start = request->Offset;
+    const long end = start + static_cast<long>(request->Data.size());
+    if (coalesced.empty()) {
+      CoalescedWrite item{};
+      item.Start = start;
+      item.End = end;
+      item.Data = request->Data;
+      item.Requests.push_back(request);
+      coalesced.push_back(std::move(item));
+      continue;
+    }
+
+    CoalescedWrite &tail = coalesced.back();
+    const bool mergeable = start <= tail.End;
+    const long merged_end = std::max(tail.End, end);
+    const uint64_t merged_size =
+        static_cast<uint64_t>(merged_end - tail.Start);
+    const bool exceeds_cap =
+        write_batch_max_batch_bytes > 0 &&
+        merged_size > write_batch_max_batch_bytes;
+    if (!mergeable || exceeds_cap) {
+      CoalescedWrite item{};
+      item.Start = start;
+      item.End = end;
+      item.Data = request->Data;
+      item.Requests.push_back(request);
+      coalesced.push_back(std::move(item));
+      continue;
+    }
+
+    tail.Data.resize(static_cast<size_t>(merged_end - tail.Start), 0);
+    const size_t copy_offset = static_cast<size_t>(start - tail.Start);
+    if (!request->Data.empty()) {
+      std::memcpy(tail.Data.data() + copy_offset, request->Data.data(),
+                  request->Data.size());
+    }
+    tail.End = merged_end;
+    tail.Requests.push_back(request);
+  }
+
+  int remote_handle = -1;
+  {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    auto it = remote_file_handle_map.find(group.front()->FileHandle);
+    if (it != remote_file_handle_map.end())
+      remote_handle = it->second;
+  }
+  if (remote_handle < 0) {
+    write_batch_failure_count.fetch_add(1, std::memory_order_relaxed);
+    for (WriteBatchRequest *request : group)
+      completeWriteBatchRequest(*request, -1, EBADF);
+    return;
+  }
+
+  for (CoalescedWrite &item : coalesced) {
+    write_batch_coalesced_write_count.fetch_add(1, std::memory_order_relaxed);
+    write_batch_coalesced_bytes_total.fetch_add(item.Data.size(),
+                                                std::memory_order_relaxed);
+    if (item.Requests.size() > 1) {
+      write_batch_saved_events.fetch_add(item.Requests.size() - 1,
+                                         std::memory_order_relaxed);
+    }
+
+    size_t bytes_written = 0;
+    const int rc = writeAtRemoteHandle(remote_handle, item.Start,
+                                       item.Data.data(), item.Data.size(),
+                                       bytes_written);
+    if (rc != 0 || bytes_written != item.Data.size()) {
+      const int errnum = errno != 0 ? errno : EIO;
+      write_batch_failure_count.fetch_add(1, std::memory_order_relaxed);
+      for (WriteBatchRequest *request : item.Requests)
+        completeWriteBatchRequest(*request, -1, errnum);
+      continue;
+    }
+
+    for (WriteBatchRequest *request : item.Requests)
+      completeWriteBatchRequest(*request, 0, 0);
+  }
 }
 
 int MPIIOBackend::getNextFileHandle() {
@@ -1646,6 +1873,16 @@ void MPIIOBackend::reportPhase0Stats() const {
       two_phase_planner_error_count.load(std::memory_order_relaxed);
   const uint64_t cache_hits =
       two_phase_cache_hit_count.load(std::memory_order_relaxed);
+  const uint64_t write_batches =
+      write_batch_count.load(std::memory_order_relaxed);
+  const uint64_t coalesced_writes =
+      write_batch_coalesced_write_count.load(std::memory_order_relaxed);
+  const uint64_t coalesced_write_bytes =
+      write_batch_coalesced_bytes_total.load(std::memory_order_relaxed);
+  const uint64_t write_saved_events =
+      write_batch_saved_events.load(std::memory_order_relaxed);
+  const uint64_t write_batch_failures =
+      write_batch_failure_count.load(std::memory_order_relaxed);
 
   const double avg_remote_bytes =
       remote_events == 0 ? 0.0
@@ -1660,6 +1897,11 @@ void MPIIOBackend::reportPhase0Stats() const {
       coalesced_reads == 0 ? 0.0
                            : static_cast<double>(coalesced_bytes) /
                                  static_cast<double>(coalesced_reads);
+  const double avg_coalesced_write_bytes =
+      coalesced_writes == 0
+          ? 0.0
+          : static_cast<double>(coalesced_write_bytes) /
+                static_cast<double>(coalesced_writes);
 
   io_log("Two-phase stats: pread_requests=%llu remote_pread_events=%llu "
          "remote_pread_bytes_total=%llu remote_pread_avg_bytes=%.2f "
@@ -1671,9 +1913,15 @@ void MPIIOBackend::reportPhase0Stats() const {
          "coalesced_avg_bytes=%.2f planner_batches=%llu "
          "planner_segments=%llu planner_affinity=%llu "
          "planner_rebalanced=%llu planner_scalar_fallbacks=%llu "
-         "planner_errors=%llu cache_hits=%llu fallbacks=%llu two_phase_enabled=%d "
+         "planner_errors=%llu cache_hits=%llu fallbacks=%llu "
+         "write_batch_count=%llu coalesced_writes=%llu "
+         "coalesced_write_bytes=%llu coalesced_write_avg_bytes=%.2f "
+         "write_batch_saved_events=%llu write_batch_failures=%llu "
+         "write_batch_enabled=%d "
+         "two_phase_enabled=%d "
          "two_phase_active=%d two_phase_policy=%s window_us=%llu "
-         "max_batch_bytes=%llu sieve_bytes=%llu\n",
+         "max_batch_bytes=%llu sieve_bytes=%llu write_batch_policy=%s "
+         "write_batch_window_us=%llu write_batch_max_batch_bytes=%llu\n",
          static_cast<unsigned long long>(pread_reqs),
          static_cast<unsigned long long>(remote_events),
          static_cast<unsigned long long>(remote_bytes), avg_remote_bytes,
@@ -1696,10 +1944,20 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(planner_errors),
          static_cast<unsigned long long>(cache_hits),
          static_cast<unsigned long long>(fallback_count),
+         static_cast<unsigned long long>(write_batches),
+         static_cast<unsigned long long>(coalesced_writes),
+         static_cast<unsigned long long>(coalesced_write_bytes),
+         avg_coalesced_write_bytes,
+         static_cast<unsigned long long>(write_saved_events),
+         static_cast<unsigned long long>(write_batch_failures),
+         static_cast<int>(write_batch_enabled),
          static_cast<int>(two_phase_enabled),
          static_cast<int>(isTwoPhaseActive()),
          twoPhasePolicyToString(two_phase_policy),
          static_cast<unsigned long long>(two_phase_window_us),
          static_cast<unsigned long long>(two_phase_max_batch_bytes),
-         static_cast<unsigned long long>(two_phase_sieve_bytes));
+         static_cast<unsigned long long>(two_phase_sieve_bytes),
+         twoPhasePolicyToString(write_batch_policy),
+         static_cast<unsigned long long>(write_batch_window_us),
+         static_cast<unsigned long long>(write_batch_max_batch_bytes));
 }
