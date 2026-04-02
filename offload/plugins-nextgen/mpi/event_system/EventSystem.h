@@ -142,6 +142,22 @@ enum class OmpFileIOOp : uint32_t {
   PREFETCH = 4,
 };
 
+constexpr uint32_t OMPFILE_IO_HINT_ABI_VERSION = 1u;
+
+enum OmpFileIOHintFlags : uint32_t {
+  OMPFILE_IO_HINT_HAS_EPOCH = 1u << 0,
+  OMPFILE_IO_HINT_HAS_STREAM = 1u << 1,
+  OMPFILE_IO_HINT_HAS_TILE = 1u << 2,
+};
+
+struct OmpFileIOHint {
+  uint32_t AbiVersion = OMPFILE_IO_HINT_ABI_VERSION;
+  uint32_t HintFlags = 0;
+  uint64_t EpochId = 0;
+  uint64_t StreamId = 0;
+  uint64_t TileId = 0;
+};
+
 struct OmpFileIORequest {
   uint64_t RequestId = 0;
   OmpFileIOOp Op = OmpFileIOOp::OPEN;
@@ -152,7 +168,10 @@ struct OmpFileIORequest {
   int64_t Offset = 0;
   uint64_t Size = 0;
   uint32_t PathSize = 0;
-  uint32_t Reserved = 0;
+  uint32_t HintFlags = 0;
+  uint64_t EpochId = 0;
+  uint64_t StreamId = 0;
+  uint64_t TileId = 0;
 };
 
 struct OmpFileIOPlan {
@@ -190,6 +209,9 @@ struct OmpFileIOBatchSegment {
   uint64_t PathKey = 0;
   uint32_t SegmentFlags = 0;
   uint32_t Reserved = 0;
+  uint64_t EpochId = 0;
+  uint64_t StreamId = 0;
+  uint64_t TileId = 0;
 };
 
 struct OmpFileIOBatchRequest {
@@ -235,6 +257,7 @@ struct OmpFileIOCompletion {
 
 static_assert(std::is_standard_layout_v<OmpFileIORequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOPlan>);
+static_assert(std::is_standard_layout_v<OmpFileIOHint>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchSegment>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchRequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchPlanEntry>);

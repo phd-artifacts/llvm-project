@@ -96,6 +96,7 @@ private:
     void *Buffer = nullptr;
     uint64_t PathKey = 0;
     bool HasPathKey = false;
+    ompfile::OmpFileIOHint Hint{};
 
     int Status = 0;
     int Errno = 0;
@@ -110,6 +111,7 @@ private:
     uint64_t DebugRequestId = 0;
     int FileHandle = -1;
     long Offset = 0;
+    uint64_t GroupKey = 0;
     std::vector<char> Data;
     int Status = 0;
     int Errno = 0;
@@ -137,12 +139,15 @@ public:
   int readAt(int file_id, long offset, void *data, size_t size) override;
   int readAtWithContext(const ompfile::OmpFileReadRequestContext &context,
                         void *data, size_t size) override;
+  int writeAtWithContext(const ompfile::OmpFileWriteRequestContext &context,
+                         const void *data, size_t size) override;
   int writeAt(int file_id, long offset, const void *data, size_t size) override;
 
 private:
   int writeAtRemoteHandle(int remote_handle, long offset, const void *data,
                           size_t size, size_t &bytes_written);
-  int writeAtBatched(int file_id, long offset, const void *data, size_t size);
+  int writeAtBatched(int file_id, long offset, const void *data, size_t size,
+                     uint64_t group_key);
   int readAtFallback(int file_id, long offset, void *data, size_t size);
   int readAtFallbackWithBytes(int file_id, long offset, void *data, size_t size,
                               size_t &bytes_read);
@@ -167,6 +172,8 @@ private:
   static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
   static uint64_t computePathKey(const char *path);
+  static uint64_t mixHintIntoKey(uint64_t base_key,
+                                 const ompfile::OmpFileIOHint &hint);
   static bool shouldReportStats();
   bool getFilePathKey(int file_id, uint64_t &path_key_out);
   void rememberFilePathKey(int file_id, const char *path);

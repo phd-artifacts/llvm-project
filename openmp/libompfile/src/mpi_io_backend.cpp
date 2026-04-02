@@ -803,6 +803,7 @@ int MPIIOBackend::readAtTwoPhase(
   request.Buffer = data;
   request.PathKey = request_key;
   request.HasPathKey = true;
+  request.Hint = context.Hint;
 
   const auto enqueue_ts = std::chrono::steady_clock::now();
   std::vector<TwoPhaseReadRequest *> batch;
@@ -1021,6 +1022,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     segment.PathKey = item.Requests.front()->HasPathKey
                           ? item.Requests.front()->PathKey
                           : static_cast<uint64_t>(0);
+    segment.SegmentFlags = item.Requests.front()->Hint.HintFlags;
+    segment.EpochId = item.Requests.front()->Hint.EpochId;
+    segment.StreamId = item.Requests.front()->Hint.StreamId;
+    segment.TileId = item.Requests.front()->Hint.TileId;
     batch_segments.push_back(segment);
   }
 
@@ -1158,7 +1163,7 @@ uint64_t MPIIOBackend::getTwoPhaseGroupKey(
 
 uint64_t MPIIOBackend::getWriteBatchGroupKey(
     const WriteBatchRequest &request) const {
-  return static_cast<uint64_t>(static_cast<uint32_t>(request.FileHandle));
+  return request.GroupKey;
 }
 
 void MPIIOBackend::completeTwoPhaseRequest(TwoPhaseReadRequest &request,
@@ -1261,8 +1266,21 @@ int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
   return 0;
 }
 
-int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
-                          size_t size) {
+int MPIIOBackend::writeAtWithContext(
+    const ompfile::OmpFileWriteRequestContext &context, const void *data,
+    size_t size) {
+  const int file_id = context.FileHandle;
+  const long offset = static_cast<long>(context.Offset);
+  uint64_t group_key = static_cast<uint64_t>(static_cast<uint32_t>(file_id));
+  if ((context.ContextFlags & ompfile::OMPFILE_WRITE_CTX_HAS_PATH_KEY) != 0)
+    group_key = context.PathKey;
+  else {
+    uint64_t path_key = 0;
+    if (getFilePathKey(file_id, path_key))
+      group_key = path_key;
+  }
+  group_key = mixHintIntoKey(group_key, context.Hint);
+
   if (strict_mpp_init_failed)
     return failStrictMpp("pwrite");
   const bool remote_only = mpp_remote_only;
@@ -1281,7 +1299,7 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
          static_cast<long long>(offset));
 
   if (isWriteBatchActive())
-    return writeAtBatched(file_id, offset, data, size);
+    return writeAtBatched(file_id, offset, data, size, group_key);
 
   if (remote_only) {
     int remote_handle = -1;
@@ -1388,13 +1406,28 @@ int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
   return 0;
 }
 
+int MPIIOBackend::writeAt(int file_id, long offset, const void *data,
+                          size_t size) {
+  ompfile::OmpFileWriteRequestContext context{};
+  context.FileHandle = file_id;
+  context.Offset = static_cast<int64_t>(offset);
+  context.Size = static_cast<uint64_t>(size);
+  uint64_t path_key = 0;
+  if (getFilePathKey(file_id, path_key)) {
+    context.PathKey = path_key;
+    context.ContextFlags |= ompfile::OMPFILE_WRITE_CTX_HAS_PATH_KEY;
+  }
+  return writeAtWithContext(context, data, size);
+}
+
 int MPIIOBackend::writeAtBatched(int file_id, long offset, const void *data,
-                                 size_t size) {
+                                 size_t size, uint64_t group_key) {
   WriteBatchRequest request{};
   request.DebugRequestId =
       write_batch_request_id.fetch_add(1, std::memory_order_relaxed);
   request.FileHandle = file_id;
   request.Offset = offset;
+  request.GroupKey = group_key;
   request.Data.resize(size);
   if (size > 0)
     std::memcpy(request.Data.data(), data, size);
@@ -1586,6 +1619,22 @@ uint64_t MPIIOBackend::computePathKey(const char *path) {
   return hash;
 }
 
+uint64_t MPIIOBackend::mixHintIntoKey(uint64_t base_key,
+                                      const ompfile::OmpFileIOHint &hint) {
+  uint64_t mixed = base_key;
+  auto mix = [&mixed](uint64_t value) {
+    mixed ^= value + 0x9e3779b97f4a7c15ULL + (mixed << 6) + (mixed >> 2);
+  };
+
+  if ((hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_STREAM) != 0)
+    mix(hint.StreamId);
+  if ((hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_EPOCH) != 0)
+    mix(hint.EpochId);
+  if ((hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0)
+    mix(hint.TileId);
+  return mixed;
+}
+
 bool MPIIOBackend::getFilePathKey(int file_id, uint64_t &path_key_out) {
   const std::lock_guard<std::mutex> lock(handle_mutex);
   const auto it = file_path_key_map.find(file_id);
@@ -1611,15 +1660,18 @@ void MPIIOBackend::forgetFilePathKey(int file_id) {
 
 uint64_t MPIIOBackend::resolveTwoPhaseKey(
     const ompfile::OmpFileReadRequestContext &context) {
+  uint64_t base_key = 0;
   if ((context.ContextFlags & ompfile::OMPFILE_READ_CTX_HAS_PATH_KEY) != 0) {
-    return context.PathKey;
+    base_key = context.PathKey;
+    return mixHintIntoKey(base_key, context.Hint);
   }
 
   uint64_t path_key = 0;
   if (getFilePathKey(context.FileHandle, path_key))
-    return path_key;
-
-  return static_cast<uint64_t>(static_cast<uint32_t>(context.FileHandle));
+    base_key = path_key;
+  else
+    base_key = static_cast<uint64_t>(static_cast<uint32_t>(context.FileHandle));
+  return mixHintIntoKey(base_key, context.Hint);
 }
 
 bool MPIIOBackend::tryServeTwoPhaseReadCache(uint64_t key, long offset,

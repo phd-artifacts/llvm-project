@@ -25,6 +25,10 @@ public:
                                 void *data, size_t size) {
     return readAt(ctx.FileHandle, static_cast<long>(ctx.Offset), data, size);
   }
+  virtual int writeAtWithContext(const ompfile::OmpFileWriteRequestContext &ctx,
+                                 const void *data, size_t size) {
+    return writeAt(ctx.FileHandle, static_cast<long>(ctx.Offset), data, size);
+  }
   virtual int writeAt(int file_id, long offset, const void *data,
                       size_t size) = 0;
 };

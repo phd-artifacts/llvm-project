@@ -1,5 +1,6 @@
 #include "abstract_backend.h"
 #include "debug_log.h"
+#include "file_interface.h"
 #include "mpp_shim.h"
 #include "ompfile_sched.h"
 #include "mpi.h"
@@ -64,6 +65,20 @@ static bool isMppRemoteOnlyEnabled() {
          envFlagEnabled("LIBOMPFILE_MPP_IO");
 }
 
+static void applyIoHint(ompfile::OmpFileIOHint &dst,
+                        const omp_file_io_hint_v1 *src) {
+  dst = {};
+  if (!src)
+    return;
+  if (src->abi_version != OMPFILE_IO_HINT_ABI_VERSION)
+    return;
+  dst.AbiVersion = src->abi_version;
+  dst.HintFlags = src->hint_flags;
+  dst.EpochId = src->epoch_id;
+  dst.StreamId = src->stream_id;
+  dst.TileId = src->tile_id;
+}
+
 class IOScheduler {
 public:
   virtual ~IOScheduler() {}
@@ -73,8 +88,13 @@ public:
   virtual int close(int file_handle) = 0;
   virtual int seek(int file_handle, long offset) = 0;
   virtual int readAt(int file_handle, long offset, void *data, size_t size) = 0;
+  virtual int readAtHint(int file_handle, long offset, void *data, size_t size,
+                         const ompfile::OmpFileIOHint *hint) = 0;
   virtual int writeAt(int file_handle, long offset, const void *data,
                       size_t size) = 0;
+  virtual int writeAtHint(int file_handle, long offset, const void *data,
+                          size_t size,
+                          const ompfile::OmpFileIOHint *hint) = 0;
 };
 
 class LocalScheduler final : public IOScheduler {
@@ -95,9 +115,29 @@ public:
   int readAt(int file_handle, long offset, void *data, size_t size) override {
     return backend.readAt(file_handle, offset, data, size);
   }
+  int readAtHint(int file_handle, long offset, void *data, size_t size,
+                 const ompfile::OmpFileIOHint *hint) override {
+    ompfile::OmpFileReadRequestContext context{};
+    context.FileHandle = file_handle;
+    context.Offset = static_cast<int64_t>(offset);
+    context.Size = static_cast<uint64_t>(size);
+    if (hint)
+      context.Hint = *hint;
+    return backend.readAtWithContext(context, data, size);
+  }
   int writeAt(int file_handle, long offset, const void *data,
               size_t size) override {
     return backend.writeAt(file_handle, offset, data, size);
+  }
+  int writeAtHint(int file_handle, long offset, const void *data, size_t size,
+                  const ompfile::OmpFileIOHint *hint) override {
+    ompfile::OmpFileWriteRequestContext context{};
+    context.FileHandle = file_handle;
+    context.Offset = static_cast<int64_t>(offset);
+    context.Size = static_cast<uint64_t>(size);
+    if (hint)
+      context.Hint = *hint;
+    return backend.writeAtWithContext(context, data, size);
   }
 
 private:
@@ -147,7 +187,8 @@ public:
   int write(int file_handle, const void *data, size_t size) override {
     if (!ensureSchedulerReady("write", /*log_once=*/true))
       return -1;
-    if (mpp_sched_active && !scheduleWrite(file_handle, /*offset=*/0, size))
+    if (mpp_sched_active &&
+        !scheduleWrite(file_handle, /*offset=*/0, size, nullptr))
       return failStrict("write");
     return backend.write(file_handle, data, size);
   }
@@ -155,7 +196,8 @@ public:
   int read(int file_handle, void *data, size_t size) override {
     if (!ensureSchedulerReady("read", /*log_once=*/true))
       return -1;
-    if (mpp_sched_active && !scheduleRead(file_handle, /*offset=*/0, size))
+    if (mpp_sched_active &&
+        !scheduleRead(file_handle, /*offset=*/0, size, nullptr))
       return failStrict("read");
     return backend.read(file_handle, data, size);
   }
@@ -187,8 +229,16 @@ public:
       return backend.readAt(file_handle, offset, data, size);
     }
     ompfile::OmpFileReadRequestContext context{};
-    if (!buildReadContext(file_handle, offset, size, context))
+    if (!buildReadContext(file_handle, offset, size, nullptr, context))
       return failStrict("readAt");
+    return backend.readAtWithContext(context, data, size);
+  }
+
+  int readAtHint(int file_handle, long offset, void *data, size_t size,
+                 const ompfile::OmpFileIOHint *hint) override {
+    ompfile::OmpFileReadRequestContext context{};
+    if (!buildReadContext(file_handle, offset, size, hint, context))
+      return failStrict("readAtHint");
     return backend.readAtWithContext(context, data, size);
   }
 
@@ -199,9 +249,24 @@ public:
         return -1;
       return backend.writeAt(file_handle, offset, data, size);
     }
-    if (!scheduleWrite(file_handle, offset, size))
+    if (!scheduleWrite(file_handle, offset, size, nullptr))
       return failStrict("writeAt");
     return backend.writeAt(file_handle, offset, data, size);
+  }
+
+  int writeAtHint(int file_handle, long offset, const void *data, size_t size,
+                  const ompfile::OmpFileIOHint *hint) override {
+    ompfile::OmpFileWriteRequestContext context{};
+    if (!buildWriteContext(file_handle, offset, size, hint, context))
+      return -1;
+    if (!mpp_sched_active) {
+      if (!ensureSchedulerReady("writeAtHint", /*log_once=*/true))
+        return -1;
+      return backend.writeAtWithContext(context, data, size);
+    }
+    if (mpp_sched_active && !scheduleWrite(file_handle, offset, size, hint))
+      return failStrict("writeAtHint");
+    return backend.writeAtWithContext(context, data, size);
   }
 
 private:
@@ -406,6 +471,7 @@ private:
   }
 
   bool buildReadContext(int file_handle, long offset, size_t size,
+                        const ompfile::OmpFileIOHint *hint,
                         ompfile::OmpFileReadRequestContext &context) {
     context = {};
     context.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
@@ -414,6 +480,8 @@ private:
     context.Offset = static_cast<int64_t>(offset);
     context.Size = static_cast<uint64_t>(size);
     context.PathKey = static_cast<uint64_t>(static_cast<uint32_t>(file_handle));
+    if (hint)
+      context.Hint = *hint;
 
     std::string tracked_path;
     if (getTrackedPath(file_handle, tracked_path, context.PathKey))
@@ -426,6 +494,12 @@ private:
     req.FileHandle = file_handle;
     req.Offset = static_cast<int64_t>(offset);
     req.Size = static_cast<uint64_t>(size);
+    if (hint) {
+      req.HintFlags = hint->HintFlags;
+      req.EpochId = hint->EpochId;
+      req.StreamId = hint->StreamId;
+      req.TileId = hint->TileId;
+    }
     io_trace("HeadnodeScheduler::buildReadContext scheduler=%p req_id=%llu "
              "file=%d offset=%lld size=%llu has_path_key=%d path_key=%llu\n",
              static_cast<void *>(this),
@@ -454,12 +528,14 @@ private:
     return true;
   }
 
-  bool scheduleRead(int file_handle, long offset, size_t size) {
+  bool scheduleRead(int file_handle, long offset, size_t size,
+                    const ompfile::OmpFileIOHint *hint) {
     ompfile::OmpFileReadRequestContext context{};
-    return buildReadContext(file_handle, offset, size, context);
+    return buildReadContext(file_handle, offset, size, hint, context);
   }
 
-  bool scheduleWrite(int file_handle, long offset, size_t size) {
+  bool scheduleWrite(int file_handle, long offset, size_t size,
+                     const ompfile::OmpFileIOHint *hint) {
     ompfile::OmpFileIORequest req{};
     req.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
     req.Op = ompfile::OmpFileIOOp::PWRITE;
@@ -467,7 +543,32 @@ private:
     req.FileHandle = file_handle;
     req.Offset = static_cast<int64_t>(offset);
     req.Size = static_cast<uint64_t>(size);
+    if (hint) {
+      req.HintFlags = hint->HintFlags;
+      req.EpochId = hint->EpochId;
+      req.StreamId = hint->StreamId;
+      req.TileId = hint->TileId;
+    }
     return schedRequest(req, nullptr, nullptr) || !strict_mpp_required;
+  }
+
+  bool buildWriteContext(int file_handle, long offset, size_t size,
+                         const ompfile::OmpFileIOHint *hint,
+                         ompfile::OmpFileWriteRequestContext &context) {
+    context = {};
+    context.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
+    context.FileHandle = file_handle;
+    context.ClientRank = client_rank;
+    context.Offset = static_cast<int64_t>(offset);
+    context.Size = static_cast<uint64_t>(size);
+    context.PathKey = static_cast<uint64_t>(static_cast<uint32_t>(file_handle));
+    if (hint)
+      context.Hint = *hint;
+
+    std::string tracked_path;
+    if (getTrackedPath(file_handle, tracked_path, context.PathKey))
+      context.ContextFlags |= ompfile::OMPFILE_WRITE_CTX_HAS_PATH_KEY;
+    return true;
   }
 };
 
@@ -707,6 +808,15 @@ public:
     return io_scheduler->writeAt(file_handle, offset, data, size);
   }
 
+  int writeFileAtHint(int file_handle, const void *data, size_t size,
+                      long offset, const omp_file_io_hint_v1 *hint) {
+    ompfile::OmpFileIOHint internal_hint{};
+    applyIoHint(internal_hint, hint);
+    IOResourceGuard guard(io_resource_token);
+    return io_scheduler->writeAtHint(file_handle, offset, data, size,
+                                     hint ? &internal_hint : nullptr);
+  }
+
   int readFileAt(int file_handle, void *data, size_t size, long offset) {
     const uint64_t call_id =
         api_call_id.fetch_add(1, std::memory_order_relaxed);
@@ -718,6 +828,27 @@ public:
     IOResourceGuard guard(io_resource_token);
     const int rc = io_scheduler->readAt(file_handle, offset, data, size);
     io_trace("ctx=%p call=%llu readFileAt exit rc=%d tokens=%d\n",
+             static_cast<void *>(this),
+             static_cast<unsigned long long>(call_id), rc,
+             io_resource_token.load());
+    return rc;
+  }
+
+  int readFileAtHint(int file_handle, void *data, size_t size, long offset,
+                     const omp_file_io_hint_v1 *hint) {
+    const uint64_t call_id =
+        api_call_id.fetch_add(1, std::memory_order_relaxed);
+    io_trace("ctx=%p call=%llu readFileAtHint enter file_handle=%d offset=%ld "
+             "size=%zu tokens=%d\n",
+             static_cast<void *>(this),
+             static_cast<unsigned long long>(call_id), file_handle, offset,
+             size, io_resource_token.load());
+    ompfile::OmpFileIOHint internal_hint{};
+    applyIoHint(internal_hint, hint);
+    IOResourceGuard guard(io_resource_token);
+    const int rc = io_scheduler->readAtHint(file_handle, offset, data, size,
+                                            hint ? &internal_hint : nullptr);
+    io_trace("ctx=%p call=%llu readFileAtHint exit rc=%d tokens=%d\n",
              static_cast<void *>(this),
              static_cast<unsigned long long>(call_id), rc,
              io_resource_token.load());
@@ -773,6 +904,14 @@ int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size,
   return ctx.writeFileAt(file_handle, data, size, offset);
 }
 
+int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
+                         size_t size, int async,
+                         const omp_file_io_hint_v1 *hint) {
+  if (acquire_async_not_supported(async)) return -1;
+  auto &ctx = OmpFileClientContext::getInstance();
+  return ctx.writeFileAtHint(file_handle, data, size, offset, hint);
+}
+
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,
                    int async) {
   if (acquire_async_not_supported(async)) return -1;
@@ -782,6 +921,13 @@ int omp_file_pread(int file_handle, long offset, void *data, size_t size,
   const int rc = ctx.readFileAt(file_handle, data, size, offset);
   io_trace("omp_file_pread api exit rc=%d\n", rc);
   return rc;
+}
+
+int omp_file_pread_hint(int file_handle, long offset, void *data, size_t size,
+                        int async, const omp_file_io_hint_v1 *hint) {
+  if (acquire_async_not_supported(async)) return -1;
+  auto &ctx = OmpFileClientContext::getInstance();
+  return ctx.readFileAtHint(file_handle, data, size, offset, hint);
 }
 
 int omp_file_read(int file_handle, void *data, size_t size, int async) {

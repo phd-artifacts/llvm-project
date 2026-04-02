@@ -11,6 +11,21 @@
 namespace ompfile {
 
 constexpr uint32_t OMPFILE_SCHED_BATCH_ABI_VERSION = 1u;
+constexpr uint32_t OMPFILE_IO_HINT_ABI_VERSION = 1u;
+
+enum OmpFileIOHintFlags : uint32_t {
+  OMPFILE_IO_HINT_HAS_EPOCH = 1u << 0,
+  OMPFILE_IO_HINT_HAS_STREAM = 1u << 1,
+  OMPFILE_IO_HINT_HAS_TILE = 1u << 2,
+};
+
+struct OmpFileIOHint {
+  uint32_t AbiVersion = OMPFILE_IO_HINT_ABI_VERSION;
+  uint32_t HintFlags = 0;
+  uint64_t EpochId = 0;
+  uint64_t StreamId = 0;
+  uint64_t TileId = 0;
+};
 
 enum class OmpFileIOOp : uint32_t {
   OPEN = 0,
@@ -30,7 +45,10 @@ struct OmpFileIORequest {
   int64_t Offset = 0;
   uint64_t Size = 0;
   uint32_t PathSize = 0;
-  uint32_t Reserved = 0;
+  uint32_t HintFlags = 0;
+  uint64_t EpochId = 0;
+  uint64_t StreamId = 0;
+  uint64_t TileId = 0;
 };
 
 struct OmpFileIOPlan {
@@ -66,6 +84,9 @@ struct OmpFileIOBatchSegment {
   uint64_t PathKey = 0;
   uint32_t SegmentFlags = 0;
   uint32_t Reserved = 0;
+  uint64_t EpochId = 0;
+  uint64_t StreamId = 0;
+  uint64_t TileId = 0;
 };
 
 struct OmpFileIOBatchRequest {
@@ -104,6 +125,7 @@ struct OmpFileIOBatchPlan {
 
 static_assert(std::is_standard_layout_v<OmpFileIORequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOPlan>);
+static_assert(std::is_standard_layout_v<OmpFileIOHint>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchSegment>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchRequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchPlanEntry>);
@@ -181,6 +203,10 @@ enum OmpFileReadContextFlags : uint32_t {
   OMPFILE_READ_CTX_HAS_PLAN = 1u << 1,
 };
 
+enum OmpFileWriteContextFlags : uint32_t {
+  OMPFILE_WRITE_CTX_HAS_PATH_KEY = 1u << 0,
+};
+
 struct OmpFileReadRequestContext {
   uint64_t RequestId = 0;
   int32_t FileHandle = -1;
@@ -190,8 +216,24 @@ struct OmpFileReadRequestContext {
   uint64_t PathKey = 0;
   uint32_t ContextFlags = 0;
   uint32_t Reserved = 0;
+  OmpFileIOHint Hint{};
   OmpFileIOPlan Plan{};
 };
+
+struct OmpFileWriteRequestContext {
+  uint64_t RequestId = 0;
+  int32_t FileHandle = -1;
+  int32_t ClientRank = -1;
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+  uint64_t PathKey = 0;
+  uint32_t ContextFlags = 0;
+  uint32_t Reserved = 0;
+  OmpFileIOHint Hint{};
+};
+
+static_assert(std::is_standard_layout_v<OmpFileReadRequestContext>);
+static_assert(std::is_standard_layout_v<OmpFileWriteRequestContext>);
 
 } // namespace ompfile
 
