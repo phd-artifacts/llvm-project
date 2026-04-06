@@ -6,6 +6,14 @@ This scope covers MPP event routing, scheduler selection, and proxy-side I/O dis
 - Keep this file focused on MPI-plugin runtime behavior.
 - Shared commit workflow, submodule hygiene, and MkDocs maintenance are canonical in root `AGENTS.md`.
 
+## Direction for MPP work
+- Treat MPP as the distributed execution substrate for runtime-managed I/O:
+  event transport, proxy execution, scheduler communication, and remote-worker
+  mechanics belong here.
+- Avoid turning this layer into the public semantic home for portable I/O
+  policy; semantics should stay in `libompfile` unless the change is truly
+  transport-specific.
+
 ## Relevant files
 - Runtime bridge exports:
   - `src/rtl.cpp`

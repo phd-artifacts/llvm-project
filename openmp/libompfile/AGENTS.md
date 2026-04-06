@@ -6,6 +6,15 @@ This scope covers libompfile backend behavior and MPP shim usage.
 - Keep this file focused on libompfile runtime behavior.
 - Shared commit workflow, submodule hygiene, and MkDocs maintenance are canonical in root `AGENTS.md`.
 
+## Direction for libompfile work
+- `libompfile` is the semantic layer for portable file I/O in this repo.
+- New policy should prefer living here when it concerns backend-agnostic I/O
+  meaning, request planning, scheduler hints, staging policy, or future runtime
+  visibility of file operations.
+- Avoid pushing semantic policy down into benchmark wrappers or directly into
+  MPP transport code when the logic is meant to be portable across backends and
+  systems.
+
 ## Relevant files
 - Backend logic:
   - `src/mpi_io_backend.cpp`
