@@ -360,6 +360,8 @@ struct ProxyDevice {
                                    false),
         OmpFileMPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6),
         OmpFileStageMode(envStringOrDefault("LIBOMPFILE_STAGE_MODE", "off")),
+        OmpFileStageWriteMode(
+            envStringOrDefault("LIBOMPFILE_STAGE_WRITE_MODE", "write-through")),
         OmpFileStageSyncPolicy(
             envStringOrDefault("LIBOMPFILE_STAGE_SYNC_POLICY", "cache")),
         OmpFileStagePopulateMode(
@@ -414,7 +416,7 @@ struct ProxyDevice {
               "topology_file=%s topology_loaded=%d topology_entries=%llu "
               "stage_root=%s stage_class=%s shared_storage_path=%s "
               "shared_storage_class=%s storage_environment=%s "
-              "stage_sync_policy=%s stage_populate_mode=%s "
+              "stage_sync_policy=%s stage_write_mode=%s stage_populate_mode=%s "
               "stage_window_bytes=%llu stage_min_free_bytes=%llu "
               "local_host=%s load_error=%s\n",
               EventSystem.LocalRank, OmpFileStageMode.c_str(),
@@ -434,10 +436,11 @@ struct ProxyDevice {
               OmpFileSharedStorageClass.empty()
                   ? "(unset)"
                   : OmpFileSharedStorageClass.c_str(),
-              OmpFileStorageEnvironment.c_str(),
-              OmpFileStageSyncPolicy.c_str(),
-              OmpFileStagePopulateMode.c_str(),
-              static_cast<unsigned long long>(OmpFileStageWindowBytes),
+               OmpFileStorageEnvironment.c_str(),
+               OmpFileStageSyncPolicy.c_str(),
+               OmpFileStageWriteMode.c_str(),
+               OmpFileStagePopulateMode.c_str(),
+               static_cast<unsigned long long>(OmpFileStageWindowBytes),
               static_cast<unsigned long long>(OmpFileStageMinFreeBytes),
               OmpFileStageLocalHost.c_str(),
               OmpFileTopologyLoadError.empty()
@@ -1151,12 +1154,24 @@ struct ProxyDevice {
     if (AccessMode != O_RDONLY && AccessMode != O_WRONLY &&
         AccessMode != O_RDWR)
       return false;
-    return true;
+    // Shared writable file descriptors have produced incorrect distributed
+    // read-after-write results in the remote-only MPP path. Keep the cache for
+    // read-only opens, but force independent open file descriptions for any
+    // handle that may write.
+    return AccessMode == O_RDONLY;
+  }
+
+  bool isStageEnabled() const {
+    return OmpFileStageMode != "off" && OmpFileTopologyLoaded &&
+           !OmpFileStageRoot.empty();
   }
 
   bool isReadthroughStageEnabled() const {
-    return OmpFileStageMode == "readthrough" && OmpFileTopologyLoaded &&
-           !OmpFileStageRoot.empty();
+    return OmpFileStageMode == "readthrough" && isStageEnabled();
+  }
+
+  bool isWritethroughStageEnabled() const {
+    return isStageEnabled() && OmpFileStageWriteMode == "write-through";
   }
 
   bool shouldSyncStagePopulate() const {
@@ -1301,6 +1316,16 @@ struct ProxyDevice {
         break;
       ++Pos;
     }
+    return true;
+  }
+
+  bool getStageEntryForPath(const std::string &SourcePath,
+                            std::shared_ptr<OmpFileStageEntry> &EntryOut) {
+    const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
+    auto It = OmpFileStageEntries.find(SourcePath);
+    if (It == OmpFileStageEntries.end())
+      return false;
+    EntryOut = It->second;
     return true;
   }
 
@@ -1711,6 +1736,170 @@ struct ProxyDevice {
     return true;
   }
 
+  bool pwriteFully(int Fd, int64_t Offset, const void *Buffer, uint64_t Size,
+                   uint64_t *BytesWrittenOut, uint64_t *ElapsedUsOut,
+                   int &ErrnoOut) {
+    ErrnoOut = 0;
+    if (BytesWrittenOut)
+      *BytesWrittenOut = 0;
+    if (ElapsedUsOut)
+      *ElapsedUsOut = 0;
+    if (Size == 0)
+      return true;
+
+    uint64_t TotalWritten = 0;
+    while (TotalWritten < Size) {
+      const auto WriteStart = std::chrono::steady_clock::now();
+      const ssize_t BytesWritten =
+          ::pwrite(Fd, static_cast<const char *>(Buffer) + TotalWritten,
+                   static_cast<size_t>(Size - TotalWritten),
+                   static_cast<off_t>(Offset + static_cast<int64_t>(TotalWritten)));
+      const auto WriteEnd = std::chrono::steady_clock::now();
+      if (ElapsedUsOut)
+        *ElapsedUsOut += elapsedMicros(WriteStart, WriteEnd);
+      if (BytesWritten < 0) {
+        ErrnoOut = errno;
+        if (BytesWrittenOut)
+          *BytesWrittenOut = TotalWritten;
+        return false;
+      }
+      if (BytesWritten == 0) {
+        ErrnoOut = EIO;
+        if (BytesWrittenOut)
+          *BytesWrittenOut = TotalWritten;
+        return false;
+      }
+      TotalWritten += static_cast<uint64_t>(BytesWritten);
+    }
+
+    if (BytesWrittenOut)
+      *BytesWrittenOut = TotalWritten;
+    return true;
+  }
+
+  void updateStageCoverageForWrite(const std::shared_ptr<OmpFileStageEntry> &Entry,
+                                   uint64_t Offset, uint64_t Size,
+                                   uint64_t SourceSize,
+                                   bool SourceSizeKnown) {
+    if (!Entry || Size == 0)
+      return;
+    const uint64_t End = saturatingAdd(Offset, Size);
+    std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
+    addCoveredExtent(Entry->CoveredExtents, Offset, End);
+    if (SourceSizeKnown) {
+      Entry->SourceSizeKnown = true;
+      Entry->SourceSize = SourceSize;
+    }
+    if (Entry->SourceSizeKnown &&
+        isCoveredByExtents(Entry->CoveredExtents, 0, Entry->SourceSize))
+      Entry->FullyPopulated = true;
+    else
+      Entry->FullyPopulated = false;
+  }
+
+  bool pwriteWithOptionalStage(int Fd, int64_t Offset, const void *Buffer,
+                               uint64_t Size, uint64_t *BytesWrittenOut,
+                               int &ErrnoOut) {
+    ErrnoOut = 0;
+    if (BytesWrittenOut)
+      *BytesWrittenOut = 0;
+    if (!Buffer && Size > 0) {
+      ErrnoOut = EINVAL;
+      return false;
+    }
+
+    std::string SourcePath;
+    const bool HasTrackedSource = Size > 0 && Offset >= 0 &&
+                                  getTrackedOmpFileFdPath(Fd, SourcePath);
+    uint64_t SourceBytesWritten = 0;
+    uint64_t SourceWriteUs = 0;
+    if (!pwriteFully(Fd, Offset, Buffer, Size, &SourceBytesWritten,
+                     &SourceWriteUs, ErrnoOut)) {
+      if (HasTrackedSource && OmpFileStageMode != "off") {
+        OmpFileStatsStagingWriteBypassCount.fetch_add(1,
+                                                      std::memory_order_relaxed);
+        invalidateStageForPath(SourcePath);
+      }
+      return false;
+    }
+    if (BytesWrittenOut)
+      *BytesWrittenOut = SourceBytesWritten;
+    if (Size == 0 || OmpFileStageMode == "off" || !HasTrackedSource)
+      return true;
+
+    if (!isWritethroughStageEnabled()) {
+      OmpFileStatsStagingWriteBypassCount.fetch_add(1,
+                                                    std::memory_order_relaxed);
+      invalidateStageRangeForPath(SourcePath, static_cast<uint64_t>(Offset),
+                                  Size);
+      return true;
+    }
+
+    int StageFd = -1;
+    int StageErrno = 0;
+    if (!ensureStageEntryForPath(SourcePath, 0, 0, StageFd, StageErrno) ||
+        StageFd < 0) {
+      OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
+      OmpFileStatsStagingWriteBypassCount.fetch_add(1,
+                                                    std::memory_order_relaxed);
+      invalidateStageForPath(SourcePath);
+      return true;
+    }
+
+    uint64_t StageBytesWritten = 0;
+    uint64_t StageWriteUs = 0;
+    if (!pwriteFully(StageFd, Offset, Buffer, Size, &StageBytesWritten,
+                     &StageWriteUs, StageErrno) ||
+        StageBytesWritten < Size) {
+      OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
+      OmpFileStatsStagingWriteBypassCount.fetch_add(1,
+                                                    std::memory_order_relaxed);
+      invalidateStageForPath(SourcePath);
+      return true;
+    }
+
+    if (shouldSyncStagePopulate()) {
+      const auto FsyncStart = std::chrono::steady_clock::now();
+      if (::fdatasync(StageFd) != 0) {
+        OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
+        OmpFileStatsStagingWriteBypassCount.fetch_add(
+            1, std::memory_order_relaxed);
+        OmpFileStatsStageWriteUs.fetch_add(
+            StageWriteUs + elapsedMicros(FsyncStart, std::chrono::steady_clock::now()),
+            std::memory_order_relaxed);
+        invalidateStageForPath(SourcePath);
+        return true;
+      }
+      StageWriteUs +=
+          elapsedMicros(FsyncStart, std::chrono::steady_clock::now());
+    }
+
+    uint64_t SourceSize = 0;
+    bool SourceSizeKnown = false;
+    struct stat SourceStat {};
+    if (::fstat(Fd, &SourceStat) == 0) {
+      SourceSize = static_cast<uint64_t>(SourceStat.st_size);
+      SourceSizeKnown = true;
+    }
+
+    std::shared_ptr<OmpFileStageEntry> Entry;
+    if (!getStageEntryForPath(SourcePath, Entry)) {
+      OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
+      OmpFileStatsStagingWriteBypassCount.fetch_add(1,
+                                                    std::memory_order_relaxed);
+      invalidateStageForPath(SourcePath);
+      return true;
+    }
+
+    updateStageCoverageForWrite(Entry, static_cast<uint64_t>(Offset), Size,
+                                SourceSize, SourceSizeKnown);
+    OmpFileStatsStagedWriteUpdates.fetch_add(1, std::memory_order_relaxed);
+    OmpFileStatsStagedWriteBytes.fetch_add(Size, std::memory_order_relaxed);
+    OmpFileStatsStageWriteUs.fetch_add(StageWriteUs,
+                                       std::memory_order_relaxed);
+    return true;
+  }
+
   std::string getOmpFileOpenCacheKey(const char *Path, int Flags, int Mode) const {
     std::string Key = Path ? Path : "";
     Key.push_back('\x1f');
@@ -1933,6 +2122,14 @@ struct ProxyDevice {
         OmpFileStatsStagingInvalidatedBytes.load(std::memory_order_relaxed);
     uint64_t StagingWriteBypass =
         OmpFileStatsStagingWriteBypassCount.load(std::memory_order_relaxed);
+    uint64_t StagedWriteUpdates =
+        OmpFileStatsStagedWriteUpdates.load(std::memory_order_relaxed);
+    uint64_t StagedWriteBytes =
+        OmpFileStatsStagedWriteBytes.load(std::memory_order_relaxed);
+    uint64_t StageWriteFailures =
+        OmpFileStatsStageWriteFailures.load(std::memory_order_relaxed);
+    uint64_t StageWriteUs =
+        OmpFileStatsStageWriteUs.load(std::memory_order_relaxed);
     uint64_t StagingEvictions =
         OmpFileStatsStagingEvictions.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
@@ -1956,6 +2153,7 @@ struct ProxyDevice {
             "stage_populate_mode=%s stage_window_bytes=%llu "
             "stage_min_free_bytes=%llu "
             "staged_read_hits=%llu staged_read_bytes=%llu "
+            "staged_write_updates=%llu staged_write_bytes=%llu "
             "stage_lookup_hits=%llu stage_lookup_misses=%llu "
             "stage_populate_count=%llu stage_populate_failures=%llu "
             "stage_populate_bytes=%llu stage_populate_us_total=%llu "
@@ -1966,7 +2164,8 @@ struct ProxyDevice {
             "staging_invalidations=%llu staging_range_invalidations=%llu "
             "staging_full_invalidations=%llu "
             "staging_invalidated_bytes=%llu "
-            "staging_write_bypass_count=%llu "
+            "staging_write_bypass_count=%llu stage_write_failures=%llu "
+            "stage_write_us_total=%llu "
             "staging_evictions=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
@@ -2000,6 +2199,8 @@ struct ProxyDevice {
             static_cast<unsigned long long>(OmpFileStageMinFreeBytes),
             static_cast<unsigned long long>(StagedReadHits),
             static_cast<unsigned long long>(StagedReadBytes),
+            static_cast<unsigned long long>(StagedWriteUpdates),
+            static_cast<unsigned long long>(StagedWriteBytes),
             static_cast<unsigned long long>(StageLookupHits),
             static_cast<unsigned long long>(StageLookupMisses),
             static_cast<unsigned long long>(StagePopulateCount),
@@ -2019,6 +2220,8 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StagingFullInvalidations),
             static_cast<unsigned long long>(StagingInvalidatedBytes),
             static_cast<unsigned long long>(StagingWriteBypass),
+            static_cast<unsigned long long>(StageWriteFailures),
+            static_cast<unsigned long long>(StageWriteUs),
             static_cast<unsigned long long>(StagingEvictions));
   }
 
@@ -2134,15 +2337,6 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
-    if (OmpFileStageMode != "off")
-      OmpFileStatsStagingWriteBypassCount.fetch_add(1,
-                                                    std::memory_order_relaxed);
-    if (OmpFileStageMode != "off") {
-      std::string SourcePath;
-      if (getTrackedOmpFileFdPath(Fd, SourcePath))
-        invalidateStageForPath(SourcePath);
-    }
-
     std::vector<char> Buffer;
     if (Size > 0) {
       Buffer.resize(Size);
@@ -2168,21 +2362,13 @@ struct ProxyDevice {
       }
     }
 
-    ssize_t BytesWritten = 0;
     uint64_t BytesWrittenOut = 0;
     int Errno = 0;
-    if (Size > 0) {
-      BytesWritten = ::pwrite(Fd, Buffer.data(), Size, static_cast<off_t>(Offset));
-      if (BytesWritten < 0) {
-        Errno = errno;
-      } else {
-        BytesWrittenOut = static_cast<uint64_t>(BytesWritten);
-        if (BytesWrittenOut < Size)
-          Errno = EIO;
-      }
-    }
+    const bool Ok =
+        Size == 0 || pwriteWithOptionalStage(Fd, Offset, Buffer.data(), Size,
+                                             &BytesWrittenOut, Errno);
 
-    int Ret = (BytesWritten < 0 || BytesWrittenOut < Size) ? -1 : 0;
+    int Ret = Ok ? 0 : -1;
     if (Ret != 0)
       OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
     RequestManager.send(&Ret, 1, MPI_INT);
@@ -2596,23 +2782,10 @@ struct ProxyDevice {
       *BytesWrittenOut = 0;
 
     if (Rank == EventSystem.LocalRank) {
-      if (OmpFileStageMode != "off") {
-        OmpFileStatsStagingWriteBypassCount.fetch_add(1,
-                                                      std::memory_order_relaxed);
-        std::string SourcePath;
-        if (getTrackedOmpFileFdPath(RemoteHandle, SourcePath))
-          invalidateStageRangeForPath(SourcePath, static_cast<uint64_t>(Offset),
-                                      Size);
-      }
-      const ssize_t BytesWritten =
-          ::pwrite(RemoteHandle, Buffer, Size, static_cast<off_t>(Offset));
-      if (BytesWritten < 0)
-        return false;
-      const uint64_t Bytes = static_cast<uint64_t>(BytesWritten);
-      if (BytesWrittenOut)
-        *BytesWrittenOut = Bytes;
-      if (Bytes < Size) {
-        errno = EIO;
+      int WriteErrno = 0;
+      if (!pwriteWithOptionalStage(RemoteHandle, Offset, Buffer, Size,
+                                   BytesWrittenOut, WriteErrno)) {
+        errno = WriteErrno;
         return false;
       }
       return true;
@@ -3364,6 +3537,7 @@ private:
   BoolEnvar OmpFileForceBlockingPwrite;
   Int64Envar OmpFileMPIFragmentSize;
   std::string OmpFileStageMode;
+  std::string OmpFileStageWriteMode;
   std::string OmpFileStageSyncPolicy;
   std::string OmpFileStagePopulateMode;
   std::string OmpFileStageRootPolicy;
@@ -3406,6 +3580,8 @@ private:
   std::atomic<uint64_t> OmpFileStatsPwriteFailures{0};
   std::atomic<uint64_t> OmpFileStatsStagedReadHits{0};
   std::atomic<uint64_t> OmpFileStatsStagedReadBytes{0};
+  std::atomic<uint64_t> OmpFileStatsStagedWriteUpdates{0};
+  std::atomic<uint64_t> OmpFileStatsStagedWriteBytes{0};
   std::atomic<uint64_t> OmpFileStatsStageLookupHits{0};
   std::atomic<uint64_t> OmpFileStatsStageLookupMisses{0};
   std::atomic<uint64_t> OmpFileStatsStagePopulateCount{0};
@@ -3425,6 +3601,8 @@ private:
   std::atomic<uint64_t> OmpFileStatsStagingFullInvalidations{0};
   std::atomic<uint64_t> OmpFileStatsStagingInvalidatedBytes{0};
   std::atomic<uint64_t> OmpFileStatsStagingWriteBypassCount{0};
+  std::atomic<uint64_t> OmpFileStatsStageWriteFailures{0};
+  std::atomic<uint64_t> OmpFileStatsStageWriteUs{0};
   std::atomic<uint64_t> OmpFileStatsStagingEvictions{0};
   std::mutex MppEventMutex;
   std::unordered_map<uint64_t, EventTy> MppEvents;
