@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <fcntl.h>    // O_RDWR, etc.
+#include <mutex>
 #include <sys/stat.h> // S_IRUSR, etc. if needed
 #include <unistd.h>   // close, lseek, read, write, pread, pwrite
 
@@ -32,11 +33,13 @@ int POSIXIOBackend::open(const char *filename) {
   }
 
   // Store the (file_id -> fd) mapping
+  const std::lock_guard<std::mutex> lock(file_handle_mutex);
   file_handle_map[file_id] = fd;
   return file_id;
 }
 
 int POSIXIOBackend::write(int file_id, const void *data, size_t size) {
+  const std::lock_guard<std::mutex> lock(file_handle_mutex);
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -58,6 +61,7 @@ int POSIXIOBackend::write(int file_id, const void *data, size_t size) {
 }
 
 int POSIXIOBackend::read(int file_id, void *data, size_t size) {
+  const std::lock_guard<std::mutex> lock(file_handle_mutex);
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -79,6 +83,7 @@ int POSIXIOBackend::read(int file_id, void *data, size_t size) {
 }
 
 int POSIXIOBackend::close(int file_id) {
+  const std::lock_guard<std::mutex> lock(file_handle_mutex);
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -102,6 +107,7 @@ int POSIXIOBackend::close(int file_id) {
 }
 
 int POSIXIOBackend::seek(int file_id, long offset) {
+  const std::lock_guard<std::mutex> lock(file_handle_mutex);
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -122,6 +128,7 @@ int POSIXIOBackend::seek(int file_id, long offset) {
 }
 
 int POSIXIOBackend::readAt(int file_id, long offset, void *data, size_t size) {
+  const std::lock_guard<std::mutex> lock(file_handle_mutex);
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);
@@ -145,6 +152,7 @@ int POSIXIOBackend::readAt(int file_id, long offset, void *data, size_t size) {
 
 int POSIXIOBackend::writeAt(int file_id, long offset, const void *data,
                             size_t size) {
+  const std::lock_guard<std::mutex> lock(file_handle_mutex);
   auto it = file_handle_map.find(file_id);
   if (it == file_handle_map.end()) {
     io_log("Error: Invalid file handle %d\n", file_id);

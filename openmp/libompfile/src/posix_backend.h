@@ -6,12 +6,14 @@
 
 #include <atomic>
 #include <cstddef> // for size_t
+#include <mutex>
 #include <unordered_map>
 
 class POSIXIOBackend : public IOBackend {
 private:
   // Maps our internal "file_id" to an actual file descriptor (fd).
   std::unordered_map<int, int> file_handle_map;
+  std::mutex file_handle_mutex;
   std::atomic<int> next_file_handle;
 
 public:
