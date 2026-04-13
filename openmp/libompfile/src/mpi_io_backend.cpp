@@ -906,6 +906,13 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
            group.front()->FileHandle, group.front()->Offset,
            group.front()->Size);
 
+  // Debug: log all request offsets before sorting
+  for (size_t dbg_i = 0; dbg_i < group.size(); ++dbg_i) {
+    io_trace("  [pre-sort] req[%zu] offset=%ld size=%zu client_rank=%d\n",
+             dbg_i, group[dbg_i]->Offset, group[dbg_i]->Size,
+             group[dbg_i]->ClientRank);
+  }
+
   std::sort(group.begin(), group.end(),
             [](const TwoPhaseReadRequest *lhs, const TwoPhaseReadRequest *rhs) {
               if (lhs->Offset != rhs->Offset)
@@ -971,6 +978,13 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
   }
   if (coalesced.empty())
     return;
+
+  // Debug: log coalesced ranges after grouping
+  for (size_t dbg_i = 0; dbg_i < coalesced.size(); ++dbg_i) {
+    io_trace("  [coalesced] range[%zu] start=%ld end=%ld requests=%zu\n",
+             dbg_i, coalesced[dbg_i].Start, coalesced[dbg_i].End,
+             coalesced[dbg_i].Requests.size());
+  }
 
   auto computeTargetReadSize = [this](long start, long end) -> size_t {
     assert(start >= 0 && end >= start &&
@@ -1489,6 +1503,12 @@ void MPIIOBackend::processWriteGroup(std::vector<WriteBatchRequest *> &group) {
   if (group.empty())
     return;
 
+  // Debug: log all write request offsets before sorting
+  for (size_t dbg_i = 0; dbg_i < group.size(); ++dbg_i) {
+    io_trace("[write-batch] req[%zu] offset=%ld size=%zu\n",
+             dbg_i, group[dbg_i]->Offset, group[dbg_i]->Data.size());
+  }
+
   std::sort(group.begin(), group.end(),
             [](const WriteBatchRequest *lhs, const WriteBatchRequest *rhs) {
               if (lhs->Offset != rhs->Offset)
@@ -1557,6 +1577,13 @@ void MPIIOBackend::processWriteGroup(std::vector<WriteBatchRequest *> &group) {
     }
     tail.End = merged_end;
     tail.Requests.push_back(request);
+  }
+
+  // Debug: log coalesced write ranges after grouping
+  for (size_t dbg_i = 0; dbg_i < coalesced.size(); ++dbg_i) {
+    io_trace("[write-coalesced] range[%zu] start=%ld end=%ld size=%zu requests=%zu\n",
+             dbg_i, coalesced[dbg_i].Start, coalesced[dbg_i].End,
+             coalesced[dbg_i].Data.size(), coalesced[dbg_i].Requests.size());
   }
 
   int remote_handle = -1;
