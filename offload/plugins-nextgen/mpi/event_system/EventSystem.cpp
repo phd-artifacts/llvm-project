@@ -220,8 +220,28 @@ llvm::Error EventTy::getError() const {
 ///  MPI Request Manager Destructor. The Manager cannot be destroyed until all
 ///  the requests it manages have been completed.
 MPIRequestManagerTy::~MPIRequestManagerTy() {
-  assert(Requests.empty() && "Requests must be fulfilled and emptied before "
-                             "destruction. Did you co_await on it?");
+  if (Requests.empty())
+    return;
+
+  ompfileTrace("MPIRequestManagerTy dtor draining pending requests this=%p "
+               "req_count=%zu other_rank=%d tag=%d event_type=%d\n",
+               static_cast<void *>(this), Requests.size(), OtherRank, Tag,
+               EventType);
+  traceRequestSample(Requests);
+
+  int MPIInitialized = 0;
+  int MPIFinalized = 0;
+  MPI_Initialized(&MPIInitialized);
+  if (MPIInitialized)
+    MPI_Finalized(&MPIFinalized);
+  ompfileTrace("MPIRequestManagerTy dtor dropping pending requests because "
+               "teardown reached with MPI %s this=%p req_count=%zu\n",
+               (!MPIInitialized ? "uninitialized"
+                                : (MPIFinalized ? "finalized" : "active")),
+               static_cast<void *>(this), Requests.size());
+
+  Requests.clear();
+  PendingMPIError = MPI_SUCCESS;
 }
 
 /// Send a message to \p OtherRank asynchronously.

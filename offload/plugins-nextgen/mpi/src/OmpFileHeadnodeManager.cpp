@@ -184,6 +184,18 @@ int OmpFileHeadnodeManager::pickRankForPathKeyUnlocked(uint64_t PathKey,
     return LeastLoadedRank;
   }
 
+  const uint64_t PreferredLoad = inFlightForRankUnlocked(PreferredRank);
+  const uint64_t LeastLoad = inFlightForRankUnlocked(LeastLoadedRank);
+  const bool CanMeasureLoads =
+      PreferredLoad != std::numeric_limits<uint64_t>::max() &&
+      LeastLoad != std::numeric_limits<uint64_t>::max();
+  if (CanMeasureLoads && PreferredRank != LeastLoadedRank &&
+      PreferredLoad > (LeastLoad + MaxAffinityLoadSkew)) {
+    It->second = LeastLoadedRank;
+    Rebalanced = true;
+    return LeastLoadedRank;
+  }
+
   AffinityHit = true;
   // Keep an existing path pinned to the same worker so cached opens and
   // follow-on reads/writes observe a single aggregator for that file.

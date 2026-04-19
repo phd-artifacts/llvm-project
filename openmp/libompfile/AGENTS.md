@@ -54,6 +54,8 @@ This scope covers libompfile backend behavior and MPP shim usage.
 ## Failure triage
 - `MPP shim init failed`: check runtime symbol export path and plugin initialization.
 - Open/read errors with MPP enabled: inspect both libompfile logs and proxy/EventSystem logs together.
+- Two-phase read cache entries are keyed by path plus mixed hint metadata (`epoch/stream/tile`); invalidating only the base file/path key after writes can leave stale entries alive under older hint variants.
+- Until per-file mixed-key tracking exists, prefer conservative full two-phase cache invalidation on write-path fixes over partial key erasure.
 
 ## Defensive checks
 - When modifying libompfile C/C++ code, add `assert(...)` around internal bounds invariants (file-id ranges, map/vector index use, offset/size arithmetic).
