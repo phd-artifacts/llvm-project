@@ -2242,6 +2242,10 @@ struct ProxyDevice {
       }
       return false;
     }
+    if (Size > 0 && ::fdatasync(Fd) != 0) {
+      ErrnoOut = errno;
+      return false;
+    }
     if (BytesWrittenOut)
       *BytesWrittenOut = SourceBytesWritten;
     if (Size == 0 || OmpFileStageMode == "off" || !HasTrackedSource)
@@ -2761,24 +2765,20 @@ struct ProxyDevice {
     if (Size > 0) {
       Buffer.resize(Size);
       OmpFileStatsPwritePayloadBytes.fetch_add(Size, std::memory_order_relaxed);
-      if (OmpFileForceBlockingPwrite.get()) {
-        OmpFileStatsPwriteBlockingFallbacks.fetch_add(
-            1, std::memory_order_relaxed);
-        if (auto Error =
-                RequestManager.receiveInBatchsBlocking(Buffer.data(), Size);
-            Error) {
-          OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
-          co_return Error;
-        }
-      } else {
-        OmpFileStatsPwriteAsyncEvents.fetch_add(1, std::memory_order_relaxed);
-        OmpFileStatsPwriteAsyncFragments.fetch_add(
-            computePwriteFragmentCount(Size), std::memory_order_relaxed);
-        RequestManager.receiveInBatchs(Buffer.data(), Size);
-        if (auto Error = co_await RequestManager; Error) {
-          OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
-          co_return Error;
-        }
+      OmpFileStatsPwriteBlockingFallbacks.fetch_add(1,
+                                                    std::memory_order_relaxed);
+      if (auto Error =
+              RequestManager.receiveInBatchsBlocking(Buffer.data(), Size);
+          Error) {
+        OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
+        co_return Error;
+      }
+      if (!OmpFileForceBlockingPwrite.get()) {
+        traceOmpFile("event ompfilePwrite using blocking receive path size=%llu "
+                     "fragments=%llu\n",
+                     static_cast<unsigned long long>(Size),
+                     static_cast<unsigned long long>(
+                         computePwriteFragmentCount(Size)));
       }
     }
 
@@ -2804,7 +2804,7 @@ struct ProxyDevice {
                  static_cast<unsigned long long>(Size),
                  static_cast<void *>(Buffer.data()), Ret, Errno,
                  static_cast<unsigned long long>(BytesWrittenOut),
-                 OmpFileForceBlockingPwrite.get() ? "blocking_debug" : "async",
+                 "blocking",
                  static_cast<unsigned long long>(
                      computePwriteFragmentCount(Size)));
     RequestManager.send(nullptr, 0, MPI_BYTE);

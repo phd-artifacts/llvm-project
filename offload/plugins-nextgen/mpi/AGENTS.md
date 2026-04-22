@@ -48,8 +48,11 @@ This scope covers MPP event routing, scheduler selection, and proxy-side I/O dis
 - If `ActiveMPIPlugin is null`, confirm which process loads this code path and whether plugin init is valid in that role.
 - If scheduling seems ignored, verify `LIBOMPFILE_SCHEDULER=HEADNODE` in the process environment.
 - Use `LIBOMPFILE_OPT_STATS=1` to inspect open/close cache counters printed by proxy.
+- `ProxyDevice::canUseOmpFileOpenCache()` already refuses cached writable opens. If a shared-file stale-read bug survives with `LIBOMPFILE_OPT_OPEN_CACHE=1`, do not assume `OmpFileOpenCacheByKey` is the cause; look deeper than proxy writable-open reuse.
 - If the app rank reports PASS but the Slurm step still fails, inspect proxy rank tails for UCX `unexpected tag-receive descriptor` plus `MPIRequestManagerTy` shutdown errors; this indicates a proxy teardown bug, not a Cholesky numerical failure.
 - Proxy/request-manager cleanup must not assume MPI is still callable during process teardown; late destructor-side MPI calls can fail with MPICH `internal_Cancel` after finalize and kill otherwise successful runs.
+- In Cholesky packed-file lanes, MPICH `internal_Testall` on a proxy rank can come from the proxy-side async `OMPFILE_PWRITE` payload path, not from numerical failure or topology setup. A blocking receive control (`LIBOMPFILE_MPP_FORCE_BLOCKING_PWRITE=1`) is the fastest way to confirm that surface before broader tracing.
+- `OMPFILE_PWRITE` origin events are sensitive to mixed request sets (payload Isends plus completion receives in one wait); split send and receive phases when debugging transport aborts to avoid chasing false topology/scheduler leads.
 
 ## Skills entrypoints
 - `skills/submodule-commit-flow/SKILL.md`

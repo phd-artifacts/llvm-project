@@ -785,7 +785,8 @@ int MPIIOBackend::readAtTwoPhase(
 
   const uint64_t request_key = resolveTwoPhaseKey(context);
   const long request_offset = static_cast<long>(context.Offset);
-  if (tryServeTwoPhaseReadCache(request_key, request_offset, data, size)) {
+  if (!mpp_remote_only &&
+      tryServeTwoPhaseReadCache(request_key, request_offset, data, size)) {
     io_trace("MPIIOBackend::readAtTwoPhase cache-hit file=%d offset=%ld "
              "size=%zu key=%llu\n",
              context.FileHandle, request_offset, size,
@@ -1136,8 +1137,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       continue;
     }
 
-    const uint64_t cache_key = getTwoPhaseGroupKey(*item.Requests.front());
-    updateTwoPhaseReadCache(cache_key, item.Start, buffer);
+    if (!mpp_remote_only) {
+      const uint64_t cache_key = getTwoPhaseGroupKey(*item.Requests.front());
+      updateTwoPhaseReadCache(cache_key, item.Start, buffer);
+    }
 
     for (TwoPhaseReadRequest *request : item.Requests) {
       const size_t scatter_offset =

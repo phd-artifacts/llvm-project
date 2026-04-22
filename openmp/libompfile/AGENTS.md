@@ -56,6 +56,7 @@ This scope covers libompfile backend behavior and MPP shim usage.
 - Open/read errors with MPP enabled: inspect both libompfile logs and proxy/EventSystem logs together.
 - Two-phase read cache entries are keyed by path plus mixed hint metadata (`epoch/stream/tile`); invalidating only the base file/path key after writes can leave stale entries alive under older hint variants.
 - Until per-file mixed-key tracking exists, prefer conservative full two-phase cache invalidation on write-path fixes over partial key erasure.
+- In remote-only MPP mode, the two-phase read cache is local to each proxy and has no cross-proxy invalidation for shared writable files. Keep it disabled/bypassed for writable distributed paths until the runtime can invalidate cached reads across proxies.
 
 ## Defensive checks
 - When modifying libompfile C/C++ code, add `assert(...)` around internal bounds invariants (file-id ranges, map/vector index use, offset/size arithmetic).

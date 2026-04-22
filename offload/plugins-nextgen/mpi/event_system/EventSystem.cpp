@@ -803,6 +803,12 @@ EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
   if (Size > 0)
     RequestManager.sendInBatchs(const_cast<void *>(Buffer), Size);
 
+  // Complete the outgoing payload first. Keeping the request set one-way here
+  // avoids MPICH internal_Testall failures seen when large non-streaming write
+  // cases mix payload Isends and completion Irecvs in a single wait set.
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
   RequestManager.receive(IoRet, 1, MPI_INT);
   RequestManager.receive(RemoteErrno, 1, MPI_INT);
   RequestManager.receive(Bytes, 1, MPI_UINT64_T);
