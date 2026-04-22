@@ -16,6 +16,7 @@ void finalize();
 bool ping();
 
 bool open(const char *path, int flags, int mode, int &handle);
+bool openOnRank(const char *path, int flags, int mode, int rank, int &handle);
 bool close(int handle);
 bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
              size_t &bytes_read);

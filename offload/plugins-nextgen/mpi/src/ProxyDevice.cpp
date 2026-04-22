@@ -746,6 +746,9 @@ struct ProxyDevice {
         OmpFileForceBlockingPwrite("LIBOMPFILE_MPP_FORCE_BLOCKING_PWRITE",
                                    false),
         OmpFileMPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6),
+        OmpFileHeadnodeScheduler(
+            envStringOrDefault("LIBOMPFILE_SCHEDULER", "LOCAL") ==
+            "HEADNODE"),
         OmpFileStageMode(envStringOrDefault("LIBOMPFILE_STAGE_MODE", "off")),
         OmpFileStageWriteMode(
             envStringOrDefault("LIBOMPFILE_STAGE_WRITE_MODE", "write-through")),
@@ -1890,6 +1893,69 @@ struct ProxyDevice {
     OmpFileTrackedFds.erase(Fd);
   }
 
+  bool shouldRefreshTrackedOmpFileFdForRead(
+      const OmpFileTrackedFdEntry &Entry) const {
+    if (!OmpFileHeadnodeScheduler)
+      return false;
+    if (Entry.Path.empty())
+      return false;
+    if (Entry.Flags & (O_CREAT | O_EXCL | O_TRUNC))
+      return false;
+    // Shared libompfile handles are opened O_RDWR. Refresh them before reads so
+    // long-lived cross-proxy descriptors observe close-to-open semantics.
+    return (Entry.Flags & O_ACCMODE) == O_RDWR;
+  }
+
+  bool refreshTrackedOmpFileFdForRead(int Fd, int &ErrnoOut) {
+    ErrnoOut = 0;
+
+    OmpFileTrackedFdEntry Entry;
+    {
+      const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
+      auto It = OmpFileTrackedFds.find(Fd);
+      if (It == OmpFileTrackedFds.end())
+        return true;
+      Entry = It->second;
+    }
+
+    if (!shouldRefreshTrackedOmpFileFdForRead(Entry))
+      return true;
+
+    const auto RefreshStart = std::chrono::steady_clock::now();
+    int RefreshedFd =
+        ::open(Entry.Path.c_str(), Entry.Flags, static_cast<mode_t>(Entry.Mode));
+    if (RefreshedFd < 0) {
+      ErrnoOut = errno;
+      OmpFileStatsCoherentReadRefreshFailures.fetch_add(
+          1, std::memory_order_relaxed);
+      traceOmpFile("refreshTrackedOmpFileFdForRead open-fail fd=%d path=%s "
+                   "flags=0x%x mode=%o errno=%d\n",
+                   Fd, Entry.Path.c_str(), Entry.Flags, Entry.Mode, ErrnoOut);
+      return false;
+    }
+
+    if (::dup2(RefreshedFd, Fd) < 0) {
+      ErrnoOut = errno;
+      OmpFileStatsCoherentReadRefreshFailures.fetch_add(
+          1, std::memory_order_relaxed);
+      traceOmpFile("refreshTrackedOmpFileFdForRead dup2-fail fd=%d new_fd=%d "
+                   "path=%s errno=%d\n",
+                   Fd, RefreshedFd, Entry.Path.c_str(), ErrnoOut);
+      (void)::close(RefreshedFd);
+      return false;
+    }
+
+    (void)::close(RefreshedFd);
+    OmpFileStatsCoherentReadRefreshes.fetch_add(1, std::memory_order_relaxed);
+    OmpFileStatsCoherentReadRefreshUs.fetch_add(
+        elapsedMicros(RefreshStart, std::chrono::steady_clock::now()),
+        std::memory_order_relaxed);
+    traceOmpFile("refreshTrackedOmpFileFdForRead refreshed fd=%d path=%s "
+                 "flags=0x%x mode=%o\n",
+                 Fd, Entry.Path.c_str(), Entry.Flags, Entry.Mode);
+    return true;
+  }
+
   void invalidateStageEntryLocked(const std::string &SourcePath,
                                   bool CountInvalidation,
                                   uint64_t InvalidatedBytes = 0,
@@ -2128,6 +2194,14 @@ struct ProxyDevice {
         traceOmpFile("stage fallback source=%s errno=%d mode=%s topology=%d\n",
                      SourcePath.c_str(), StageErrno, OmpFileStageMode.c_str(),
                      static_cast<int>(OmpFileTopologyLoaded));
+      }
+    }
+
+    if (ReadFd == Fd && Size > 0) {
+      int RefreshErrno = 0;
+      if (!refreshTrackedOmpFileFdForRead(Fd, RefreshErrno)) {
+        ErrnoOut = RefreshErrno;
+        return false;
       }
     }
 
@@ -2556,6 +2630,12 @@ struct ProxyDevice {
         OmpFileStatsStageWriteUs.load(std::memory_order_relaxed);
     uint64_t StagingEvictions =
         OmpFileStatsStagingEvictions.load(std::memory_order_relaxed);
+    uint64_t CoherentReadRefreshes =
+        OmpFileStatsCoherentReadRefreshes.load(std::memory_order_relaxed);
+    uint64_t CoherentReadRefreshFailures =
+        OmpFileStatsCoherentReadRefreshFailures.load(std::memory_order_relaxed);
+    uint64_t CoherentReadRefreshUs =
+        OmpFileStatsCoherentReadRefreshUs.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
 
     {
@@ -2589,7 +2669,9 @@ struct ProxyDevice {
             "staging_full_invalidations=%llu "
             "staging_invalidated_bytes=%llu "
             "staging_write_bypass_count=%llu stage_write_failures=%llu "
-            "stage_write_us_total=%llu "
+            "stage_write_us_total=%llu coherent_read_refreshes=%llu "
+            "coherent_read_refresh_failures=%llu "
+            "coherent_read_refresh_us_total=%llu "
             "staging_evictions=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
@@ -2646,6 +2728,9 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StagingWriteBypass),
             static_cast<unsigned long long>(StageWriteFailures),
             static_cast<unsigned long long>(StageWriteUs),
+            static_cast<unsigned long long>(CoherentReadRefreshes),
+            static_cast<unsigned long long>(CoherentReadRefreshFailures),
+            static_cast<unsigned long long>(CoherentReadRefreshUs),
             static_cast<unsigned long long>(StagingEvictions));
   }
 
@@ -3345,6 +3430,27 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
+  int mppOpenOnRank(const char *Path, int Flags, int Mode, int Rank,
+                    int *Handle) {
+    if (!Path || !Handle)
+      return OFFLOAD_FAIL;
+    if (!isWorkerRank(Rank)) {
+      errno = EHOSTUNREACH;
+      return OFFLOAD_FAIL;
+    }
+
+    traceOmpFile("mppOpenOnRank enter path=%s flags=0x%x mode=%o rank=%d\n",
+                 Path, Flags, Mode, Rank);
+    int RemoteHandle = -1;
+    if (!openOnRank(Rank, Path, Flags, Mode, RemoteHandle))
+      return OFFLOAD_FAIL;
+
+    *Handle = registerRemoteHandle(Rank, RemoteHandle);
+    traceOmpFile("mppOpenOnRank exit local=%d rank=%d remote=%d\n", *Handle,
+                 Rank, RemoteHandle);
+    return OFFLOAD_SUCCESS;
+  }
+
   int mppClose(int Handle) {
     traceOmpFile("mppClose enter local=%d\n", Handle);
     OmpFileHandleEntry Entry{};
@@ -3956,6 +4062,7 @@ private:
   BoolEnvar OmpFileOptStats;
   BoolEnvar OmpFileForceBlockingPwrite;
   Int64Envar OmpFileMPIFragmentSize;
+  bool OmpFileHeadnodeScheduler = false;
   std::string OmpFileStageMode;
   std::string OmpFileStageWriteMode;
   std::string OmpFileStageSyncPolicy;
@@ -4027,6 +4134,9 @@ private:
   std::atomic<uint64_t> OmpFileStatsStageWriteFailures{0};
   std::atomic<uint64_t> OmpFileStatsStageWriteUs{0};
   std::atomic<uint64_t> OmpFileStatsStagingEvictions{0};
+  std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshes{0};
+  std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshFailures{0};
+  std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshUs{0};
   std::mutex MppEventMutex;
   std::unordered_map<uint64_t, EventTy> MppEvents;
   std::unordered_set<uint64_t> CompletedMppTokens;
@@ -4057,6 +4167,14 @@ int ompfile_mpp_open(const char *Path, int Flags, int Mode, int *Handle) {
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppOpen(Path, Flags, Mode, Handle);
+}
+
+int ompfile_mpp_open_on_rank(const char *Path, int Flags, int Mode, int Rank,
+                             int *Handle) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppOpenOnRank(Path, Flags, Mode, Rank, Handle);
 }
 
 int ompfile_mpp_sched_request(const OmpFileIORequest *Request, const char *Path,

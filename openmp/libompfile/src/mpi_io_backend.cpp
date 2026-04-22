@@ -203,24 +203,47 @@ MPIIOBackend::~MPIIOBackend() {
 }
 
 int MPIIOBackend::open(const char *filename) {
+  return openWithPlan(filename, nullptr);
+}
+
+int MPIIOBackend::openWithPlan(const char *filename,
+                               const ompfile::OmpFileIOPlan *plan) {
   if (strict_mpp_init_failed)
     return failStrictMpp("open");
   int file_id = getNextFileHandle();
   const bool remote_only = mpp_remote_only;
+  const bool have_open_plan = plan && plan->Status == 0 &&
+                              plan->AggregatorRank >= 0;
 
   io_log("Opening file %s with file_id %d\n", filename, file_id);
   io_trace("MPIIOBackend::open enter this=%p file_id=%d remote_only=%d "
-           "filename=%s\n",
+           "filename=%s have_plan=%d aggregator=%d remote_handle=%d\n",
            static_cast<void *>(this), file_id, static_cast<int>(remote_only),
-           filename ? filename : "(null)");
+           filename ? filename : "(null)", static_cast<int>(have_open_plan),
+           have_open_plan ? plan->AggregatorRank : -1,
+           have_open_plan ? plan->RemoteHandle : -1);
+
+  auto openRemoteHandle = [&](int &remote_handle_out) {
+    bool open_ok = false;
+    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    if (have_open_plan) {
+      open_ok = ompfile::mpp::openOnRank(filename, O_RDWR, 0666,
+                                         plan->AggregatorRank,
+                                         remote_handle_out);
+      if (!open_ok) {
+        io_log("Planned MPP open failed for %s on rank %d; falling back to "
+               "default open path.\n",
+               filename, plan->AggregatorRank);
+      }
+    }
+    if (!open_ok)
+      open_ok = ompfile::mpp::open(filename, O_RDWR, 0666, remote_handle_out);
+    return open_ok;
+  };
 
   if (remote_only) {
     int remote_handle = -1;
-    bool open_ok = false;
-    {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-      open_ok = ompfile::mpp::open(filename, O_RDWR, 0666, remote_handle);
-    }
+    const bool open_ok = openRemoteHandle(remote_handle);
     if (!open_ok) {
       io_log("MPP open failed for %s\n", filename);
       errno = EIO;
@@ -259,11 +282,7 @@ int MPIIOBackend::open(const char *filename) {
 
   if (mpp_open_enabled) {
     int remote_handle = -1;
-    bool open_ok = false;
-    {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-      open_ok = ompfile::mpp::open(filename, O_RDWR, 0666, remote_handle);
-    }
+    const bool open_ok = openRemoteHandle(remote_handle);
     if (!open_ok) {
       io_log("MPP open failed for %s\n", filename);
       MPI_File_close(&file_handle);
@@ -1081,15 +1100,12 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
           two_phase_planner_rebalanced_count.fetch_add(
               1, std::memory_order_relaxed);
         if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_REBALANCED) != 0) {
-          two_phase_planner_error_count.fetch_add(1, std::memory_order_relaxed);
-          item.Skip = true;
-          item.ErrorStatus = -1;
-          item.ErrorErrno = ENOTSUP;
-          io_log("Two-phase planner returned an unsupported rebalanced batch "
-                 "segment: batch_id=%llu segment_id=%llu aggregator=%d\n",
-                 static_cast<unsigned long long>(batch_request.BatchId),
-                 static_cast<unsigned long long>(entry.SegmentId),
-                 entry.AggregatorRank);
+          io_trace("MPIIOBackend::processTwoPhaseGroup planner rebalanced "
+                   "segment batch_id=%llu segment_id=%llu aggregator=%d; "
+                   "continuing on the opened-handle owner path\n",
+                   static_cast<unsigned long long>(batch_request.BatchId),
+                   static_cast<unsigned long long>(entry.SegmentId),
+                   entry.AggregatorRank);
         }
         if (entry.Status != 0) {
           item.Skip = true;

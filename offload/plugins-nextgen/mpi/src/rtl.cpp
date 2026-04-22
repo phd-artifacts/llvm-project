@@ -1451,6 +1451,44 @@ int ompfile_mpp_open(const char *Path, int Flags, int Mode, int *Handle) {
   return OFFLOAD_SUCCESS;
 }
 
+int ompfile_mpp_open_on_rank(const char *Path, int Flags, int Mode, int Rank,
+                             int *Handle) {
+  using namespace llvm::omp::target::plugin;
+  if (!Path || !Handle)
+    return OFFLOAD_FAIL;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  int RemoteHandle = -1;
+  int RemoteErrno = 0;
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfileOpen, EventTypeTy::OMPFILE_OPEN,
+      /*DstDeviceID=*/Rank, Path, Flags, Mode, &RemoteHandle,
+      &RemoteErrno);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+
+  Event.wait();
+  if (auto Error = Event.getError())
+    return OFFLOAD_FAIL;
+
+  if (RemoteHandle < 0) {
+    errno = RemoteErrno;
+    return OFFLOAD_FAIL;
+  }
+
+  *Handle = RemoteHandle;
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_sched_request(const OmpFileIORequest *Request, const char *Path,
                               OmpFileIOPlan *Plan) {
   using namespace llvm::omp::target::plugin;

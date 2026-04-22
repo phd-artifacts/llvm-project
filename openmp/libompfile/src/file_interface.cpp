@@ -176,9 +176,15 @@ public:
   int open(const char *filename) override {
     if (!ensureSchedulerReady("open", /*log_once=*/true))
       return -1;
-    if (mpp_sched_active && !scheduleOpen(filename))
-      return failStrict("open");
-    const int file_handle = backend.open(filename);
+    ompfile::OmpFileIOPlan open_plan{};
+    ompfile::OmpFileIOPlan *open_plan_ptr = nullptr;
+    if (mpp_sched_active) {
+      if (!scheduleOpen(filename, &open_plan))
+        return failStrict("open");
+      if (open_plan.Status == 0 && open_plan.AggregatorRank >= 0)
+        open_plan_ptr = &open_plan;
+    }
+    const int file_handle = backend.openWithPlan(filename, open_plan_ptr);
     if (file_handle >= 0 && filename)
       rememberOpenPath(file_handle, filename);
     return file_handle;
@@ -443,7 +449,7 @@ private:
     return true;
   }
 
-  bool scheduleOpen(const char *path) {
+  bool scheduleOpen(const char *path, ompfile::OmpFileIOPlan *plan_out) {
     if (!path)
       return true;
     ompfile::OmpFileIORequest req{};
@@ -454,7 +460,7 @@ private:
     io_trace("HeadnodeScheduler::scheduleOpen scheduler=%p req_id=%llu path=%s\n",
              static_cast<void *>(this),
              static_cast<unsigned long long>(req.RequestId), path);
-    return schedRequest(req, path, nullptr) || !strict_mpp_required;
+    return schedRequest(req, path, plan_out) || !strict_mpp_required;
   }
 
   bool scheduleClose(int file_handle) {

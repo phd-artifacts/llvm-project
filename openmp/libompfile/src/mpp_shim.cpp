@@ -15,6 +15,7 @@ namespace {
 using MppInitFn = int (*)();
 using MppSubmitFn = int (*)(uint64_t);
 using MppOpenFn = int (*)(const char *, int, int, int *);
+using MppOpenOnRankFn = int (*)(const char *, int, int, int, int *);
 using MppCloseFn = int (*)(int);
 using MppPreadFn = int (*)(int, int64_t, void *, uint64_t);
 using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
@@ -33,6 +34,7 @@ struct MppApi {
   MppInitFn init = nullptr;
   MppSubmitFn submit = nullptr;
   MppOpenFn open = nullptr;
+  MppOpenOnRankFn open_on_rank = nullptr;
   MppCloseFn close = nullptr;
   MppPreadFn pread = nullptr;
   MppPreadExFn pread_ex = nullptr;
@@ -51,9 +53,11 @@ MppApi loadMppApi() {
   loaded.submit = reinterpret_cast<MppSubmitFn>(dlsym(RTLD_DEFAULT,
                                                       "ompfile_mpp_submit"));
   loaded.open = reinterpret_cast<MppOpenFn>(dlsym(RTLD_DEFAULT,
-                                                      "ompfile_mpp_open"));
+                                                       "ompfile_mpp_open"));
+  loaded.open_on_rank = reinterpret_cast<MppOpenOnRankFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_open_on_rank"));
   loaded.close = reinterpret_cast<MppCloseFn>(dlsym(RTLD_DEFAULT,
-                                                       "ompfile_mpp_close"));
+                                                        "ompfile_mpp_close"));
   loaded.pread = reinterpret_cast<MppPreadFn>(dlsym(RTLD_DEFAULT,
                                                        "ompfile_mpp_pread"));
   loaded.pread_ex = reinterpret_cast<MppPreadExFn>(
@@ -108,6 +112,8 @@ bool init() {
 
   io_trace_symbol_owner("ompfile_mpp_init", reinterpret_cast<void *>(api.init));
   io_trace_symbol_owner("ompfile_mpp_open", reinterpret_cast<void *>(api.open));
+  io_trace_symbol_owner("ompfile_mpp_open_on_rank",
+                        reinterpret_cast<void *>(api.open_on_rank));
   io_trace_symbol_owner("ompfile_mpp_close",
                         reinterpret_cast<void *>(api.close));
   io_trace_symbol_owner("ompfile_mpp_pread",
@@ -198,6 +204,40 @@ bool open(const char *path, int flags, int mode, int &handle) {
 
   io_trace("mpp_shim::open success call=%llu handle=%d\n",
            static_cast<unsigned long long>(call_id), handle);
+  return true;
+}
+
+bool openOnRank(const char *path, int flags, int mode, int rank, int &handle) {
+  const uint64_t call_id = nextShimCallId();
+  handle = -1;
+  io_trace("mpp_shim::openOnRank enter call=%llu path=%s flags=0x%x mode=%o "
+           "rank=%d\n",
+           static_cast<unsigned long long>(call_id), path ? path : "(null)",
+           flags, mode, rank);
+  if (!init())
+    return false;
+
+  auto &api = getMppApi();
+  if (!api.open_on_rank)
+    api = loadMppApi();
+
+  if (!api.open_on_rank) {
+    io_log("MPP shim not available (ompfile_mpp_open_on_rank missing).\n");
+    io_trace("mpp_shim::openOnRank missing symbol call=%llu\n",
+             static_cast<unsigned long long>(call_id));
+    return false;
+  }
+
+  const int rc = api.open_on_rank(path, flags, mode, rank, &handle);
+  if (rc != 0) {
+    io_log("MPP shim openOnRank failed.\n");
+    io_trace("mpp_shim::openOnRank failed call=%llu rc=%d handle=%d rank=%d\n",
+             static_cast<unsigned long long>(call_id), rc, handle, rank);
+    return false;
+  }
+
+  io_trace("mpp_shim::openOnRank success call=%llu handle=%d rank=%d\n",
+           static_cast<unsigned long long>(call_id), handle, rank);
   return true;
 }
 

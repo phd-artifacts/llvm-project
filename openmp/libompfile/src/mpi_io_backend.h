@@ -132,6 +132,8 @@ public:
   ~MPIIOBackend();
 
   int open(const char *filename) override;
+  int openWithPlan(const char *filename,
+                   const ompfile::OmpFileIOPlan *plan) override;
   int write(int file_id, const void *data, size_t size) override;
   int read(int file_id, void *data, size_t size) override;
   int close(int file_id) override;

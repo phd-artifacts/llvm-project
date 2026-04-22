@@ -16,6 +16,10 @@ public:
   virtual ~IOBackend() {}
 
   virtual int open(const char *filename) = 0;
+  virtual int openWithPlan(const char *filename,
+                           const ompfile::OmpFileIOPlan *plan) {
+    return open(filename);
+  }
   virtual int write(int file_id, const void *data, size_t size) = 0;
   virtual int read(int file_id, void *data, size_t size) = 0;
   virtual int close(int file_id) = 0;
