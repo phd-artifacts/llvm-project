@@ -11,8 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
-#include <cerrno>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -70,6 +70,49 @@ static std::mutex &getOmpfileMppMutex() {
 static std::unordered_map<uint64_t, EventTy> &getOmpfileMppEvents() {
   static auto *Events = new std::unordered_map<uint64_t, EventTy>();
   return *Events;
+}
+
+struct OmpfileMppHandleEntry {
+  int Rank = -1;
+  int RemoteHandle = -1;
+};
+
+static std::unordered_map<int, OmpfileMppHandleEntry> &getOmpfileMppHandles() {
+  static auto *Handles = new std::unordered_map<int, OmpfileMppHandleEntry>();
+  return *Handles;
+}
+
+static int registerOmpfileMppHandle(int Rank, int RemoteHandle) {
+  static std::atomic<int> NextHandle{1};
+  auto &Handles = getOmpfileMppHandles();
+  const int LocalHandle = NextHandle.fetch_add(1, std::memory_order_relaxed);
+  Handles[LocalHandle] = {Rank, RemoteHandle};
+  return LocalHandle;
+}
+
+static bool findOmpfileMppHandle(int LocalHandle,
+                                 OmpfileMppHandleEntry &Entry) {
+  auto &Handles = getOmpfileMppHandles();
+  auto It = Handles.find(LocalHandle);
+  if (It == Handles.end()) {
+    errno = EBADF;
+    return false;
+  }
+  Entry = It->second;
+  return true;
+}
+
+static bool eraseOmpfileMppHandle(int LocalHandle,
+                                  OmpfileMppHandleEntry &Entry) {
+  auto &Handles = getOmpfileMppHandles();
+  auto It = Handles.find(LocalHandle);
+  if (It == Handles.end()) {
+    errno = EBADF;
+    return false;
+  }
+  Entry = It->second;
+  Handles.erase(It);
+  return true;
 }
 
 // TODO: Should this be defined inside the EventSystem?
@@ -1433,8 +1476,7 @@ int ompfile_mpp_open(const char *Path, int Flags, int Mode, int *Handle) {
   int RemoteErrno = 0;
   EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
       OriginEvents::ompfileOpen, EventTypeTy::OMPFILE_OPEN,
-      /*DstDeviceID=*/0, Path, Flags, Mode, &RemoteHandle,
-      &RemoteErrno);
+      /*DstDeviceID=*/0, Path, Flags, Mode, &RemoteHandle, &RemoteErrno);
   if (Event.empty())
     return OFFLOAD_FAIL;
 
@@ -1447,7 +1489,8 @@ int ompfile_mpp_open(const char *Path, int Flags, int Mode, int *Handle) {
     return OFFLOAD_FAIL;
   }
 
-  *Handle = RemoteHandle;
+  const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+  *Handle = registerOmpfileMppHandle(/*Rank=*/0, RemoteHandle);
   return OFFLOAD_SUCCESS;
 }
 
@@ -1471,8 +1514,7 @@ int ompfile_mpp_open_on_rank(const char *Path, int Flags, int Mode, int Rank,
   int RemoteErrno = 0;
   EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
       OriginEvents::ompfileOpen, EventTypeTy::OMPFILE_OPEN,
-      /*DstDeviceID=*/Rank, Path, Flags, Mode, &RemoteHandle,
-      &RemoteErrno);
+      /*DstDeviceID=*/Rank, Path, Flags, Mode, &RemoteHandle, &RemoteErrno);
   if (Event.empty())
     return OFFLOAD_FAIL;
 
@@ -1485,7 +1527,8 @@ int ompfile_mpp_open_on_rank(const char *Path, int Flags, int Mode, int Rank,
     return OFFLOAD_FAIL;
   }
 
-  *Handle = RemoteHandle;
+  const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+  *Handle = registerOmpfileMppHandle(Rank, RemoteHandle);
   return OFFLOAD_SUCCESS;
 }
 
@@ -1515,7 +1558,8 @@ int ompfile_mpp_sched_request(const OmpFileIORequest *Request, const char *Path,
   }
 
   if (!Plugin->ensureEventSystemInitializedForOmpFile()) {
-    DP("ompfile_mpp_sched_request: ensureEventSystemInitializedForOmpFile failed.\n");
+    DP("ompfile_mpp_sched_request: ensureEventSystemInitializedForOmpFile "
+       "failed.\n");
     return OFFLOAD_FAIL;
   }
 
@@ -1544,10 +1588,12 @@ int ompfile_mpp_sched_request(const OmpFileIORequest *Request, const char *Path,
   return OFFLOAD_SUCCESS;
 }
 
-int ompfile_mpp_sched_request_batch(
-    const OmpFileIOBatchRequest *Request, const void *RequestPayload,
-    uint64_t RequestPayloadBytes, OmpFileIOBatchPlan *Plan, void *PlanPayload,
-    uint64_t PlanPayloadCapBytes, uint64_t *PlanPayloadOutBytes) {
+int ompfile_mpp_sched_request_batch(const OmpFileIOBatchRequest *Request,
+                                    const void *RequestPayload,
+                                    uint64_t RequestPayloadBytes,
+                                    OmpFileIOBatchPlan *Plan, void *PlanPayload,
+                                    uint64_t PlanPayloadCapBytes,
+                                    uint64_t *PlanPayloadOutBytes) {
   using namespace llvm::omp::target::plugin;
   if (!Request || !Plan || !PlanPayloadOutBytes) {
     DP("ompfile_mpp_sched_request_batch: missing Request/Plan buffers.\n");
@@ -1619,11 +1665,18 @@ int ompfile_mpp_close(int Handle) {
   if (!Plugin->ensureEventSystemInitializedForOmpFile())
     return OFFLOAD_FAIL;
 
+  OmpfileMppHandleEntry Entry{};
+  {
+    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+    if (!eraseOmpfileMppHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+  }
+
   int CloseRet = -1;
   int RemoteErrno = 0;
   EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
       OriginEvents::ompfileClose, EventTypeTy::OMPFILE_CLOSE,
-      /*DstDeviceID=*/0, Handle, &CloseRet, &RemoteErrno);
+      /*DstDeviceID=*/Entry.Rank, Entry.RemoteHandle, &CloseRet, &RemoteErrno);
   if (Event.empty())
     return OFFLOAD_FAIL;
 
@@ -1658,13 +1711,20 @@ int ompfile_mpp_pread_ex(int Handle, int64_t Offset, void *Buffer,
   if (!Plugin->ensureEventSystemInitializedForOmpFile())
     return OFFLOAD_FAIL;
 
+  OmpfileMppHandleEntry Entry{};
+  {
+    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+    if (!findOmpfileMppHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+  }
+
   int IoRet = -1;
   int RemoteErrno = 0;
   uint64_t Bytes = 0;
   EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
       OriginEvents::ompfilePread, EventTypeTy::OMPFILE_PREAD,
-      /*DstDeviceID=*/0, Handle, Offset, Buffer, Size, &IoRet,
-      &RemoteErrno, &Bytes);
+      /*DstDeviceID=*/Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
+      &IoRet, &RemoteErrno, &Bytes);
   if (Event.empty())
     return OFFLOAD_FAIL;
 
@@ -1713,13 +1773,20 @@ int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
   if (!Plugin->ensureEventSystemInitializedForOmpFile())
     return OFFLOAD_FAIL;
 
+  OmpfileMppHandleEntry Entry{};
+  {
+    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+    if (!findOmpfileMppHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+  }
+
   int IoRet = -1;
   int RemoteErrno = 0;
   uint64_t Bytes = 0;
   EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
       OriginEvents::ompfilePwrite, EventTypeTy::OMPFILE_PWRITE,
-      /*DstDeviceID=*/0, Handle, Offset, Buffer, Size, &IoRet,
-      &RemoteErrno, &Bytes);
+      /*DstDeviceID=*/Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
+      &IoRet, &RemoteErrno, &Bytes);
   if (Event.empty())
     return OFFLOAD_FAIL;
 
@@ -1753,7 +1820,6 @@ int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,
   return OFFLOAD_SUCCESS;
 }
 
-
 int ompfile_mpp_poll(uint64_t Token, int *Done) {
   using namespace llvm::omp::target::plugin;
   if (!Done)
@@ -1783,8 +1849,10 @@ int ompfile_mpp_poll(uint64_t Token, int *Done) {
 int ompfile_mpp_finalize() {
   using namespace llvm::omp::target::plugin;
   auto &Events = getOmpfileMppEvents();
+  auto &Handles = getOmpfileMppHandles();
   const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
   Events.clear();
+  Handles.clear();
   return OFFLOAD_SUCCESS;
 }
 

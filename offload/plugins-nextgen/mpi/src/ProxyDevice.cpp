@@ -2029,9 +2029,13 @@ struct ProxyDevice {
   }
 
   bool ensureStageEntryForPath(const std::string &SourcePath, uint64_t Offset,
-                               uint64_t Size, int &StageFd, int &ErrnoOut) {
+                               uint64_t Size,
+                               std::shared_ptr<OmpFileStageEntry> *EntryOut,
+                               int &StageFd, int &ErrnoOut) {
     StageFd = -1;
     ErrnoOut = 0;
+    if (EntryOut)
+      EntryOut->reset();
     if (!isReadthroughStageEnabled() || SourcePath.empty()) {
       ErrnoOut = ENOTSUP;
       return false;
@@ -2086,6 +2090,8 @@ struct ProxyDevice {
     Lock.unlock();
 
     if (Size == 0) {
+      if (EntryOut)
+        *EntryOut = Entry;
       StageFd = Entry->StageFd;
       return true;
     }
@@ -2097,6 +2103,8 @@ struct ProxyDevice {
           Entry->FullyPopulated ||
           isCoveredByExtents(Entry->CoveredExtents, Offset, RequestedEnd);
       if (Covered) {
+        if (EntryOut)
+          *EntryOut = Entry;
         StageFd = Entry->StageFd;
         return true;
       }
@@ -2171,6 +2179,8 @@ struct ProxyDevice {
                  static_cast<unsigned long long>(PopulateBegin),
                  static_cast<unsigned long long>(PopulateEnd), Entry->StageFd,
                  static_cast<unsigned long long>(PopulateStats.CopiedBytes));
+    if (EntryOut)
+      *EntryOut = Entry;
     StageFd = Entry->StageFd;
     return true;
   }
@@ -2183,12 +2193,16 @@ struct ProxyDevice {
 
     int ReadFd = Fd;
     std::string SourcePath;
+    std::shared_ptr<OmpFileStageEntry> HeldStageEntry;
     if (Offset >= 0 && Size > 0 && isReadthroughStageEnabled() &&
         getTrackedOmpFileFdPath(Fd, SourcePath)) {
       int StageFd = -1;
       int StageErrno = 0;
-      if (ensureStageEntryForPath(SourcePath, static_cast<uint64_t>(Offset), Size,
-                                 StageFd, StageErrno)) {
+      // Keep the stage entry alive so invalidation cannot close StageFd
+      // while this read is still using it.
+      if (ensureStageEntryForPath(SourcePath, static_cast<uint64_t>(Offset),
+                                  Size, &HeldStageEntry, StageFd,
+                                  StageErrno)) {
         ReadFd = StageFd;
       } else {
         traceOmpFile("stage fallback source=%s errno=%d mode=%s topology=%d\n",
@@ -2335,7 +2349,9 @@ struct ProxyDevice {
 
     int StageFd = -1;
     int StageErrno = 0;
-    if (!ensureStageEntryForPath(SourcePath, 0, 0, StageFd, StageErrno) ||
+    std::shared_ptr<OmpFileStageEntry> HeldStageEntry;
+    if (!ensureStageEntryForPath(SourcePath, 0, 0, &HeldStageEntry, StageFd,
+                                 StageErrno) ||
         StageFd < 0) {
       OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
       OmpFileStatsStagingWriteBypassCount.fetch_add(1,
@@ -2380,8 +2396,7 @@ struct ProxyDevice {
       SourceSizeKnown = true;
     }
 
-    std::shared_ptr<OmpFileStageEntry> Entry;
-    if (!getStageEntryForPath(SourcePath, Entry)) {
+    if (!HeldStageEntry) {
       OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
       OmpFileStatsStagingWriteBypassCount.fetch_add(1,
                                                     std::memory_order_relaxed);
@@ -2389,7 +2404,7 @@ struct ProxyDevice {
       return true;
     }
 
-    updateStageCoverageForWrite(Entry, static_cast<uint64_t>(Offset), Size,
+    updateStageCoverageForWrite(HeldStageEntry, static_cast<uint64_t>(Offset), Size,
                                 SourceSize, SourceSizeKnown);
     OmpFileStatsStagedWriteUpdates.fetch_add(1, std::memory_order_relaxed);
     OmpFileStatsStagedWriteBytes.fetch_add(Size, std::memory_order_relaxed);
