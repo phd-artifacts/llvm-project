@@ -48,6 +48,7 @@ This scope covers MPP event routing, scheduler selection, and proxy-side I/O dis
 - If `ActiveMPIPlugin is null`, confirm which process loads this code path and whether plugin init is valid in that role.
 - If scheduling seems ignored, verify `LIBOMPFILE_SCHEDULER=HEADNODE` in the process environment.
 - Use `LIBOMPFILE_OPT_STATS=1` to inspect open/close cache counters printed by proxy.
+- Readthrough stage entries are process-local; if multiple proxies can share one host, the stage file path must include proxy-local identity. Keying only by source path lets separate proxy processes truncate the same `*.stage` file and produces misleading staged readback mismatches.
 - `ProxyDevice::canUseOmpFileOpenCache()` already refuses cached writable opens. If a shared-file stale-read bug survives with `LIBOMPFILE_OPT_OPEN_CACHE=1`, do not assume `OmpFileOpenCacheByKey` is the cause; look deeper than proxy writable-open reuse.
 - If the app rank reports PASS but the Slurm step still fails, inspect proxy rank tails for UCX `unexpected tag-receive descriptor` plus `MPIRequestManagerTy` shutdown errors; this indicates a proxy teardown bug, not a Cholesky numerical failure.
 - Proxy/request-manager cleanup must not assume MPI is still callable during process teardown; late destructor-side MPI calls can fail with MPICH `internal_Cancel` after finalize and kill otherwise successful runs.

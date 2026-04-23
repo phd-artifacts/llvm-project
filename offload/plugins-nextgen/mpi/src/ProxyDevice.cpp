@@ -1713,8 +1713,12 @@ struct ProxyDevice {
             Ch == '_' || Ch == '-'))
         Ch = '_';
     }
+    // Stage entries are process-local today, so sharing one stage file between
+    // proxies on the same host can race via O_TRUNC/repopulate cycles.
+    const int ProxyRank = EventSystem.LocalRank >= 0 ? EventSystem.LocalRank : 0;
     return OmpFileStageRoot + "/" + BaseName + "-" +
-           std::to_string(std::hash<std::string>{}(SourcePath)) + ".stage";
+           std::to_string(std::hash<std::string>{}(SourcePath)) + "-rank" +
+           std::to_string(ProxyRank) + ".stage";
   }
 
   bool ensureDirectoryTree(const std::string &Path, int &ErrnoOut) const {
