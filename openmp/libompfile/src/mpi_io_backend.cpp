@@ -14,6 +14,7 @@
 #include <mpi.h>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -252,10 +253,12 @@ int MPIIOBackend::openWithPlan(const char *filename,
     {
       const std::lock_guard<std::mutex> lock(handle_mutex);
       remote_file_handle_map[file_id] = remote_handle;
+      remote_read_handle_cache[file_id].clear();
       logical_handle_set.insert(file_id);
       traceHandleStateLocked("open.remote_only.insert", file_id, remote_handle);
     }
     io_log("Remote-only open completed for file_id %d\n", file_id);
+    rememberFilePath(file_id, filename);
     rememberFilePathKey(file_id, filename);
     traceHandleState("open.remote_only.done", file_id, remote_handle);
     return file_id;
@@ -276,6 +279,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
   {
     const std::lock_guard<std::mutex> lock(handle_mutex);
     file_handle_map[file_id] = file_handle;
+    remote_read_handle_cache[file_id].clear();
     logical_handle_set.insert(file_id);
     traceHandleStateLocked("open.mpi.insert", file_id, -1);
   }
@@ -301,6 +305,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
       traceHandleStateLocked("open.mpp.remote.insert", file_id, remote_handle);
     }
   }
+  rememberFilePath(file_id, filename);
   rememberFilePathKey(file_id, filename);
   traceHandleState("open.done", file_id, -1);
   return file_id;
@@ -376,6 +381,9 @@ int MPIIOBackend::close(int file_id) {
     return failStrictMpp("close");
   io_log("Closing file %d\n", file_id);
   invalidateTwoPhaseReadCacheForFile(file_id);
+  std::vector<int> rebalanced_handles;
+  collectRemoteReadHandlesForClose(file_id, rebalanced_handles);
+  forgetFilePath(file_id);
   forgetFilePathKey(file_id);
   const bool remote_only = mpp_remote_only;
   int remote_handle = -1;
@@ -423,6 +431,23 @@ int MPIIOBackend::close(int file_id) {
     }
     if (!close_ok) {
       io_log("MPP close failed for file %d\n", file_id);
+      mpp_ret = -1;
+    }
+  }
+
+  for (int cached_handle : rebalanced_handles) {
+    if (cached_handle < 0)
+      continue;
+    if (has_remote_handle && cached_handle == remote_handle)
+      continue;
+    bool close_ok = false;
+    {
+      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      close_ok = ompfile::mpp::close(cached_handle);
+    }
+    if (!close_ok) {
+      io_log("MPP close failed for cached rebalanced handle (file %d, handle=%d)\n",
+             file_id, cached_handle);
       mpp_ret = -1;
     }
   }
@@ -944,6 +969,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     long Start = 0;
     long End = 0;
     std::vector<TwoPhaseReadRequest *> Requests;
+    int PlannedAggregatorRank = -1;
+    bool PlannerRebalanced = false;
+    bool PlannerForceFallback = false;
+    int PlannerFallbackErrno = 0;
     bool Skip = false;
     int ErrorStatus = 0;
     int ErrorErrno = 0;
@@ -1100,6 +1129,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
           two_phase_planner_rebalanced_count.fetch_add(
               1, std::memory_order_relaxed);
         if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_REBALANCED) != 0) {
+          item.PlannerRebalanced = true;
+          item.PlannedAggregatorRank = entry.AggregatorRank;
+        }
+        if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_REBALANCED) != 0) {
           io_trace("MPIIOBackend::processTwoPhaseGroup planner rebalanced "
                    "segment batch_id=%llu segment_id=%llu aggregator=%d; "
                    "continuing on the opened-handle owner path\n",
@@ -1108,9 +1141,21 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
                    entry.AggregatorRank);
         }
         if (entry.Status != 0) {
-          item.Skip = true;
-          item.ErrorStatus = -1;
-          item.ErrorErrno = entry.Errno != 0 ? entry.Errno : EIO;
+          const int entry_errno = entry.Errno != 0 ? entry.Errno : EIO;
+          if (item.PlannerRebalanced &&
+              (entry_errno == ESTALE || entry_errno == ENOKEY ||
+               entry_errno == EAGAIN)) {
+            item.PlannerForceFallback = true;
+            item.PlannerFallbackErrno = entry_errno;
+            io_trace("MPIIOBackend::processTwoPhaseGroup planner requested "
+                     "owner fallback segment=%llu errno=%d\n",
+                     static_cast<unsigned long long>(entry.SegmentId),
+                     entry_errno);
+          } else {
+            item.Skip = true;
+            item.ErrorStatus = -1;
+            item.ErrorErrno = entry_errno;
+          }
         }
       }
     }
@@ -1140,9 +1185,57 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     std::vector<char> buffer(read_size);
     size_t bytes_read = 0;
 
-    const int rc = readAtFallbackWithBytes(item.Requests.front()->FileHandle,
-                                           item.Start, buffer.data(), read_size,
-                                           bytes_read);
+    int rc = -1;
+    int read_errno = 0;
+    const int file_id = item.Requests.front()->FileHandle;
+    if (item.PlannerRebalanced && item.PlannedAggregatorRank >= 0) {
+      const char *fallback_reason = "none";
+      int fallback_errno = 0;
+      bool eligible_for_rebalance = false;
+      if (item.PlannerForceFallback) {
+        fallback_reason = "scheduler-version-mismatch";
+        fallback_errno =
+            item.PlannerFallbackErrno != 0 ? item.PlannerFallbackErrno : ESTALE;
+      } else {
+        eligible_for_rebalance =
+            canApplyRebalancedRead(item.Requests.front()->Hint, file_id,
+                                   item.Start, read_size, fallback_reason,
+                                   fallback_errno);
+      }
+
+      if (eligible_for_rebalance) {
+        rc = readAtRemoteRankWithBytes(file_id, item.PlannedAggregatorRank,
+                                       item.Start, buffer.data(), read_size,
+                                       bytes_read);
+      } else {
+        rc = -1;
+        read_errno = fallback_errno != 0 ? fallback_errno : EAGAIN;
+        two_phase_planner_rebalanced_skipped_count.fetch_add(
+            1, std::memory_order_relaxed);
+        io_trace("MPIIOBackend::processTwoPhaseGroup rebalanced segment fallback "
+                 "file=%d target_rank=%d offset=%ld size=%zu reason=%s errno=%d\n",
+                 file_id, item.PlannedAggregatorRank, item.Start, read_size,
+                 fallback_reason, read_errno);
+      }
+
+      if (rc == 0) {
+        two_phase_planner_rebalanced_applied_count.fetch_add(
+            1, std::memory_order_relaxed);
+      } else if (eligible_for_rebalance) {
+        read_errno = errno;
+        two_phase_planner_rebalanced_skipped_count.fetch_add(
+            1, std::memory_order_relaxed);
+        io_trace("MPIIOBackend::processTwoPhaseGroup rebalanced segment fallback "
+                 "file=%d target_rank=%d offset=%ld size=%zu reason=remote-read-fail errno=%d\n",
+                 file_id, item.PlannedAggregatorRank, item.Start, read_size,
+                 read_errno);
+      }
+    }
+
+    if (rc != 0) {
+      rc = readAtFallbackWithBytes(file_id, item.Start, buffer.data(), read_size,
+                                   bytes_read);
+    }
     if (rc != 0) {
       const int errnum = errno;
       io_trace("MPIIOBackend::processTwoPhaseGroup coalesced read failed "
@@ -1312,7 +1405,7 @@ int MPIIOBackend::writeAtWithContext(
     if (getFilePathKey(file_id, path_key))
       group_key = path_key;
   }
-  group_key = mixHintIntoKey(group_key, context.Hint);
+  group_key = mixWriteHintIntoKey(group_key, context.Hint);
 
   if (strict_mpp_init_failed)
     return failStrictMpp("pwrite");
@@ -1331,8 +1424,12 @@ int MPIIOBackend::writeAtWithContext(
   io_log("Writing %zu bytes to file %d at offset %lld\n", size, file_id,
          static_cast<long long>(offset));
 
-  if (isWriteBatchActive())
-    return writeAtBatched(file_id, offset, data, size, group_key);
+  if (isWriteBatchActive()) {
+    const int batched_rc = writeAtBatched(file_id, offset, data, size, group_key);
+    if (batched_rc == 0)
+      recordWriteEpochForContext(file_id, offset, size, context.Hint);
+    return batched_rc;
+  }
 
   if (remote_only) {
     int remote_handle = -1;
@@ -1358,6 +1455,7 @@ int MPIIOBackend::writeAtWithContext(
     }
     assert(bytes_written == size && "Remote pwrite must complete full request");
 
+    recordWriteEpochForContext(file_id, offset, size, context.Hint);
     io_log("MPP write at offset completed.\n");
     return 0;
   }
@@ -1387,6 +1485,7 @@ int MPIIOBackend::writeAtWithContext(
     }
     assert(bytes_written == size && "Remote pwrite must complete full request");
 
+    recordWriteEpochForContext(file_id, offset, size, context.Hint);
     io_log("MPP write at offset completed.\n");
     return 0;
   }
@@ -1435,6 +1534,7 @@ int MPIIOBackend::writeAtWithContext(
     return -1;
   }
 
+  recordWriteEpochForContext(file_id, offset, size, context.Hint);
   io_log("Write at offset completed\n");
   return 0;
 }
@@ -1681,6 +1781,20 @@ uint64_t MPIIOBackend::mixHintIntoKey(uint64_t base_key,
   return mixed;
 }
 
+uint64_t MPIIOBackend::mixWriteHintIntoKey(
+    uint64_t base_key, const ompfile::OmpFileIOHint &hint) {
+  uint64_t mixed = base_key;
+  auto mix = [&mixed](uint64_t value) {
+    mixed ^= value + 0x9e3779b97f4a7c15ULL + (mixed << 6) + (mixed >> 2);
+  };
+
+  if ((hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_STREAM) != 0)
+    mix(hint.StreamId);
+  if ((hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0)
+    mix(hint.TileId);
+  return mixed;
+}
+
 bool MPIIOBackend::getFilePathKey(int file_id, uint64_t &path_key_out) {
   const std::lock_guard<std::mutex> lock(handle_mutex);
   const auto it = file_path_key_map.find(file_id);
@@ -1699,9 +1813,246 @@ void MPIIOBackend::rememberFilePathKey(int file_id, const char *path) {
   invalidateTwoPhaseReadCacheKey(path_key);
 }
 
+void MPIIOBackend::rememberFilePath(int file_id, const char *path) {
+  if (!path)
+    return;
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  file_path_map[file_id] = path;
+  file_write_epoch_history.erase(file_id);
+}
+
+void MPIIOBackend::forgetFilePath(int file_id) {
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  file_path_map.erase(file_id);
+  file_write_epoch_history.erase(file_id);
+}
+
 void MPIIOBackend::forgetFilePathKey(int file_id) {
   const std::lock_guard<std::mutex> lock(handle_mutex);
   file_path_key_map.erase(file_id);
+}
+
+bool MPIIOBackend::rangesOverlap(long a_start, long a_end, long b_start,
+                                 long b_end) const {
+  if (a_end <= a_start || b_end <= b_start)
+    return false;
+  return a_start < b_end && b_start < a_end;
+}
+
+void MPIIOBackend::recordWriteEpochForContext(
+    int file_id, long offset, size_t size, const ompfile::OmpFileIOHint &hint) {
+  if (size == 0)
+    return;
+  if (offset < 0 ||
+      size > static_cast<size_t>(std::numeric_limits<long>::max()) ||
+      offset > std::numeric_limits<long>::max() - static_cast<long>(size)) {
+    return;
+  }
+
+  WriteEpochEntry entry{};
+  entry.Start = offset;
+  entry.End = offset + static_cast<long>(size);
+  entry.HasEpoch = (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_EPOCH) != 0;
+  entry.EpochId = entry.HasEpoch ? hint.EpochId : 0;
+  entry.HasTile = (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0;
+  entry.TileId = entry.HasTile ? hint.TileId : 0;
+
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  entry.Sequence = next_write_sequence++;
+  auto &history = file_write_epoch_history[file_id];
+  history.push_back(entry);
+  constexpr size_t kMaxWriteEpochHistory = 8192;
+  if (history.size() > kMaxWriteEpochHistory) {
+    history.erase(history.begin(),
+                  history.begin() + (history.size() - kMaxWriteEpochHistory));
+  }
+}
+
+bool MPIIOBackend::canApplyRebalancedRead(
+    const ompfile::OmpFileIOHint &hint, int file_id, long start, size_t size,
+    const char *&reason_out, int &reason_errno_out) {
+  reason_out = "none";
+  reason_errno_out = 0;
+  if (size == 0)
+    return true;
+
+  if (start < 0 ||
+      size > static_cast<size_t>(std::numeric_limits<long>::max()) ||
+      start > std::numeric_limits<long>::max() - static_cast<long>(size)) {
+    reason_out = "invalid-read-range";
+    reason_errno_out = EINVAL;
+    return false;
+  }
+
+  const long end = start + static_cast<long>(size);
+  const bool read_has_epoch =
+      (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_EPOCH) != 0;
+  const bool read_has_tile =
+      (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0;
+  const uint64_t read_epoch = hint.EpochId;
+
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  auto it = file_write_epoch_history.find(file_id);
+  if (it == file_write_epoch_history.end() || it->second.empty())
+    return true;
+
+  for (const WriteEpochEntry &entry : it->second) {
+    if (!rangesOverlap(start, end, entry.Start, entry.End))
+      continue;
+    if (read_has_tile && entry.HasTile && hint.TileId != entry.TileId)
+      continue;
+    if (!read_has_epoch) {
+      reason_out = "missing-read-epoch";
+      reason_errno_out = ENOKEY;
+      return false;
+    }
+    if (!entry.HasEpoch) {
+      reason_out = "missing-write-epoch";
+      reason_errno_out = ENOKEY;
+      return false;
+    }
+    if (entry.EpochId > read_epoch) {
+      reason_out = "newer-write-epoch";
+      reason_errno_out = ESTALE;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
+                                                      int target_rank,
+                                                      int &remote_handle_out) {
+  remote_handle_out = -1;
+  std::string path;
+
+  {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
+      errno = EBADF;
+      return false;
+    }
+    auto cache_it = remote_read_handle_cache.find(file_id);
+    if (cache_it != remote_read_handle_cache.end()) {
+      auto rank_it = cache_it->second.find(target_rank);
+      if (rank_it != cache_it->second.end()) {
+        remote_handle_out = rank_it->second;
+        return true;
+      }
+    }
+
+    auto path_it = file_path_map.find(file_id);
+    if (path_it == file_path_map.end()) {
+      errno = ENOENT;
+      return false;
+    }
+    path = path_it->second;
+  }
+
+  if (path.empty()) {
+    errno = ENOENT;
+    return false;
+  }
+
+  int opened_handle = -1;
+  {
+    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    if (!ompfile::mpp::openOnRank(path.c_str(), O_RDWR, 0666, target_rank,
+                                  opened_handle)) {
+      return false;
+    }
+  }
+
+  bool must_close_opened_handle = false;
+  bool closed_during_open = false;
+  {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
+      must_close_opened_handle = true;
+      closed_during_open = true;
+      errno = EBADF;
+    } else {
+      auto &rank_cache = remote_read_handle_cache[file_id];
+      auto [it, inserted] = rank_cache.try_emplace(target_rank, opened_handle);
+      if (!inserted) {
+        must_close_opened_handle = true;
+        opened_handle = it->second;
+      }
+    }
+  }
+
+  if (must_close_opened_handle) {
+    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    (void)ompfile::mpp::close(opened_handle);
+    if (closed_during_open)
+      return false;
+  }
+
+  remote_handle_out = opened_handle;
+  return true;
+}
+
+bool MPIIOBackend::readAtRemoteRankWithBytes(int file_id, int target_rank,
+                                             long offset, void *data,
+                                             size_t size, size_t &bytes_read) {
+  bytes_read = 0;
+  if (!mpp_remote_only) {
+    errno = ENOTSUP;
+    return false;
+  }
+  if (target_rank < 0) {
+    errno = EINVAL;
+    return false;
+  }
+  int remote_handle = -1;
+  if (!getOrCreateRemoteReadHandleForRank(file_id, target_rank, remote_handle))
+    return false;
+
+  remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
+  remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
+
+  bool ok = false;
+  {
+    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    ok = ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
+  }
+  if (!ok) {
+    if (errno == EBADF) {
+      const std::lock_guard<std::mutex> lock(handle_mutex);
+      auto cache_it = remote_read_handle_cache.find(file_id);
+      if (cache_it != remote_read_handle_cache.end())
+        cache_it->second.erase(target_rank);
+    }
+    return false;
+  }
+  if (bytes_read > size) {
+    errno = EPROTO;
+    return false;
+  }
+  if (bytes_read < size && data) {
+    const size_t short_bytes = size - bytes_read;
+    short_read_count.fetch_add(1, std::memory_order_relaxed);
+    short_read_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
+    std::memset(static_cast<char *>(data) + bytes_read, 0, short_bytes);
+  }
+  return true;
+}
+
+void MPIIOBackend::collectRemoteReadHandlesForClose(
+    int file_id, std::vector<int> &handles_out) {
+  handles_out.clear();
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  auto it = remote_read_handle_cache.find(file_id);
+  if (it == remote_read_handle_cache.end()) {
+    file_write_epoch_history.erase(file_id);
+    return;
+  }
+
+  for (const auto &entry : it->second)
+    handles_out.push_back(entry.second);
+  remote_read_handle_cache.erase(it);
+  file_write_epoch_history.erase(file_id);
 }
 
 uint64_t MPIIOBackend::resolveTwoPhaseKey(
@@ -1977,6 +2328,12 @@ void MPIIOBackend::reportPhase0Stats() const {
       two_phase_planner_affinity_count.load(std::memory_order_relaxed);
   const uint64_t planner_rebalanced =
       two_phase_planner_rebalanced_count.load(std::memory_order_relaxed);
+  const uint64_t planner_rebalanced_applied =
+      two_phase_planner_rebalanced_applied_count.load(
+          std::memory_order_relaxed);
+  const uint64_t planner_rebalanced_skipped =
+      two_phase_planner_rebalanced_skipped_count.load(
+          std::memory_order_relaxed);
   const uint64_t planner_scalar_fallbacks =
       two_phase_planner_scalar_fallback_count.load(std::memory_order_relaxed);
   const uint64_t planner_errors =
@@ -2022,7 +2379,8 @@ void MPIIOBackend::reportPhase0Stats() const {
          "batch_count=%llu coalesced_reads=%llu coalesced_bytes=%llu "
          "coalesced_avg_bytes=%.2f planner_batches=%llu "
          "planner_segments=%llu planner_affinity=%llu "
-         "planner_rebalanced=%llu planner_scalar_fallbacks=%llu "
+         "planner_rebalanced=%llu planner_rebalanced_applied=%llu "
+         "planner_rebalanced_skipped=%llu planner_scalar_fallbacks=%llu "
          "planner_errors=%llu cache_hits=%llu fallbacks=%llu "
          "write_batch_count=%llu coalesced_writes=%llu "
          "coalesced_write_bytes=%llu coalesced_write_avg_bytes=%.2f "
@@ -2047,10 +2405,12 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(coalesced_reads),
          static_cast<unsigned long long>(coalesced_bytes), avg_coalesced_bytes,
          static_cast<unsigned long long>(planner_batches),
-         static_cast<unsigned long long>(planner_segments),
-         static_cast<unsigned long long>(planner_affinity),
-         static_cast<unsigned long long>(planner_rebalanced),
-         static_cast<unsigned long long>(planner_scalar_fallbacks),
+          static_cast<unsigned long long>(planner_segments),
+          static_cast<unsigned long long>(planner_affinity),
+          static_cast<unsigned long long>(planner_rebalanced),
+          static_cast<unsigned long long>(planner_rebalanced_applied),
+          static_cast<unsigned long long>(planner_rebalanced_skipped),
+          static_cast<unsigned long long>(planner_scalar_fallbacks),
          static_cast<unsigned long long>(planner_errors),
          static_cast<unsigned long long>(cache_hits),
          static_cast<unsigned long long>(fallback_count),

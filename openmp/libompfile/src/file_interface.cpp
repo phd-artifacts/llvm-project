@@ -555,7 +555,16 @@ private:
       req.StreamId = hint->StreamId;
       req.TileId = hint->TileId;
     }
-    return schedRequest(req, nullptr, nullptr) || !strict_mpp_required;
+
+    std::string tracked_path;
+    uint64_t ignored_path_key = 0;
+    const bool has_path = getTrackedPath(file_handle, tracked_path, ignored_path_key);
+    if (has_path && !tracked_path.empty())
+      req.PathSize = static_cast<uint32_t>(tracked_path.size() + 1);
+
+    return schedRequest(req, has_path ? tracked_path.c_str() : nullptr,
+                        nullptr) ||
+           !strict_mpp_required;
   }
 
   bool buildWriteContext(int file_handle, long offset, size_t size,

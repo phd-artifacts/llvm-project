@@ -42,6 +42,16 @@ public:
     bool HasPathKey = false;
   };
 
+  struct WriteVersionEntry {
+    int64_t Start = 0;
+    uint64_t Size = 0;
+    uint64_t EpochId = 0;
+    uint64_t TileId = 0;
+    uint64_t Sequence = 0;
+    bool HasEpoch = false;
+    bool HasTile = false;
+  };
+
   struct BatchPlanStats {
     uint64_t Requests = 0;
     uint64_t Segments = 0;
@@ -70,6 +80,14 @@ private:
 
   static uint64_t computePathKey(std::string_view Path);
   static uint64_t parseUint64Env(const char *Name, uint64_t DefaultValue);
+  bool segmentRangesOverlap(int64_t ReadOffset, uint64_t ReadSize,
+                            int64_t WriteOffset, uint64_t WriteSize) const;
+  uint64_t nextWriteSequenceUnlocked();
+  void recordWriteVersionUnlocked(uint64_t PathKey,
+                                  const OmpFileIORequest &Request);
+  bool hasRebalanceConflictUnlocked(const OmpFileIOBatchSegment &Segment,
+                                    const char *&Reason,
+                                    int &ReasonErrno) const;
   bool isWorkerRankUnlocked(int Rank) const;
   bool isHeadnodeRequestUnlocked(int LocalRank) const;
   uint64_t minInFlightUnlocked() const;
@@ -94,10 +112,12 @@ private:
   std::unordered_map<uint64_t, OmpFileIOPlan> FlightplanTable;
   std::unordered_map<std::string, GlobalFileEntry> GlobalFileTable;
   std::unordered_map<uint64_t, int> PathAffinityTable;
+  std::unordered_map<uint64_t, std::vector<WriteVersionEntry>> PathWriteVersions;
   std::vector<HandlerInfo> Handlers;
   BatchPlanStats Stats;
   uint64_t NextGlobalFileId = 1;
   uint64_t NextHandlerTieBreaker = 0;
+  uint64_t NextWriteSequence = 1;
 };
 
 #endif // _MPI_PROXY_OMPFILE_HEADNODE_MANAGER_H_

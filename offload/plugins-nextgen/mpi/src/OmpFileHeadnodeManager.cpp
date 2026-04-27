@@ -49,6 +49,101 @@ uint64_t OmpFileHeadnodeManager::parseUint64Env(const char *Name,
   return static_cast<uint64_t>(Value);
 }
 
+bool OmpFileHeadnodeManager::segmentRangesOverlap(int64_t ReadOffset,
+                                                  uint64_t ReadSize,
+                                                  int64_t WriteOffset,
+                                                  uint64_t WriteSize) const {
+  if (ReadSize == 0 || WriteSize == 0)
+    return false;
+  if (ReadOffset < 0 || WriteOffset < 0)
+    return true;
+
+  const uint64_t ReadStart = static_cast<uint64_t>(ReadOffset);
+  const uint64_t WriteStart = static_cast<uint64_t>(WriteOffset);
+  if (ReadStart > std::numeric_limits<uint64_t>::max() - ReadSize)
+    return true;
+  if (WriteStart > std::numeric_limits<uint64_t>::max() - WriteSize)
+    return true;
+
+  const uint64_t ReadEnd = ReadStart + ReadSize;
+  const uint64_t WriteEnd = WriteStart + WriteSize;
+  return ReadStart < WriteEnd && WriteStart < ReadEnd;
+}
+
+uint64_t OmpFileHeadnodeManager::nextWriteSequenceUnlocked() {
+  return NextWriteSequence++;
+}
+
+void OmpFileHeadnodeManager::recordWriteVersionUnlocked(
+    uint64_t PathKey, const OmpFileIORequest &Request) {
+  if (PathKey == 0 || Request.Size == 0)
+    return;
+
+  WriteVersionEntry Entry{};
+  Entry.Start = Request.Offset;
+  Entry.Size = Request.Size;
+  Entry.Sequence = nextWriteSequenceUnlocked();
+  Entry.HasEpoch = (Request.HintFlags & OMPFILE_IO_HINT_HAS_EPOCH) != 0;
+  Entry.EpochId = Entry.HasEpoch ? Request.EpochId : 0;
+  Entry.HasTile = (Request.HintFlags & OMPFILE_IO_HINT_HAS_TILE) != 0;
+  Entry.TileId = Entry.HasTile ? Request.TileId : 0;
+
+  auto &Versions = PathWriteVersions[PathKey];
+  Versions.push_back(Entry);
+  constexpr size_t MaxHistoryPerPath = 8192;
+  if (Versions.size() > MaxHistoryPerPath)
+    Versions.erase(Versions.begin(), Versions.begin() + (Versions.size() - MaxHistoryPerPath));
+}
+
+bool OmpFileHeadnodeManager::hasRebalanceConflictUnlocked(
+    const OmpFileIOBatchSegment &Segment, const char *&Reason,
+    int &ReasonErrno) const {
+  Reason = "none";
+  ReasonErrno = 0;
+
+  if (Segment.PathKey == 0) {
+    Reason = "missing-path-key";
+    ReasonErrno = ENOKEY;
+    return true;
+  }
+
+  auto It = PathWriteVersions.find(Segment.PathKey);
+  if (It == PathWriteVersions.end() || It->second.empty())
+    return false;
+
+  const bool ReadHasEpoch = (Segment.SegmentFlags & OMPFILE_IO_HINT_HAS_EPOCH) != 0;
+  const bool ReadHasTile = (Segment.SegmentFlags & OMPFILE_IO_HINT_HAS_TILE) != 0;
+  const uint64_t ReadEpoch = Segment.EpochId;
+
+  for (const WriteVersionEntry &Write : It->second) {
+    if (!segmentRangesOverlap(Segment.Offset, Segment.Size, Write.Start,
+                              Write.Size)) {
+      continue;
+    }
+
+    if (ReadHasTile && Write.HasTile && Segment.TileId != Write.TileId)
+      continue;
+
+    if (!ReadHasEpoch) {
+      Reason = "read-missing-epoch";
+      ReasonErrno = ENOKEY;
+      return true;
+    }
+    if (!Write.HasEpoch) {
+      Reason = "write-missing-epoch";
+      ReasonErrno = ENOKEY;
+      return true;
+    }
+    if (Write.EpochId > ReadEpoch) {
+      Reason = "newer-write-epoch";
+      ReasonErrno = ESTALE;
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void OmpFileHeadnodeManager::initialize(int NewWorldSize, int NewHeadnodeRank) {
   const std::lock_guard<std::mutex> Lock(Mutex);
   if (Initialized)
@@ -56,8 +151,9 @@ void OmpFileHeadnodeManager::initialize(int NewWorldSize, int NewHeadnodeRank) {
 
   WorldSize = std::max(NewWorldSize, 1);
   HeadnodeRank = NewHeadnodeRank;
-  MaxAffinityLoadSkew =
-      parseUint64Env("LIBOMPFILE_SCHED_MAX_AFFINITY_LOAD_SKEW", 2);
+  MaxAffinityLoadSkew = parseUint64Env(
+      "LIBOMPFILE_SCHED_MAX_AFFINITY_LOAD_SKEW",
+      std::numeric_limits<uint64_t>::max());
   BatchStatsReportEvery =
       std::max<uint64_t>(1, parseUint64Env("LIBOMPFILE_SCHED_STATS_REPORT_EVERY",
                                            128));
@@ -189,7 +285,9 @@ int OmpFileHeadnodeManager::pickRankForPathKeyUnlocked(uint64_t PathKey,
   const bool CanMeasureLoads =
       PreferredLoad != std::numeric_limits<uint64_t>::max() &&
       LeastLoad != std::numeric_limits<uint64_t>::max();
-  if (CanMeasureLoads && PreferredRank != LeastLoadedRank &&
+  if (CanMeasureLoads &&
+      MaxAffinityLoadSkew != std::numeric_limits<uint64_t>::max() &&
+      PreferredRank != LeastLoadedRank &&
       PreferredLoad > (LeastLoad + MaxAffinityLoadSkew)) {
     It->second = LeastLoadedRank;
     Rebalanced = true;
@@ -251,11 +349,26 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
 
     bool AffinityHit = false;
     bool Rebalanced = false;
-    HandlerRank = pickRankForPathKeyUnlocked(PathKey, /*HasPathKey=*/true,
-                                             Request.ClientRank, AffinityHit,
-                                             Rebalanced);
-    Entry.PreferredAggregatorRank = HandlerRank;
-    registerPathAffinityUnlocked(PathKey, HandlerRank);
+    if (Inserted) {
+      HandlerRank = pickRankForPathKeyUnlocked(PathKey, /*HasPathKey=*/true,
+                                               Request.ClientRank, AffinityHit,
+                                               Rebalanced);
+      Entry.PreferredAggregatorRank = HandlerRank;
+      registerPathAffinityUnlocked(PathKey, HandlerRank);
+    } else {
+      // Multiple concurrent OPEN requests for the same path must keep routing to
+      // one stable aggregator rank. Rebalancing this path during OPEN can split
+      // handles across workers and break read-after-write ordering assumptions.
+      if (isWorkerRankUnlocked(Entry.PreferredAggregatorRank)) {
+        HandlerRank = Entry.PreferredAggregatorRank;
+        AffinityHit = true;
+      } else {
+        HandlerRank = pickLeastLoadedRankUnlocked(Request.ClientRank);
+        Entry.PreferredAggregatorRank = HandlerRank;
+        registerPathAffinityUnlocked(PathKey, HandlerRank);
+        Rebalanced = true;
+      }
+    }
 
     if (AffinityHit)
       Plan.PlanFlags |= OMPFILE_BATCH_PLAN_FILE_AFFINITY;
@@ -263,6 +376,38 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
       Plan.PlanFlags |= OMPFILE_BATCH_PLAN_REBALANCED;
 
     Plan.RemoteHandle = static_cast<int32_t>(Entry.GlobalFileId & 0x7fffffffU);
+  } else if (Request.Op == OmpFileIOOp::PWRITE) {
+    uint64_t PathKey = 0;
+    bool HasPathKey = false;
+    if (Request.PathSize > 0 && Path) {
+      std::string_view PathView(Path,
+                                Request.PathSize > 0 ? Request.PathSize - 1 : 0);
+      if (!PathView.empty()) {
+        PathKey = computePathKey(PathView);
+        HasPathKey = true;
+      }
+    }
+
+    if (HasPathKey) {
+      recordWriteVersionUnlocked(PathKey, Request);
+      fprintf(stderr,
+              "[ompfile-mpp][sched] write-version path_key=%llu offset=%lld "
+              "size=%llu has_epoch=%d epoch=%llu has_tile=%d tile=%llu\n",
+              static_cast<unsigned long long>(PathKey),
+              static_cast<long long>(Request.Offset),
+              static_cast<unsigned long long>(Request.Size),
+              static_cast<int>((Request.HintFlags & OMPFILE_IO_HINT_HAS_EPOCH) != 0),
+              static_cast<unsigned long long>(Request.EpochId),
+              static_cast<int>((Request.HintFlags & OMPFILE_IO_HINT_HAS_TILE) != 0),
+              static_cast<unsigned long long>(Request.TileId));
+    } else {
+      fprintf(stderr,
+              "[ompfile-mpp][sched] write-version skipped-metadata file=%d "
+              "offset=%lld size=%llu has_path=%d\n",
+              Request.FileHandle, static_cast<long long>(Request.Offset),
+              static_cast<unsigned long long>(Request.Size),
+              static_cast<int>(Request.PathSize > 0 && Path));
+    }
   }
 
   if (!isWorkerRankUnlocked(HandlerRank)) {
@@ -358,6 +503,14 @@ bool OmpFileHeadnodeManager::planBatchRequest(
         Segment.PathKey, Segment.PathKey != 0, Segment.ClientRank, AffinityHit,
         Rebalanced);
 
+    const char *RebalanceReason = "none";
+    int RebalanceErrno = 0;
+    bool RebalanceBlocked = false;
+    if (Rebalanced) {
+      RebalanceBlocked =
+          hasRebalanceConflictUnlocked(Segment, RebalanceReason, RebalanceErrno);
+    }
+
     if (!isWorkerRankUnlocked(HandlerRank)) {
       Entry.Status = -1;
       Entry.Errno = EHOSTUNREACH;
@@ -372,6 +525,22 @@ bool OmpFileHeadnodeManager::planBatchRequest(
       if (Rebalanced) {
         Entry.PlanFlags |= OMPFILE_BATCH_PLAN_REBALANCED;
         ++Rebalances;
+        if (RebalanceBlocked) {
+          Entry.Status = -1;
+          Entry.Errno = RebalanceErrno != 0 ? RebalanceErrno : ESTALE;
+          fprintf(stderr,
+                  "[ompfile-mpp][sched] rebalanced-plan blocked segment=%llu "
+                  "path_key=%llu offset=%lld size=%llu reason=%s errno=%d "
+                  "read_epoch=%llu read_has_epoch=%d\n",
+                  static_cast<unsigned long long>(Segment.SegmentId),
+                  static_cast<unsigned long long>(Segment.PathKey),
+                  static_cast<long long>(Segment.Offset),
+                  static_cast<unsigned long long>(Segment.Size),
+                  RebalanceReason, Entry.Errno,
+                  static_cast<unsigned long long>(Segment.EpochId),
+                  static_cast<int>((Segment.SegmentFlags &
+                                    OMPFILE_IO_HINT_HAS_EPOCH) != 0));
+        }
       }
     }
 
