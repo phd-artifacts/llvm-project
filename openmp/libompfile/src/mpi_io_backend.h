@@ -3,6 +3,7 @@
 
 #include "abstract_backend.h"
 #include "ompfile_sched.h"
+#include <cerrno>
 #include <condition_variable>
 #include <atomic>
 #include <cstddef> // for size_t
@@ -147,6 +148,23 @@ public:
   MPIIOBackend();
   ~MPIIOBackend();
 
+  void recordWriteEpochForTesting(int file_id, long offset, size_t size,
+                                  const ompfile::OmpFileIOHint &hint) {
+    recordWriteEpochForContext(file_id, offset, size, hint);
+  }
+  bool canApplyRebalancedReadForTesting(const ompfile::OmpFileIOHint &hint,
+                                        int file_id, long start, size_t size,
+                                        const char *&reason_out,
+                                        int &reason_errno_out) {
+    return canApplyRebalancedRead(hint, file_id, start, size, reason_out,
+                                  reason_errno_out);
+  }
+  static bool plannerStatusForcesFallbackForTesting(
+      int planner_errno, const char *&reason_out, int &reason_errno_out) {
+    return plannerStatusForcesFallback(planner_errno, reason_out,
+                                       reason_errno_out);
+  }
+
   int open(const char *filename) override;
   int openWithPlan(const char *filename,
                    const ompfile::OmpFileIOPlan *plan) override;
@@ -214,6 +232,19 @@ private:
   bool readAtRemoteRankWithBytes(int file_id, int target_rank, long offset,
                                  void *data, size_t size,
                                  size_t &bytes_read);
+  static bool plannerStatusForcesFallback(int planner_errno,
+                                          const char *&reason_out,
+                                          int &reason_errno_out) {
+    reason_out = "none";
+    reason_errno_out = 0;
+    if (planner_errno == ESTALE || planner_errno == ENOKEY ||
+        planner_errno == EAGAIN) {
+      reason_out = "scheduler-version-mismatch";
+      reason_errno_out = planner_errno;
+      return true;
+    }
+    return false;
+  }
   void collectRemoteReadHandlesForClose(int file_id,
                                         std::vector<int> &handles_out);
   bool tryServeTwoPhaseReadCache(uint64_t key, long offset, void *data,

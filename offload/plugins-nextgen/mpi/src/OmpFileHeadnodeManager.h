@@ -61,6 +61,10 @@ public:
 
   static OmpFileHeadnodeManager &instance();
 
+  static uint64_t computePathKeyForTesting(std::string_view Path) {
+    return computePathKey(Path);
+  }
+
   void initialize(int WorldSize, int HeadnodeRank);
 
   OmpFileIOPlan planRequest(const OmpFileIORequest &Request, const char *Path,
@@ -71,6 +75,10 @@ public:
                         OmpFileIOBatchPlan &Plan,
                         std::vector<OmpFileIOBatchPlanEntry> &Entries,
                         int LocalRank);
+
+  bool classifyRebalanceConflictForTesting(const OmpFileIOBatchSegment &Segment,
+                                           const char *&Reason,
+                                           int &ReasonErrno);
 
   void completeRequest(const OmpFileIOPlan &Plan);
   std::vector<HandlerInfo> snapshotHandlersForTesting();
@@ -90,6 +98,7 @@ private:
                                     int &ReasonErrno) const;
   bool isWorkerRankUnlocked(int Rank) const;
   bool isHeadnodeRequestUnlocked(int LocalRank) const;
+  uint64_t effectiveLoadUnlocked(const HandlerInfo &H) const;
   uint64_t minInFlightUnlocked() const;
   uint64_t inFlightForRankUnlocked(int Rank) const;
   void bumpHandlerLoadUnlocked(int Rank);
@@ -108,6 +117,7 @@ private:
   int HeadnodeRank = 0;
   uint64_t MaxAffinityLoadSkew = 2;
   uint64_t BatchStatsReportEvery = 128;
+  bool UsePlannedLoadForSkew = false;
 
   std::unordered_map<uint64_t, OmpFileIOPlan> FlightplanTable;
   std::unordered_map<std::string, GlobalFileEntry> GlobalFileTable;

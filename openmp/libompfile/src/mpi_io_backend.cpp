@@ -1186,6 +1186,7 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     size_t bytes_read = 0;
 
     int rc = -1;
+    bool remote_rebalanced_ok = false;
     int read_errno = 0;
     const int file_id = item.Requests.front()->FileHandle;
     if (item.PlannerRebalanced && item.PlannedAggregatorRank >= 0) {
@@ -1193,9 +1194,13 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       int fallback_errno = 0;
       bool eligible_for_rebalance = false;
       if (item.PlannerForceFallback) {
-        fallback_reason = "scheduler-version-mismatch";
-        fallback_errno =
+        const int planner_errno =
             item.PlannerFallbackErrno != 0 ? item.PlannerFallbackErrno : ESTALE;
+        if (!plannerStatusForcesFallback(planner_errno, fallback_reason,
+                                         fallback_errno)) {
+          fallback_reason = "scheduler-version-mismatch";
+          fallback_errno = planner_errno;
+        }
       } else {
         eligible_for_rebalance =
             canApplyRebalancedRead(item.Requests.front()->Hint, file_id,
@@ -1204,31 +1209,33 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       }
 
       if (eligible_for_rebalance) {
-        rc = readAtRemoteRankWithBytes(file_id, item.PlannedAggregatorRank,
-                                       item.Start, buffer.data(), read_size,
-                                       bytes_read);
+        remote_rebalanced_ok =
+            readAtRemoteRankWithBytes(file_id, item.PlannedAggregatorRank,
+                                      item.Start, buffer.data(), read_size,
+                                      bytes_read);
+        rc = remote_rebalanced_ok ? 0 : -1;
       } else {
         rc = -1;
         read_errno = fallback_errno != 0 ? fallback_errno : EAGAIN;
         two_phase_planner_rebalanced_skipped_count.fetch_add(
             1, std::memory_order_relaxed);
-        io_trace("MPIIOBackend::processTwoPhaseGroup rebalanced segment fallback "
-                 "file=%d target_rank=%d offset=%ld size=%zu reason=%s errno=%d\n",
-                 file_id, item.PlannedAggregatorRank, item.Start, read_size,
-                 fallback_reason, read_errno);
+        io_log("Rebalanced segment fallback file=%d target_rank=%d offset=%ld "
+               "size=%zu reason=%s errno=%d\n",
+               file_id, item.PlannedAggregatorRank, item.Start, read_size,
+               fallback_reason, read_errno);
       }
 
-      if (rc == 0) {
+      if (remote_rebalanced_ok) {
         two_phase_planner_rebalanced_applied_count.fetch_add(
             1, std::memory_order_relaxed);
       } else if (eligible_for_rebalance) {
-        read_errno = errno;
+        read_errno = errno != 0 ? errno : EIO;
         two_phase_planner_rebalanced_skipped_count.fetch_add(
             1, std::memory_order_relaxed);
-        io_trace("MPIIOBackend::processTwoPhaseGroup rebalanced segment fallback "
-                 "file=%d target_rank=%d offset=%ld size=%zu reason=remote-read-fail errno=%d\n",
-                 file_id, item.PlannedAggregatorRank, item.Start, read_size,
-                 read_errno);
+        io_log("Rebalanced segment fallback file=%d target_rank=%d offset=%ld "
+               "size=%zu reason=remote-read-fail errno=%d\n",
+               file_id, item.PlannedAggregatorRank, item.Start, read_size,
+               read_errno);
       }
     }
 
@@ -2005,27 +2012,43 @@ bool MPIIOBackend::readAtRemoteRankWithBytes(int file_id, int target_rank,
     errno = EINVAL;
     return false;
   }
-  int remote_handle = -1;
-  if (!getOrCreateRemoteReadHandleForRank(file_id, target_rank, remote_handle))
-    return false;
-
-  remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
-  remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
-
-  bool ok = false;
-  {
-    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-    ok = ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
-  }
-  if (!ok) {
-    if (errno == EBADF) {
+  int last_errno = 0;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (attempt > 0) {
       const std::lock_guard<std::mutex> lock(handle_mutex);
       auto cache_it = remote_read_handle_cache.find(file_id);
       if (cache_it != remote_read_handle_cache.end())
         cache_it->second.erase(target_rank);
     }
-    return false;
+
+    int remote_handle = -1;
+    if (!getOrCreateRemoteReadHandleForRank(file_id, target_rank,
+                                            remote_handle)) {
+      last_errno = errno;
+      continue;
+    }
+
+    remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
+    remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
+
+    bytes_read = 0;
+    bool ok = false;
+    {
+      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      ok = ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
+    }
+    if (ok)
+      goto pread_ok;
+
+    last_errno = errno;
+    if (last_errno != 0 && last_errno != EBADF)
+      break;
   }
+
+  errno = last_errno != 0 ? last_errno : EIO;
+  return false;
+
+pread_ok:
   if (bytes_read > size) {
     errno = EPROTO;
     return false;

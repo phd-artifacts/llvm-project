@@ -125,12 +125,12 @@ bool OmpFileHeadnodeManager::hasRebalanceConflictUnlocked(
       continue;
 
     if (!ReadHasEpoch) {
-      Reason = "read-missing-epoch";
+      Reason = "missing-read-epoch";
       ReasonErrno = ENOKEY;
       return true;
     }
     if (!Write.HasEpoch) {
-      Reason = "write-missing-epoch";
+      Reason = "missing-write-epoch";
       ReasonErrno = ENOKEY;
       return true;
     }
@@ -157,8 +157,17 @@ void OmpFileHeadnodeManager::initialize(int NewWorldSize, int NewHeadnodeRank) {
   BatchStatsReportEvery =
       std::max<uint64_t>(1, parseUint64Env("LIBOMPFILE_SCHED_STATS_REPORT_EVERY",
                                            128));
+  UsePlannedLoadForSkew =
+      parseUint64Env("LIBOMPFILE_SCHED_USE_PLANNED_LOAD_FOR_SKEW", 0) != 0;
   ensureHandlersUnlocked();
   Initialized = true;
+}
+
+bool OmpFileHeadnodeManager::classifyRebalanceConflictForTesting(
+    const OmpFileIOBatchSegment &Segment, const char *&Reason,
+    int &ReasonErrno) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  return hasRebalanceConflictUnlocked(Segment, Reason, ReasonErrno);
 }
 
 bool OmpFileHeadnodeManager::isWorkerRankUnlocked(int Rank) const {
@@ -198,9 +207,14 @@ uint64_t OmpFileHeadnodeManager::minInFlightUnlocked() const {
 uint64_t OmpFileHeadnodeManager::inFlightForRankUnlocked(int Rank) const {
   for (const HandlerInfo &H : Handlers) {
     if (H.Rank == Rank)
-      return H.InFlight;
+      return effectiveLoadUnlocked(H);
   }
   return std::numeric_limits<uint64_t>::max();
+}
+
+uint64_t OmpFileHeadnodeManager::effectiveLoadUnlocked(
+    const HandlerInfo &H) const {
+  return UsePlannedLoadForSkew ? H.PlannedTotal : H.InFlight;
 }
 
 void OmpFileHeadnodeManager::bumpHandlerLoadUnlocked(int Rank) {
@@ -245,8 +259,9 @@ int OmpFileHeadnodeManager::pickLeastLoadedRankUnlocked(int ClientRank) {
   for (size_t I = 0; I < Handlers.size(); ++I) {
     const size_t Idx = (StartIdx + I) % Handlers.size();
     const HandlerInfo &H = Handlers[Idx];
-    if (H.InFlight < BestLoad) {
-      BestLoad = H.InFlight;
+    const uint64_t Load = effectiveLoadUnlocked(H);
+    if (Load < BestLoad) {
+      BestLoad = Load;
       BestRank = H.Rank;
     }
   }
