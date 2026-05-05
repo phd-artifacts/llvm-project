@@ -1035,34 +1035,6 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
            coalesced[dbg_i].Requests.size());
   }
 
-  auto computeTargetReadSize = [this](long start, long end) -> size_t {
-    assert(start >= 0 && end >= start &&
-           "Coalesced read range must be monotonic.");
-    size_t read_size = static_cast<size_t>(end - start);
-    if (two_phase_sieve_bytes == 0)
-      return read_size;
-
-    uint64_t target_size = std::max<uint64_t>(
-        static_cast<uint64_t>(read_size), two_phase_sieve_bytes);
-    if (two_phase_max_batch_bytes > 0) {
-      target_size = std::min<uint64_t>(target_size, two_phase_max_batch_bytes);
-    }
-    const uint64_t size_t_max = static_cast<uint64_t>(
-        std::numeric_limits<size_t>::max());
-    target_size = std::min<uint64_t>(target_size, size_t_max);
-    const uint64_t long_max = static_cast<uint64_t>(
-        std::numeric_limits<long>::max());
-    const uint64_t start_u64 = static_cast<uint64_t>(start);
-    if (start_u64 >= long_max)
-      return read_size;
-    const uint64_t max_extent = long_max - start_u64;
-    target_size = std::min<uint64_t>(target_size, max_extent);
-
-    if (target_size < static_cast<uint64_t>(read_size))
-      return read_size;
-    return static_cast<size_t>(target_size);
-  };
-
   ompfile::OmpFileIOBatchRequest batch_request{};
   batch_request.AbiVersion = ompfile::OMPFILE_SCHED_BATCH_ABI_VERSION;
   batch_request.SegmentCount = static_cast<uint32_t>(coalesced.size());
@@ -1081,7 +1053,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     segment.ClientRank = item.Requests.front()->ClientRank;
     segment.Offset = item.Start;
     segment.Size = static_cast<uint64_t>(
-        computeTargetReadSize(item.Start, item.End));
+        computeTwoPhaseTargetReadSize(item.Start, item.End,
+                                      item.Requests.size(), mpp_remote_only,
+                                      two_phase_sieve_bytes,
+                                      two_phase_max_batch_bytes));
     segment.PathKey = item.Requests.front()->HasPathKey
                           ? item.Requests.front()->PathKey
                           : static_cast<uint64_t>(0);
@@ -1179,7 +1154,9 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       continue;
     }
 
-    const size_t read_size = computeTargetReadSize(item.Start, item.End);
+    const size_t read_size = computeTwoPhaseTargetReadSize(
+        item.Start, item.End, item.Requests.size(), mpp_remote_only,
+        two_phase_sieve_bytes, two_phase_max_batch_bytes);
     two_phase_coalesced_bytes_total.fetch_add(read_size,
                                               std::memory_order_relaxed);
     std::vector<char> buffer(read_size);
@@ -1217,6 +1194,8 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       } else {
         rc = -1;
         read_errno = fallback_errno != 0 ? fallback_errno : EAGAIN;
+        two_phase_planner_rebalanced_conflict_count.fetch_add(
+            1, std::memory_order_relaxed);
         two_phase_planner_rebalanced_skipped_count.fetch_add(
             1, std::memory_order_relaxed);
         io_log("Rebalanced segment fallback file=%d target_rank=%d offset=%ld "
@@ -1900,19 +1879,36 @@ bool MPIIOBackend::canApplyRebalancedRead(
 
   const std::lock_guard<std::mutex> lock(handle_mutex);
   auto it = file_write_epoch_history.find(file_id);
-  if (it == file_write_epoch_history.end() || it->second.empty())
+  if (it == file_write_epoch_history.end() || it->second.empty()) {
+    const bool has_file_metadata =
+        logical_handle_set.find(file_id) != logical_handle_set.end() ||
+        file_path_map.find(file_id) != file_path_map.end() ||
+        file_path_key_map.find(file_id) != file_path_key_map.end();
+    if (!has_file_metadata) {
+      reason_out = "missing-file-metadata";
+      reason_errno_out = ENOKEY;
+      return false;
+    }
     return true;
+  }
+
+  if (mpp_remote_only) {
+    reason_out = "remote-writable-file";
+    reason_errno_out = ENOKEY;
+    return false;
+  }
+
+  if (!read_has_epoch) {
+    reason_out = "missing-read-epoch";
+    reason_errno_out = ENOKEY;
+    return false;
+  }
 
   for (const WriteEpochEntry &entry : it->second) {
     if (!rangesOverlap(start, end, entry.Start, entry.End))
       continue;
     if (read_has_tile && entry.HasTile && hint.TileId != entry.TileId)
       continue;
-    if (!read_has_epoch) {
-      reason_out = "missing-read-epoch";
-      reason_errno_out = ENOKEY;
-      return false;
-    }
     if (!entry.HasEpoch) {
       reason_out = "missing-write-epoch";
       reason_errno_out = ENOKEY;
@@ -2307,6 +2303,41 @@ uint64_t MPIIOBackend::parseUint64Env(const char *name, uint64_t default_value) 
   return static_cast<uint64_t>(value);
 }
 
+size_t MPIIOBackend::computeTwoPhaseTargetReadSize(
+    long start, long end, size_t request_count, bool remote_only,
+    uint64_t sieve_bytes, uint64_t max_batch_bytes) {
+  assert(start >= 0 && end >= start &&
+         "Coalesced read range must be monotonic.");
+  const size_t read_size = static_cast<size_t>(end - start);
+  if (sieve_bytes == 0)
+    return read_size;
+
+  // Remote-only MPP intentionally does not cache two-phase overreads across
+  // proxies, so data sieving isolated requests only adds transfer volume.
+  if (remote_only && request_count <= 1)
+    return read_size;
+
+  uint64_t target_size =
+      std::max<uint64_t>(static_cast<uint64_t>(read_size), sieve_bytes);
+  if (max_batch_bytes > 0)
+    target_size = std::min<uint64_t>(target_size, max_batch_bytes);
+
+  const uint64_t size_t_max =
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max());
+  target_size = std::min<uint64_t>(target_size, size_t_max);
+  const uint64_t long_max =
+      static_cast<uint64_t>(std::numeric_limits<long>::max());
+  const uint64_t start_u64 = static_cast<uint64_t>(start);
+  if (start_u64 >= long_max)
+    return read_size;
+  const uint64_t max_extent = long_max - start_u64;
+  target_size = std::min<uint64_t>(target_size, max_extent);
+
+  if (target_size < static_cast<uint64_t>(read_size))
+    return read_size;
+  return static_cast<size_t>(target_size);
+}
+
 bool MPIIOBackend::shouldReportStats() {
   return parseBoolEnv("LIBOMPFILE_OPT_STATS", false);
 }
@@ -2357,6 +2388,9 @@ void MPIIOBackend::reportPhase0Stats() const {
   const uint64_t planner_rebalanced_skipped =
       two_phase_planner_rebalanced_skipped_count.load(
           std::memory_order_relaxed);
+  const uint64_t planner_rebalanced_conflicts =
+      two_phase_planner_rebalanced_conflict_count.load(
+          std::memory_order_relaxed);
   const uint64_t planner_scalar_fallbacks =
       two_phase_planner_scalar_fallback_count.load(std::memory_order_relaxed);
   const uint64_t planner_errors =
@@ -2403,8 +2437,10 @@ void MPIIOBackend::reportPhase0Stats() const {
          "coalesced_avg_bytes=%.2f planner_batches=%llu "
          "planner_segments=%llu planner_affinity=%llu "
          "planner_rebalanced=%llu planner_rebalanced_applied=%llu "
-         "planner_rebalanced_skipped=%llu planner_scalar_fallbacks=%llu "
-         "planner_errors=%llu cache_hits=%llu fallbacks=%llu "
+         "planner_rebalanced_skipped=%llu "
+         "planner_rebalanced_conflicts=%llu "
+         "planner_scalar_fallbacks=%llu planner_errors=%llu "
+         "cache_hits=%llu fallbacks=%llu "
          "write_batch_count=%llu coalesced_writes=%llu "
          "coalesced_write_bytes=%llu coalesced_write_avg_bytes=%.2f "
          "write_batch_saved_events=%llu write_batch_failures=%llu "
@@ -2430,10 +2466,11 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(planner_batches),
           static_cast<unsigned long long>(planner_segments),
           static_cast<unsigned long long>(planner_affinity),
-          static_cast<unsigned long long>(planner_rebalanced),
-          static_cast<unsigned long long>(planner_rebalanced_applied),
-          static_cast<unsigned long long>(planner_rebalanced_skipped),
-          static_cast<unsigned long long>(planner_scalar_fallbacks),
+           static_cast<unsigned long long>(planner_rebalanced),
+           static_cast<unsigned long long>(planner_rebalanced_applied),
+           static_cast<unsigned long long>(planner_rebalanced_skipped),
+           static_cast<unsigned long long>(planner_rebalanced_conflicts),
+           static_cast<unsigned long long>(planner_scalar_fallbacks),
          static_cast<unsigned long long>(planner_errors),
          static_cast<unsigned long long>(cache_hits),
          static_cast<unsigned long long>(fallback_count),

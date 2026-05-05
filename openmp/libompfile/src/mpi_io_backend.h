@@ -90,6 +90,7 @@ private:
   std::atomic<uint64_t> two_phase_planner_rebalanced_count{0};
   std::atomic<uint64_t> two_phase_planner_rebalanced_applied_count{0};
   std::atomic<uint64_t> two_phase_planner_rebalanced_skipped_count{0};
+  std::atomic<uint64_t> two_phase_planner_rebalanced_conflict_count{0};
   std::atomic<uint64_t> two_phase_planner_scalar_fallback_count{0};
   std::atomic<uint64_t> two_phase_planner_error_count{0};
   std::atomic<uint64_t> two_phase_cache_hit_count{0};
@@ -164,6 +165,42 @@ public:
     return plannerStatusForcesFallback(planner_errno, reason_out,
                                        reason_errno_out);
   }
+  static size_t computeTwoPhaseTargetReadSizeForTesting(
+      long start, long end, size_t request_count, bool remote_only,
+      uint64_t sieve_bytes, uint64_t max_batch_bytes) {
+    return computeTwoPhaseTargetReadSize(start, end, request_count, remote_only,
+                                         sieve_bytes, max_batch_bytes);
+  }
+  struct PlannerCounterSnapshotForTesting {
+    uint64_t Rebalanced = 0;
+    uint64_t Applied = 0;
+    uint64_t Skipped = 0;
+    uint64_t Conflicts = 0;
+    uint64_t Errors = 0;
+  };
+  void addPlannerCountersForTesting(uint64_t rebalanced, uint64_t applied,
+                                    uint64_t skipped, uint64_t conflicts,
+                                    uint64_t errors) {
+    two_phase_planner_rebalanced_count.fetch_add(rebalanced,
+                                                 std::memory_order_relaxed);
+    two_phase_planner_rebalanced_applied_count.fetch_add(
+        applied, std::memory_order_relaxed);
+    two_phase_planner_rebalanced_skipped_count.fetch_add(
+        skipped, std::memory_order_relaxed);
+    two_phase_planner_rebalanced_conflict_count.fetch_add(
+        conflicts, std::memory_order_relaxed);
+    two_phase_planner_error_count.fetch_add(errors, std::memory_order_relaxed);
+  }
+  PlannerCounterSnapshotForTesting plannerCountersForTesting() const {
+    return {two_phase_planner_rebalanced_count.load(std::memory_order_relaxed),
+            two_phase_planner_rebalanced_applied_count.load(
+                std::memory_order_relaxed),
+            two_phase_planner_rebalanced_skipped_count.load(
+                std::memory_order_relaxed),
+            two_phase_planner_rebalanced_conflict_count.load(
+                std::memory_order_relaxed),
+            two_phase_planner_error_count.load(std::memory_order_relaxed)};
+  }
 
   int open(const char *filename) override;
   int openWithPlan(const char *filename,
@@ -207,6 +244,11 @@ private:
   static const char *twoPhasePolicyToString(TwoPhasePolicy policy);
   static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
+  static size_t computeTwoPhaseTargetReadSize(long start, long end,
+                                             size_t request_count,
+                                             bool remote_only,
+                                             uint64_t sieve_bytes,
+                                             uint64_t max_batch_bytes);
   static uint64_t computePathKey(const char *path);
   static uint64_t mixHintIntoKey(uint64_t base_key,
                                  const ompfile::OmpFileIOHint &hint);
@@ -237,9 +279,18 @@ private:
                                           int &reason_errno_out) {
     reason_out = "none";
     reason_errno_out = 0;
-    if (planner_errno == ESTALE || planner_errno == ENOKEY ||
-        planner_errno == EAGAIN) {
-      reason_out = "scheduler-version-mismatch";
+    if (planner_errno == ESTALE) {
+      reason_out = "planner-stale-version";
+      reason_errno_out = planner_errno;
+      return true;
+    }
+    if (planner_errno == ENOKEY) {
+      reason_out = "planner-missing-metadata";
+      reason_errno_out = planner_errno;
+      return true;
+    }
+    if (planner_errno == EAGAIN) {
+      reason_out = "planner-owner-retry";
       reason_errno_out = planner_errno;
       return true;
     }
