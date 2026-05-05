@@ -310,7 +310,12 @@ struct EventTy {
     /// Coroutines should return llvm::Error::success() or an appropriate error
     /// message.
     void return_value(llvm::Error &&GivenError) noexcept {
-      CoroutineError = std::move(GivenError);
+      if (GivenError) {
+        CoroutineError = std::move(GivenError);
+      } else {
+        llvm::consumeError(std::move(GivenError));
+        CoroutineError = std::nullopt;
+      }
     }
 
     /// Any unhandled exception should create an externally visible error.
@@ -369,7 +374,7 @@ struct EventTy {
   bool empty() const;
 
   /// Get the returned error from the coroutine.
-  llvm::Error getError() const;
+  llvm::Error getError();
 
   /// EventTy instances are also awaitables. This means one can link multiple
   /// EventTy together by calling the co_await operator on one another. For this
@@ -401,7 +406,9 @@ struct EventTy {
     auto &Error = getHandle().promise().CoroutineError;
 
     if (Error) {
-      return std::move(*Error);
+      llvm::Error Result = std::move(*Error);
+      Error.reset();
+      return Result;
     }
 
     return llvm::Error::success();

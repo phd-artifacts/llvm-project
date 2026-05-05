@@ -209,10 +209,13 @@ bool EventTy::done() const { return getHandle().done(); }
 bool EventTy::empty() const { return !getHandle(); }
 
 /// Get the coroutine error from the Handle.
-llvm::Error EventTy::getError() const {
+llvm::Error EventTy::getError() {
   auto &Error = getHandle().promise().CoroutineError;
-  if (Error)
-    return std::move(*Error);
+  if (Error) {
+    llvm::Error Result = std::move(*Error);
+    Error.reset();
+    return Result;
+  }
 
   return llvm::Error::success();
 }
