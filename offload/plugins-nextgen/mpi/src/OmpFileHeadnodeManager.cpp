@@ -159,8 +159,30 @@ void OmpFileHeadnodeManager::initialize(int NewWorldSize, int NewHeadnodeRank) {
                                            128));
   UsePlannedLoadForSkew =
       parseUint64Env("LIBOMPFILE_SCHED_USE_PLANNED_LOAD_FOR_SKEW", 0) != 0;
+  SpreadSamePathOpens =
+      parseUint64Env("LIBOMPFILE_MPP_OPEN_SPREAD", 0) != 0;
   ensureHandlersUnlocked();
   Initialized = true;
+}
+
+void OmpFileHeadnodeManager::resetForTesting() {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  Initialized = false;
+  WorldSize = 1;
+  HeadnodeRank = 0;
+  MaxAffinityLoadSkew = 2;
+  BatchStatsReportEvery = 128;
+  UsePlannedLoadForSkew = false;
+  SpreadSamePathOpens = false;
+  FlightplanTable.clear();
+  GlobalFileTable.clear();
+  PathAffinityTable.clear();
+  PathWriteVersions.clear();
+  Handlers.clear();
+  Stats = {};
+  NextGlobalFileId = 1;
+  NextHandlerTieBreaker = 0;
+  NextWriteSequence = 1;
 }
 
 bool OmpFileHeadnodeManager::classifyRebalanceConflictForTesting(
@@ -371,17 +393,26 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
       Entry.PreferredAggregatorRank = HandlerRank;
       registerPathAffinityUnlocked(PathKey, HandlerRank);
     } else {
-      // Multiple concurrent OPEN requests for the same path must keep routing to
-      // one stable aggregator rank. Rebalancing this path during OPEN can split
-      // handles across workers and break read-after-write ordering assumptions.
-      if (isWorkerRankUnlocked(Entry.PreferredAggregatorRank)) {
-        HandlerRank = Entry.PreferredAggregatorRank;
-        AffinityHit = true;
-      } else {
+      if (SpreadSamePathOpens) {
         HandlerRank = pickLeastLoadedRankUnlocked(Request.ClientRank);
-        Entry.PreferredAggregatorRank = HandlerRank;
-        registerPathAffinityUnlocked(PathKey, HandlerRank);
-        Rebalanced = true;
+        if (isWorkerRankUnlocked(Entry.PreferredAggregatorRank) &&
+            HandlerRank == Entry.PreferredAggregatorRank) {
+          AffinityHit = true;
+        } else {
+          Rebalanced = isWorkerRankUnlocked(Entry.PreferredAggregatorRank);
+        }
+      } else {
+        // Multiple concurrent OPEN requests for the same path must keep routing
+        // to one stable aggregator rank unless the explicit spread policy is on.
+        if (isWorkerRankUnlocked(Entry.PreferredAggregatorRank)) {
+          HandlerRank = Entry.PreferredAggregatorRank;
+          AffinityHit = true;
+        } else {
+          HandlerRank = pickLeastLoadedRankUnlocked(Request.ClientRank);
+          Entry.PreferredAggregatorRank = HandlerRank;
+          registerPathAffinityUnlocked(PathKey, HandlerRank);
+          Rebalanced = true;
+        }
       }
     }
 

@@ -82,6 +82,7 @@ public:
 
   void completeRequest(const OmpFileIOPlan &Plan);
   std::vector<HandlerInfo> snapshotHandlersForTesting();
+  void resetForTesting();
 
 private:
   OmpFileHeadnodeManager() = default;
@@ -118,6 +119,7 @@ private:
   uint64_t MaxAffinityLoadSkew = 2;
   uint64_t BatchStatsReportEvery = 128;
   bool UsePlannedLoadForSkew = false;
+  bool SpreadSamePathOpens = false;
 
   std::unordered_map<uint64_t, OmpFileIOPlan> FlightplanTable;
   std::unordered_map<std::string, GlobalFileEntry> GlobalFileTable;
