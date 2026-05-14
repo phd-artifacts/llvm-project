@@ -854,6 +854,8 @@ int MPIIOBackend::readAtTwoPhase(
   std::vector<TwoPhaseReadRequest *> batch;
   std::unique_lock<std::mutex> lock(two_phase_mutex);
   const size_t queue_size_before = two_phase_queue.size();
+  updateAtomicMax(two_phase_queue_max_depth,
+                  static_cast<uint64_t>(queue_size_before + 1));
   io_trace("MPIIOBackend::readAtTwoPhase enqueue req=%llu file=%d offset=%ld "
            "size=%zu queue_before=%zu in_progress=%d\n",
            static_cast<unsigned long long>(request.DebugRequestId),
@@ -865,6 +867,7 @@ int MPIIOBackend::readAtTwoPhase(
   while (!request.Done) {
     if (!two_phase_batch_in_progress) {
       two_phase_batch_in_progress = true;
+      two_phase_leader_turn_count.fetch_add(1, std::memory_order_relaxed);
       io_trace("MPIIOBackend::readAtTwoPhase leader req=%llu queue_size=%zu "
                "window_us=%llu\n",
                static_cast<unsigned long long>(request.DebugRequestId),
@@ -872,8 +875,19 @@ int MPIIOBackend::readAtTwoPhase(
                static_cast<unsigned long long>(two_phase_window_us));
 
       if (two_phase_window_us > 0) {
+        const auto window_wait_begin = std::chrono::steady_clock::now();
         two_phase_queue_cv.wait_for(lock,
                                     std::chrono::microseconds(two_phase_window_us));
+        const auto window_wait_end = std::chrono::steady_clock::now();
+        const auto window_wait_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                window_wait_end - window_wait_begin)
+                .count();
+        if (window_wait_us > 0) {
+          two_phase_window_wait_us_total.fetch_add(
+              static_cast<uint64_t>(window_wait_us),
+              std::memory_order_relaxed);
+        }
       }
 
       while (!two_phase_queue.empty()) {
@@ -886,19 +900,41 @@ int MPIIOBackend::readAtTwoPhase(
                batch.size(), two_phase_queue.size());
 
       lock.unlock();
+      const auto batch_exec_begin = std::chrono::steady_clock::now();
       processTwoPhaseBatch(batch);
+      const auto batch_exec_end = std::chrono::steady_clock::now();
+      const auto batch_exec_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              batch_exec_end - batch_exec_begin)
+              .count();
+      if (batch_exec_us > 0) {
+        two_phase_batch_exec_us_total.fetch_add(
+            static_cast<uint64_t>(batch_exec_us), std::memory_order_relaxed);
+      }
       batch.clear();
       lock.lock();
 
       two_phase_batch_in_progress = false;
       two_phase_queue_cv.notify_all();
     } else {
+      two_phase_follower_wait_count.fetch_add(1, std::memory_order_relaxed);
       io_trace("MPIIOBackend::readAtTwoPhase follower wait req=%llu "
                "queue_size=%zu\n",
                static_cast<unsigned long long>(request.DebugRequestId),
                two_phase_queue.size());
+      const auto follower_wait_begin = std::chrono::steady_clock::now();
       two_phase_queue_cv.wait(
           lock, [this, &request] { return request.Done || !two_phase_batch_in_progress; });
+      const auto follower_wait_end = std::chrono::steady_clock::now();
+      const auto follower_wait_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              follower_wait_end - follower_wait_begin)
+              .count();
+      if (follower_wait_us > 0) {
+        two_phase_follower_wait_us_total.fetch_add(
+            static_cast<uint64_t>(follower_wait_us),
+            std::memory_order_relaxed);
+      }
     }
   }
 
@@ -906,6 +942,10 @@ int MPIIOBackend::readAtTwoPhase(
   const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
                            done_ts - enqueue_ts)
                            .count();
+  if (wait_us > 0) {
+    two_phase_request_wait_us_total.fetch_add(static_cast<uint64_t>(wait_us),
+                                              std::memory_order_relaxed);
+  }
   if (request.Status != 0) {
     errno = request.Errno;
     io_trace("MPIIOBackend::readAtTwoPhase done req=%llu status=%d errno=%d "
@@ -1183,6 +1223,26 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
             canApplyRebalancedRead(item.Requests.front()->Hint, file_id,
                                    item.Start, read_size, fallback_reason,
                                    fallback_errno);
+        if (eligible_for_rebalance && mpp_remote_only) {
+          bool has_writable_context = false;
+          {
+            const std::lock_guard<std::mutex> lock(handle_mutex);
+            auto history_it = file_write_epoch_history.find(file_id);
+            const bool has_local_write_history =
+                history_it != file_write_epoch_history.end() &&
+                !history_it->second.empty();
+            const bool has_file_metadata =
+                logical_handle_set.find(file_id) != logical_handle_set.end() ||
+                file_path_map.find(file_id) != file_path_map.end() ||
+                file_path_key_map.find(file_id) != file_path_key_map.end();
+            has_writable_context = has_file_metadata || has_local_write_history;
+          }
+          if (has_writable_context) {
+            eligible_for_rebalance = false;
+            fallback_reason = "remote-only-writable-file";
+            fallback_errno = EAGAIN;
+          }
+        }
       }
 
       if (eligible_for_rebalance) {
@@ -1552,16 +1612,31 @@ int MPIIOBackend::writeAtBatched(int file_id, long offset, const void *data,
     std::memcpy(request.Data.data(), data, size);
 
   std::vector<WriteBatchRequest *> batch;
+  const auto enqueue_ts = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lock(write_batch_mutex);
+  const size_t queue_size_before = write_batch_queue.size();
+  updateAtomicMax(write_queue_max_depth,
+                  static_cast<uint64_t>(queue_size_before + 1));
   write_batch_queue.push_back(&request);
   write_batch_queue_cv.notify_all();
 
   while (!request.Done) {
     if (!write_batch_in_progress) {
       write_batch_in_progress = true;
+      write_leader_turn_count.fetch_add(1, std::memory_order_relaxed);
       if (write_batch_window_us > 0) {
+        const auto window_wait_begin = std::chrono::steady_clock::now();
         write_batch_queue_cv.wait_for(
             lock, std::chrono::microseconds(write_batch_window_us));
+        const auto window_wait_end = std::chrono::steady_clock::now();
+        const auto window_wait_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                window_wait_end - window_wait_begin)
+                .count();
+        if (window_wait_us > 0) {
+          write_window_wait_us_total.fetch_add(
+              static_cast<uint64_t>(window_wait_us), std::memory_order_relaxed);
+        }
       }
 
       while (!write_batch_queue.empty()) {
@@ -1570,17 +1645,47 @@ int MPIIOBackend::writeAtBatched(int file_id, long offset, const void *data,
       }
 
       lock.unlock();
+      const auto batch_exec_begin = std::chrono::steady_clock::now();
       processWriteBatch(batch);
+      const auto batch_exec_end = std::chrono::steady_clock::now();
+      const auto batch_exec_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              batch_exec_end - batch_exec_begin)
+              .count();
+      if (batch_exec_us > 0) {
+        write_batch_exec_us_total.fetch_add(static_cast<uint64_t>(batch_exec_us),
+                                            std::memory_order_relaxed);
+      }
       batch.clear();
       lock.lock();
 
       write_batch_in_progress = false;
       write_batch_queue_cv.notify_all();
     } else {
+      write_follower_wait_count.fetch_add(1, std::memory_order_relaxed);
+      const auto follower_wait_begin = std::chrono::steady_clock::now();
       write_batch_queue_cv.wait(lock, [this, &request] {
         return request.Done || !write_batch_in_progress;
       });
+      const auto follower_wait_end = std::chrono::steady_clock::now();
+      const auto follower_wait_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              follower_wait_end - follower_wait_begin)
+              .count();
+      if (follower_wait_us > 0) {
+        write_follower_wait_us_total.fetch_add(
+            static_cast<uint64_t>(follower_wait_us), std::memory_order_relaxed);
+      }
     }
+  }
+
+  const auto done_ts = std::chrono::steady_clock::now();
+  const auto request_wait_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(done_ts - enqueue_ts)
+          .count();
+  if (request_wait_us > 0) {
+    write_request_wait_us_total.fetch_add(
+        static_cast<uint64_t>(request_wait_us), std::memory_order_relaxed);
   }
 
   if (request.Status != 0) {
@@ -1859,6 +1964,20 @@ bool MPIIOBackend::canApplyRebalancedRead(
     const char *&reason_out, int &reason_errno_out) {
   reason_out = "none";
   reason_errno_out = 0;
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  auto it = file_write_epoch_history.find(file_id);
+  const bool has_local_write_history =
+      (it != file_write_epoch_history.end()) && !it->second.empty();
+  const bool has_file_metadata =
+      logical_handle_set.find(file_id) != logical_handle_set.end() ||
+      file_path_map.find(file_id) != file_path_map.end() ||
+      file_path_key_map.find(file_id) != file_path_key_map.end();
+  if (mpp_remote_only && (has_file_metadata || has_local_write_history)) {
+    reason_out = "remote-only-writable-file";
+    reason_errno_out = EAGAIN;
+    return false;
+  }
+
   if (size == 0)
     return true;
 
@@ -1877,25 +1996,13 @@ bool MPIIOBackend::canApplyRebalancedRead(
       (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0;
   const uint64_t read_epoch = hint.EpochId;
 
-  const std::lock_guard<std::mutex> lock(handle_mutex);
-  auto it = file_write_epoch_history.find(file_id);
   if (it == file_write_epoch_history.end() || it->second.empty()) {
-    const bool has_file_metadata =
-        logical_handle_set.find(file_id) != logical_handle_set.end() ||
-        file_path_map.find(file_id) != file_path_map.end() ||
-        file_path_key_map.find(file_id) != file_path_key_map.end();
     if (!has_file_metadata) {
       reason_out = "missing-file-metadata";
       reason_errno_out = ENOKEY;
       return false;
     }
     return true;
-  }
-
-  if (mpp_remote_only) {
-    reason_out = "remote-writable-file";
-    reason_errno_out = ENOKEY;
-    return false;
   }
 
   if (!read_has_epoch) {
@@ -2303,6 +2410,16 @@ uint64_t MPIIOBackend::parseUint64Env(const char *name, uint64_t default_value) 
   return static_cast<uint64_t>(value);
 }
 
+void MPIIOBackend::updateAtomicMax(std::atomic<uint64_t> &counter,
+                                   uint64_t candidate) {
+  uint64_t observed = counter.load(std::memory_order_relaxed);
+  while (candidate > observed &&
+         !counter.compare_exchange_weak(observed, candidate,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+  }
+}
+
 size_t MPIIOBackend::computeTwoPhaseTargetReadSize(
     long start, long end, size_t request_count, bool remote_only,
     uint64_t sieve_bytes, uint64_t max_batch_bytes) {
@@ -2407,6 +2524,34 @@ void MPIIOBackend::reportPhase0Stats() const {
       write_batch_saved_events.load(std::memory_order_relaxed);
   const uint64_t write_batch_failures =
       write_batch_failure_count.load(std::memory_order_relaxed);
+  const uint64_t two_phase_queue_depth_max =
+      two_phase_queue_max_depth.load(std::memory_order_relaxed);
+  const uint64_t two_phase_leader_turns =
+      two_phase_leader_turn_count.load(std::memory_order_relaxed);
+  const uint64_t two_phase_follower_waits =
+      two_phase_follower_wait_count.load(std::memory_order_relaxed);
+  const uint64_t two_phase_follower_wait_us =
+      two_phase_follower_wait_us_total.load(std::memory_order_relaxed);
+  const uint64_t two_phase_window_wait_us =
+      two_phase_window_wait_us_total.load(std::memory_order_relaxed);
+  const uint64_t two_phase_batch_exec_us =
+      two_phase_batch_exec_us_total.load(std::memory_order_relaxed);
+  const uint64_t two_phase_request_wait_us =
+      two_phase_request_wait_us_total.load(std::memory_order_relaxed);
+  const uint64_t write_queue_depth_max =
+      write_queue_max_depth.load(std::memory_order_relaxed);
+  const uint64_t write_leader_turns =
+      write_leader_turn_count.load(std::memory_order_relaxed);
+  const uint64_t write_follower_waits =
+      write_follower_wait_count.load(std::memory_order_relaxed);
+  const uint64_t write_follower_wait_us =
+      write_follower_wait_us_total.load(std::memory_order_relaxed);
+  const uint64_t write_window_wait_us =
+      write_window_wait_us_total.load(std::memory_order_relaxed);
+  const uint64_t write_batch_exec_us =
+      write_batch_exec_us_total.load(std::memory_order_relaxed);
+  const uint64_t write_request_wait_us =
+      write_request_wait_us_total.load(std::memory_order_relaxed);
 
   const double avg_remote_bytes =
       remote_events == 0 ? 0.0
@@ -2444,6 +2589,14 @@ void MPIIOBackend::reportPhase0Stats() const {
          "write_batch_count=%llu coalesced_writes=%llu "
          "coalesced_write_bytes=%llu coalesced_write_avg_bytes=%.2f "
          "write_batch_saved_events=%llu write_batch_failures=%llu "
+         "two_phase_queue_max_depth=%llu two_phase_leader_turns=%llu "
+         "two_phase_follower_waits=%llu two_phase_follower_wait_us=%llu "
+         "two_phase_window_wait_us=%llu two_phase_batch_exec_us=%llu "
+         "two_phase_request_wait_us=%llu "
+         "write_queue_max_depth=%llu write_leader_turns=%llu "
+         "write_follower_waits=%llu write_follower_wait_us=%llu "
+         "write_window_wait_us=%llu write_batch_exec_us=%llu "
+         "write_request_wait_us=%llu "
          "write_batch_enabled=%d "
          "two_phase_enabled=%d "
          "two_phase_active=%d two_phase_policy=%s window_us=%llu "
@@ -2480,6 +2633,20 @@ void MPIIOBackend::reportPhase0Stats() const {
          avg_coalesced_write_bytes,
          static_cast<unsigned long long>(write_saved_events),
          static_cast<unsigned long long>(write_batch_failures),
+         static_cast<unsigned long long>(two_phase_queue_depth_max),
+         static_cast<unsigned long long>(two_phase_leader_turns),
+         static_cast<unsigned long long>(two_phase_follower_waits),
+         static_cast<unsigned long long>(two_phase_follower_wait_us),
+         static_cast<unsigned long long>(two_phase_window_wait_us),
+         static_cast<unsigned long long>(two_phase_batch_exec_us),
+         static_cast<unsigned long long>(two_phase_request_wait_us),
+         static_cast<unsigned long long>(write_queue_depth_max),
+         static_cast<unsigned long long>(write_leader_turns),
+         static_cast<unsigned long long>(write_follower_waits),
+         static_cast<unsigned long long>(write_follower_wait_us),
+         static_cast<unsigned long long>(write_window_wait_us),
+         static_cast<unsigned long long>(write_batch_exec_us),
+         static_cast<unsigned long long>(write_request_wait_us),
          static_cast<int>(write_batch_enabled),
          static_cast<int>(two_phase_enabled),
          static_cast<int>(isTwoPhaseActive()),

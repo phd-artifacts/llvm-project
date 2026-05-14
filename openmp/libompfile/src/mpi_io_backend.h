@@ -101,6 +101,20 @@ private:
   std::atomic<uint64_t> write_batch_coalesced_bytes_total{0};
   std::atomic<uint64_t> write_batch_saved_events{0};
   std::atomic<uint64_t> write_batch_failure_count{0};
+  std::atomic<uint64_t> two_phase_queue_max_depth{0};
+  std::atomic<uint64_t> two_phase_leader_turn_count{0};
+  std::atomic<uint64_t> two_phase_follower_wait_count{0};
+  std::atomic<uint64_t> two_phase_follower_wait_us_total{0};
+  std::atomic<uint64_t> two_phase_window_wait_us_total{0};
+  std::atomic<uint64_t> two_phase_batch_exec_us_total{0};
+  std::atomic<uint64_t> two_phase_request_wait_us_total{0};
+  std::atomic<uint64_t> write_queue_max_depth{0};
+  std::atomic<uint64_t> write_leader_turn_count{0};
+  std::atomic<uint64_t> write_follower_wait_count{0};
+  std::atomic<uint64_t> write_follower_wait_us_total{0};
+  std::atomic<uint64_t> write_window_wait_us_total{0};
+  std::atomic<uint64_t> write_batch_exec_us_total{0};
+  std::atomic<uint64_t> write_request_wait_us_total{0};
   std::atomic<uint64_t> write_batch_request_id{1};
   bool two_phase_batch_in_progress = false;
   bool write_batch_in_progress = false;
@@ -160,6 +174,14 @@ public:
     return canApplyRebalancedRead(hint, file_id, start, size, reason_out,
                                   reason_errno_out);
   }
+  void rememberWritableFileContextForTesting(int file_id, const char *path) {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    logical_handle_set.insert(file_id);
+    if (path && path[0] != '\0') {
+      file_path_map[file_id] = path;
+      file_path_key_map[file_id] = computePathKey(path);
+    }
+  }
   static bool plannerStatusForcesFallbackForTesting(
       int planner_errno, const char *&reason_out, int &reason_errno_out) {
     return plannerStatusForcesFallback(planner_errno, reason_out,
@@ -200,6 +222,70 @@ public:
             two_phase_planner_rebalanced_conflict_count.load(
                 std::memory_order_relaxed),
             two_phase_planner_error_count.load(std::memory_order_relaxed)};
+  }
+  struct QueueCoordinationCountersForTesting {
+    uint64_t TwoPhaseQueueMaxDepth = 0;
+    uint64_t TwoPhaseLeaderTurns = 0;
+    uint64_t TwoPhaseFollowerWaitCount = 0;
+    uint64_t TwoPhaseFollowerWaitUsTotal = 0;
+    uint64_t TwoPhaseWindowWaitUsTotal = 0;
+    uint64_t TwoPhaseBatchExecUsTotal = 0;
+    uint64_t TwoPhaseRequestWaitUsTotal = 0;
+    uint64_t WriteQueueMaxDepth = 0;
+    uint64_t WriteLeaderTurns = 0;
+    uint64_t WriteFollowerWaitCount = 0;
+    uint64_t WriteFollowerWaitUsTotal = 0;
+    uint64_t WriteWindowWaitUsTotal = 0;
+    uint64_t WriteBatchExecUsTotal = 0;
+    uint64_t WriteRequestWaitUsTotal = 0;
+  };
+  void addQueueCoordinationCountersForTesting(
+      const QueueCoordinationCountersForTesting &delta) {
+    two_phase_queue_max_depth.store(delta.TwoPhaseQueueMaxDepth,
+                                    std::memory_order_relaxed);
+    two_phase_leader_turn_count.fetch_add(delta.TwoPhaseLeaderTurns,
+                                          std::memory_order_relaxed);
+    two_phase_follower_wait_count.fetch_add(delta.TwoPhaseFollowerWaitCount,
+                                            std::memory_order_relaxed);
+    two_phase_follower_wait_us_total.fetch_add(delta.TwoPhaseFollowerWaitUsTotal,
+                                               std::memory_order_relaxed);
+    two_phase_window_wait_us_total.fetch_add(delta.TwoPhaseWindowWaitUsTotal,
+                                             std::memory_order_relaxed);
+    two_phase_batch_exec_us_total.fetch_add(delta.TwoPhaseBatchExecUsTotal,
+                                            std::memory_order_relaxed);
+    two_phase_request_wait_us_total.fetch_add(delta.TwoPhaseRequestWaitUsTotal,
+                                              std::memory_order_relaxed);
+    write_queue_max_depth.store(delta.WriteQueueMaxDepth,
+                                std::memory_order_relaxed);
+    write_leader_turn_count.fetch_add(delta.WriteLeaderTurns,
+                                      std::memory_order_relaxed);
+    write_follower_wait_count.fetch_add(delta.WriteFollowerWaitCount,
+                                        std::memory_order_relaxed);
+    write_follower_wait_us_total.fetch_add(delta.WriteFollowerWaitUsTotal,
+                                           std::memory_order_relaxed);
+    write_window_wait_us_total.fetch_add(delta.WriteWindowWaitUsTotal,
+                                         std::memory_order_relaxed);
+    write_batch_exec_us_total.fetch_add(delta.WriteBatchExecUsTotal,
+                                        std::memory_order_relaxed);
+    write_request_wait_us_total.fetch_add(delta.WriteRequestWaitUsTotal,
+                                          std::memory_order_relaxed);
+  }
+  QueueCoordinationCountersForTesting
+  queueCoordinationCountersForTesting() const {
+    return {two_phase_queue_max_depth.load(std::memory_order_relaxed),
+            two_phase_leader_turn_count.load(std::memory_order_relaxed),
+            two_phase_follower_wait_count.load(std::memory_order_relaxed),
+            two_phase_follower_wait_us_total.load(std::memory_order_relaxed),
+            two_phase_window_wait_us_total.load(std::memory_order_relaxed),
+            two_phase_batch_exec_us_total.load(std::memory_order_relaxed),
+            two_phase_request_wait_us_total.load(std::memory_order_relaxed),
+            write_queue_max_depth.load(std::memory_order_relaxed),
+            write_leader_turn_count.load(std::memory_order_relaxed),
+            write_follower_wait_count.load(std::memory_order_relaxed),
+            write_follower_wait_us_total.load(std::memory_order_relaxed),
+            write_window_wait_us_total.load(std::memory_order_relaxed),
+            write_batch_exec_us_total.load(std::memory_order_relaxed),
+            write_request_wait_us_total.load(std::memory_order_relaxed)};
   }
 
   int open(const char *filename) override;
@@ -244,9 +330,11 @@ private:
   static const char *twoPhasePolicyToString(TwoPhasePolicy policy);
   static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
+  static void updateAtomicMax(std::atomic<uint64_t> &counter,
+                              uint64_t candidate);
   static size_t computeTwoPhaseTargetReadSize(long start, long end,
-                                             size_t request_count,
-                                             bool remote_only,
+                                              size_t request_count,
+                                              bool remote_only,
                                              uint64_t sieve_bytes,
                                              uint64_t max_batch_bytes);
   static uint64_t computePathKey(const char *path);
