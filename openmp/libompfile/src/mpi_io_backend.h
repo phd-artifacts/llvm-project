@@ -55,6 +55,7 @@ private:
   bool strict_mpp_required = false;
   bool strict_mpp_init_failed = false;
   mutable std::atomic<bool> strict_failure_logged{false};
+  bool writable_read_rebalance_enabled = false;
   TwoPhasePolicy two_phase_policy = TwoPhasePolicy::Disabled;
   bool two_phase_enabled = false;
   TwoPhasePolicy write_batch_policy = TwoPhasePolicy::Disabled;
@@ -93,6 +94,16 @@ private:
   std::atomic<uint64_t> two_phase_planner_rebalanced_conflict_count{0};
   std::atomic<uint64_t> two_phase_planner_scalar_fallback_count{0};
   std::atomic<uint64_t> two_phase_planner_error_count{0};
+  std::atomic<uint64_t> writable_read_rebalance_candidate_count{0};
+  std::atomic<uint64_t> writable_read_rebalance_eligible_count{0};
+  std::atomic<uint64_t> writable_read_rebalance_applied_count{0};
+  std::atomic<uint64_t> writable_read_rebalance_blocked_count{0};
+  std::atomic<uint64_t> writable_read_rebalance_blocked_disabled_count{0};
+  std::atomic<uint64_t> writable_read_rebalance_blocked_missing_metadata_count{0};
+  std::atomic<uint64_t> writable_read_rebalance_blocked_stale_metadata_count{0};
+  std::atomic<uint64_t> writable_read_rebalance_blocked_unsafe_overlap_count{0};
+  std::atomic<uint64_t>
+      writable_read_rebalance_blocked_invalid_destination_count{0};
   std::atomic<uint64_t> two_phase_cache_hit_count{0};
   std::atomic<uint64_t> two_phase_planner_batch_id{1};
   std::atomic<uint64_t> two_phase_request_id{1};
@@ -200,6 +211,17 @@ public:
     uint64_t Conflicts = 0;
     uint64_t Errors = 0;
   };
+  struct WritableReadRebalanceCountersForTesting {
+    uint64_t Candidates = 0;
+    uint64_t Eligible = 0;
+    uint64_t Applied = 0;
+    uint64_t Blocked = 0;
+    uint64_t BlockedDisabled = 0;
+    uint64_t BlockedMissingMetadata = 0;
+    uint64_t BlockedStaleMetadata = 0;
+    uint64_t BlockedUnsafeOverlap = 0;
+    uint64_t BlockedInvalidDestination = 0;
+  };
   void addPlannerCountersForTesting(uint64_t rebalanced, uint64_t applied,
                                     uint64_t skipped, uint64_t conflicts,
                                     uint64_t errors) {
@@ -222,6 +244,27 @@ public:
             two_phase_planner_rebalanced_conflict_count.load(
                 std::memory_order_relaxed),
             two_phase_planner_error_count.load(std::memory_order_relaxed)};
+  }
+  WritableReadRebalanceCountersForTesting
+  writableReadRebalanceCountersForTesting() const {
+    return {writable_read_rebalance_candidate_count.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_eligible_count.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_applied_count.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_blocked_count.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_blocked_disabled_count.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_blocked_missing_metadata_count.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_blocked_stale_metadata_count.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_blocked_unsafe_overlap_count.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_blocked_invalid_destination_count.load(
+                std::memory_order_relaxed)};
   }
   struct QueueCoordinationCountersForTesting {
     uint64_t TwoPhaseQueueMaxDepth = 0;
@@ -357,6 +400,7 @@ private:
                               long start, size_t size,
                               const char *&reason_out,
                               int &reason_errno_out);
+  void noteWritableReadRebalanceBlocked(const char *reason);
   bool getOrCreateRemoteReadHandleForRank(int file_id, int target_rank,
                                           int &remote_handle_out);
   bool readAtRemoteRankWithBytes(int file_id, int target_rank, long offset,

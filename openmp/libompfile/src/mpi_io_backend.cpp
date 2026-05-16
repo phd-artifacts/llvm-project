@@ -52,6 +52,8 @@ MPIIOBackend::MPIIOBackend() {
 
   mpp_requested = mpp_open_enabled || mpp_io_enabled;
   mpp_remote_only = mpp_open_enabled && mpp_io_enabled;
+  writable_read_rebalance_enabled =
+      parseBoolEnv("LIBOMPFILE_OPT_WRITABLE_READ_REBALANCE", false);
   allow_fallback = parseBoolEnv("LIBOMPFILE_ALLOWFALLBACK", false);
   strict_mpp_required = mpp_requested && !allow_fallback;
 
@@ -131,7 +133,8 @@ MPIIOBackend::MPIIOBackend() {
   io_log("Two-phase guard config: policy=%s enabled=%d window_us=%llu "
          "max_batch_bytes=%llu sieve_bytes=%llu write_batch_policy=%s "
          "write_batch_enabled=%d write_batch_window_us=%llu "
-         "write_batch_max_batch_bytes=%llu scheduler=%s remote_only=%d\n",
+         "write_batch_max_batch_bytes=%llu scheduler=%s remote_only=%d "
+         "writable_read_rebalance=%d\n",
          twoPhasePolicyToString(two_phase_policy),
          static_cast<int>(two_phase_enabled),
          static_cast<unsigned long long>(two_phase_window_us),
@@ -142,7 +145,8 @@ MPIIOBackend::MPIIOBackend() {
          static_cast<unsigned long long>(write_batch_window_us),
          static_cast<unsigned long long>(write_batch_max_batch_bytes),
          scheduler_env ? scheduler_env : "(unset)",
-         static_cast<int>(mpp_remote_only));
+         static_cast<int>(mpp_remote_only),
+         static_cast<int>(writable_read_rebalance_enabled));
 
   if (isTwoPhaseActive()) {
     io_log("Two-phase batching active (leader/follower mode).\n");
@@ -1223,26 +1227,6 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
             canApplyRebalancedRead(item.Requests.front()->Hint, file_id,
                                    item.Start, read_size, fallback_reason,
                                    fallback_errno);
-        if (eligible_for_rebalance && mpp_remote_only) {
-          bool has_writable_context = false;
-          {
-            const std::lock_guard<std::mutex> lock(handle_mutex);
-            auto history_it = file_write_epoch_history.find(file_id);
-            const bool has_local_write_history =
-                history_it != file_write_epoch_history.end() &&
-                !history_it->second.empty();
-            const bool has_file_metadata =
-                logical_handle_set.find(file_id) != logical_handle_set.end() ||
-                file_path_map.find(file_id) != file_path_map.end() ||
-                file_path_key_map.find(file_id) != file_path_key_map.end();
-            has_writable_context = has_file_metadata || has_local_write_history;
-          }
-          if (has_writable_context) {
-            eligible_for_rebalance = false;
-            fallback_reason = "remote-only-writable-file";
-            fallback_errno = EAGAIN;
-          }
-        }
       }
 
       if (eligible_for_rebalance) {
@@ -1267,6 +1251,23 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       if (remote_rebalanced_ok) {
         two_phase_planner_rebalanced_applied_count.fetch_add(
             1, std::memory_order_relaxed);
+        bool count_writable_read_applied = false;
+        if (mpp_remote_only) {
+          const std::lock_guard<std::mutex> lock(handle_mutex);
+          auto it = file_write_epoch_history.find(file_id);
+          const bool has_local_write_history =
+              it != file_write_epoch_history.end() && !it->second.empty();
+          const bool has_file_metadata =
+              logical_handle_set.find(file_id) != logical_handle_set.end() ||
+              file_path_map.find(file_id) != file_path_map.end() ||
+              file_path_key_map.find(file_id) != file_path_key_map.end();
+          count_writable_read_applied =
+              has_file_metadata || has_local_write_history;
+        }
+        if (count_writable_read_applied) {
+          writable_read_rebalance_applied_count.fetch_add(
+              1, std::memory_order_relaxed);
+        }
       } else if (eligible_for_rebalance) {
         read_errno = errno != 0 ? errno : EIO;
         two_phase_planner_rebalanced_skipped_count.fetch_add(
@@ -1959,6 +1960,35 @@ void MPIIOBackend::recordWriteEpochForContext(
   }
 }
 
+void MPIIOBackend::noteWritableReadRebalanceBlocked(const char *reason) {
+  writable_read_rebalance_blocked_count.fetch_add(1,
+                                                  std::memory_order_relaxed);
+  if (!reason || std::strcmp(reason, "remote-only-writable-file") == 0) {
+    writable_read_rebalance_blocked_disabled_count.fetch_add(
+        1, std::memory_order_relaxed);
+    return;
+  }
+  if (std::strcmp(reason, "missing-file-metadata") == 0 ||
+      std::strcmp(reason, "missing-read-epoch") == 0 ||
+      std::strcmp(reason, "missing-write-epoch") == 0) {
+    writable_read_rebalance_blocked_missing_metadata_count.fetch_add(
+        1, std::memory_order_relaxed);
+    return;
+  }
+  if (std::strcmp(reason, "newer-write-epoch") == 0) {
+    writable_read_rebalance_blocked_stale_metadata_count.fetch_add(
+        1, std::memory_order_relaxed);
+    return;
+  }
+  if (std::strcmp(reason, "invalid-read-range") == 0) {
+    writable_read_rebalance_blocked_invalid_destination_count.fetch_add(
+        1, std::memory_order_relaxed);
+    return;
+  }
+  writable_read_rebalance_blocked_unsafe_overlap_count.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
 bool MPIIOBackend::canApplyRebalancedRead(
     const ompfile::OmpFileIOHint &hint, int file_id, long start, size_t size,
     const char *&reason_out, int &reason_errno_out) {
@@ -1972,21 +2002,36 @@ bool MPIIOBackend::canApplyRebalancedRead(
       logical_handle_set.find(file_id) != logical_handle_set.end() ||
       file_path_map.find(file_id) != file_path_map.end() ||
       file_path_key_map.find(file_id) != file_path_key_map.end();
-  if (mpp_remote_only && (has_file_metadata || has_local_write_history)) {
-    reason_out = "remote-only-writable-file";
-    reason_errno_out = EAGAIN;
-    return false;
+  const bool has_remote_only_writable_context =
+      mpp_remote_only && (has_file_metadata || has_local_write_history);
+  if (has_remote_only_writable_context) {
+    writable_read_rebalance_candidate_count.fetch_add(
+        1, std::memory_order_relaxed);
   }
-
-  if (size == 0)
-    return true;
 
   if (start < 0 ||
       size > static_cast<size_t>(std::numeric_limits<long>::max()) ||
       start > std::numeric_limits<long>::max() - static_cast<long>(size)) {
     reason_out = "invalid-read-range";
     reason_errno_out = EINVAL;
+    if (has_remote_only_writable_context)
+      noteWritableReadRebalanceBlocked(reason_out);
     return false;
+  }
+
+  if (has_remote_only_writable_context && !writable_read_rebalance_enabled) {
+    reason_out = "remote-only-writable-file";
+    reason_errno_out = EAGAIN;
+    noteWritableReadRebalanceBlocked(reason_out);
+    return false;
+  }
+
+  if (size == 0) {
+    if (has_remote_only_writable_context) {
+      writable_read_rebalance_eligible_count.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+    return true;
   }
 
   const long end = start + static_cast<long>(size);
@@ -2000,34 +2045,64 @@ bool MPIIOBackend::canApplyRebalancedRead(
     if (!has_file_metadata) {
       reason_out = "missing-file-metadata";
       reason_errno_out = ENOKEY;
+      if (has_remote_only_writable_context)
+        noteWritableReadRebalanceBlocked(reason_out);
       return false;
+    }
+    if (has_remote_only_writable_context) {
+      writable_read_rebalance_eligible_count.fetch_add(
+          1, std::memory_order_relaxed);
     }
     return true;
   }
 
-  if (!read_has_epoch) {
-    reason_out = "missing-read-epoch";
-    reason_errno_out = ENOKEY;
-    return false;
-  }
-
+  bool saw_overlap = false;
+  bool saw_missing_write_epoch = false;
+  bool saw_newer_write_epoch = false;
   for (const WriteEpochEntry &entry : it->second) {
     if (!rangesOverlap(start, end, entry.Start, entry.End))
       continue;
     if (read_has_tile && entry.HasTile && hint.TileId != entry.TileId)
       continue;
+    saw_overlap = true;
     if (!entry.HasEpoch) {
-      reason_out = "missing-write-epoch";
-      reason_errno_out = ENOKEY;
-      return false;
+      saw_missing_write_epoch = true;
+      continue;
     }
-    if (entry.EpochId > read_epoch) {
-      reason_out = "newer-write-epoch";
-      reason_errno_out = ESTALE;
-      return false;
-    }
+    if (read_has_epoch && entry.EpochId > read_epoch)
+      saw_newer_write_epoch = true;
   }
 
+  if (saw_overlap) {
+    if (!read_has_epoch) {
+      reason_out = "missing-read-epoch";
+      reason_errno_out = ENOKEY;
+    } else if (saw_missing_write_epoch) {
+      reason_out = "missing-write-epoch";
+      reason_errno_out = ENOKEY;
+    } else if (saw_newer_write_epoch) {
+      reason_out = "newer-write-epoch";
+      reason_errno_out = ESTALE;
+    } else {
+      reason_out = "unsafe-write-overlap";
+      reason_errno_out = EAGAIN;
+    }
+    if (has_remote_only_writable_context)
+      noteWritableReadRebalanceBlocked(reason_out);
+    return false;
+  }
+
+  if (has_remote_only_writable_context && has_local_write_history) {
+    reason_out = "unsafe-write-history";
+    reason_errno_out = EAGAIN;
+    noteWritableReadRebalanceBlocked(reason_out);
+    return false;
+  }
+
+  if (has_remote_only_writable_context) {
+    writable_read_rebalance_eligible_count.fetch_add(
+        1, std::memory_order_relaxed);
+  }
   return true;
 }
 
@@ -2508,6 +2583,29 @@ void MPIIOBackend::reportPhase0Stats() const {
   const uint64_t planner_rebalanced_conflicts =
       two_phase_planner_rebalanced_conflict_count.load(
           std::memory_order_relaxed);
+  const uint64_t writable_read_candidates =
+      writable_read_rebalance_candidate_count.load(std::memory_order_relaxed);
+  const uint64_t writable_read_eligible =
+      writable_read_rebalance_eligible_count.load(std::memory_order_relaxed);
+  const uint64_t writable_read_applied =
+      writable_read_rebalance_applied_count.load(std::memory_order_relaxed);
+  const uint64_t writable_read_blocked =
+      writable_read_rebalance_blocked_count.load(std::memory_order_relaxed);
+  const uint64_t writable_read_blocked_disabled =
+      writable_read_rebalance_blocked_disabled_count.load(
+          std::memory_order_relaxed);
+  const uint64_t writable_read_blocked_missing_metadata =
+      writable_read_rebalance_blocked_missing_metadata_count.load(
+          std::memory_order_relaxed);
+  const uint64_t writable_read_blocked_stale_metadata =
+      writable_read_rebalance_blocked_stale_metadata_count.load(
+          std::memory_order_relaxed);
+  const uint64_t writable_read_blocked_unsafe_overlap =
+      writable_read_rebalance_blocked_unsafe_overlap_count.load(
+          std::memory_order_relaxed);
+  const uint64_t writable_read_blocked_invalid_destination =
+      writable_read_rebalance_blocked_invalid_destination_count.load(
+          std::memory_order_relaxed);
   const uint64_t planner_scalar_fallbacks =
       two_phase_planner_scalar_fallback_count.load(std::memory_order_relaxed);
   const uint64_t planner_errors =
@@ -2584,6 +2682,15 @@ void MPIIOBackend::reportPhase0Stats() const {
          "planner_rebalanced=%llu planner_rebalanced_applied=%llu "
          "planner_rebalanced_skipped=%llu "
          "planner_rebalanced_conflicts=%llu "
+         "writable_read_rebalance_candidates=%llu "
+         "writable_read_rebalance_eligible=%llu "
+         "writable_read_rebalance_applied=%llu "
+         "writable_read_rebalance_blocked=%llu "
+         "writable_read_rebalance_blocked_disabled=%llu "
+         "writable_read_rebalance_blocked_missing_metadata=%llu "
+         "writable_read_rebalance_blocked_stale_metadata=%llu "
+         "writable_read_rebalance_blocked_unsafe_overlap=%llu "
+         "writable_read_rebalance_blocked_invalid_destination=%llu "
          "planner_scalar_fallbacks=%llu planner_errors=%llu "
          "cache_hits=%llu fallbacks=%llu "
          "write_batch_count=%llu coalesced_writes=%llu "
@@ -2617,13 +2724,24 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(coalesced_reads),
          static_cast<unsigned long long>(coalesced_bytes), avg_coalesced_bytes,
          static_cast<unsigned long long>(planner_batches),
-          static_cast<unsigned long long>(planner_segments),
-          static_cast<unsigned long long>(planner_affinity),
-           static_cast<unsigned long long>(planner_rebalanced),
-           static_cast<unsigned long long>(planner_rebalanced_applied),
-           static_cast<unsigned long long>(planner_rebalanced_skipped),
-           static_cast<unsigned long long>(planner_rebalanced_conflicts),
-           static_cast<unsigned long long>(planner_scalar_fallbacks),
+         static_cast<unsigned long long>(planner_segments),
+         static_cast<unsigned long long>(planner_affinity),
+         static_cast<unsigned long long>(planner_rebalanced),
+         static_cast<unsigned long long>(planner_rebalanced_applied),
+         static_cast<unsigned long long>(planner_rebalanced_skipped),
+         static_cast<unsigned long long>(planner_rebalanced_conflicts),
+         static_cast<unsigned long long>(writable_read_candidates),
+         static_cast<unsigned long long>(writable_read_eligible),
+         static_cast<unsigned long long>(writable_read_applied),
+         static_cast<unsigned long long>(writable_read_blocked),
+         static_cast<unsigned long long>(writable_read_blocked_disabled),
+         static_cast<unsigned long long>(
+             writable_read_blocked_missing_metadata),
+         static_cast<unsigned long long>(writable_read_blocked_stale_metadata),
+         static_cast<unsigned long long>(writable_read_blocked_unsafe_overlap),
+         static_cast<unsigned long long>(
+             writable_read_blocked_invalid_destination),
+         static_cast<unsigned long long>(planner_scalar_fallbacks),
          static_cast<unsigned long long>(planner_errors),
          static_cast<unsigned long long>(cache_hits),
          static_cast<unsigned long long>(fallback_count),

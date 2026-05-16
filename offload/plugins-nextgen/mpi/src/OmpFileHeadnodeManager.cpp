@@ -115,6 +115,9 @@ bool OmpFileHeadnodeManager::hasRebalanceConflictUnlocked(
   const bool ReadHasTile = (Segment.SegmentFlags & OMPFILE_IO_HINT_HAS_TILE) != 0;
   const uint64_t ReadEpoch = Segment.EpochId;
 
+  bool SawOverlap = false;
+  bool SawMissingWriteEpoch = false;
+  bool SawNewerWriteEpoch = false;
   for (const WriteVersionEntry &Write : It->second) {
     if (!segmentRangesOverlap(Segment.Offset, Segment.Size, Write.Start,
                               Write.Size)) {
@@ -124,21 +127,34 @@ bool OmpFileHeadnodeManager::hasRebalanceConflictUnlocked(
     if (ReadHasTile && Write.HasTile && Segment.TileId != Write.TileId)
       continue;
 
+    SawOverlap = true;
+    if (!Write.HasEpoch) {
+      SawMissingWriteEpoch = true;
+      continue;
+    }
+    if (ReadHasEpoch && Write.EpochId > ReadEpoch)
+      SawNewerWriteEpoch = true;
+  }
+
+  if (SawOverlap) {
     if (!ReadHasEpoch) {
       Reason = "missing-read-epoch";
       ReasonErrno = ENOKEY;
       return true;
     }
-    if (!Write.HasEpoch) {
+    if (SawMissingWriteEpoch) {
       Reason = "missing-write-epoch";
       ReasonErrno = ENOKEY;
       return true;
     }
-    if (Write.EpochId > ReadEpoch) {
+    if (SawNewerWriteEpoch) {
       Reason = "newer-write-epoch";
       ReasonErrno = ESTALE;
       return true;
     }
+    Reason = "unsafe-write-overlap";
+    ReasonErrno = EAGAIN;
+    return true;
   }
 
   return false;
@@ -545,9 +561,18 @@ bool OmpFileHeadnodeManager::planBatchRequest(
 
     bool AffinityHit = false;
     bool Rebalanced = false;
+    const bool HasPathKey = Segment.PathKey != 0;
+    bool HadPriorAffinity = false;
+    int PriorAffinityRank = -1;
+    if (HasPathKey) {
+      auto AffinityIt = PathAffinityTable.find(Segment.PathKey);
+      if (AffinityIt != PathAffinityTable.end()) {
+        HadPriorAffinity = true;
+        PriorAffinityRank = AffinityIt->second;
+      }
+    }
     const int HandlerRank = pickRankForPathKeyUnlocked(
-        Segment.PathKey, Segment.PathKey != 0, Segment.ClientRank, AffinityHit,
-        Rebalanced);
+        Segment.PathKey, HasPathKey, Segment.ClientRank, AffinityHit, Rebalanced);
 
     const char *RebalanceReason = "none";
     int RebalanceErrno = 0;
@@ -555,6 +580,12 @@ bool OmpFileHeadnodeManager::planBatchRequest(
     if (Rebalanced) {
       RebalanceBlocked =
           hasRebalanceConflictUnlocked(Segment, RebalanceReason, RebalanceErrno);
+      if (RebalanceBlocked && HasPathKey) {
+        if (HadPriorAffinity)
+          PathAffinityTable[Segment.PathKey] = PriorAffinityRank;
+        else
+          PathAffinityTable.erase(Segment.PathKey);
+      }
     }
 
     if (!isWorkerRankUnlocked(HandlerRank)) {
