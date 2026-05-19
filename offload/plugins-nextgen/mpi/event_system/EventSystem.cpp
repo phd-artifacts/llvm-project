@@ -87,6 +87,7 @@ std::string EventTypeToString(EventTypeTy eventType) {
     case EventTypeTy::SYNC: return "SYNC";
     case EventTypeTy::OMPFILE_STAGE_INVALIDATE:
       return "OMPFILE_STAGE_INVALIDATE";
+    case EventTypeTy::OMPFILE_PREAD_NO_STAGE: return "OMPFILE_PREAD_NO_STAGE";
     case EventTypeTy::EXIT: return "EXIT";
     default: return "UNKNOWN_EVENT_TYPE";
   }

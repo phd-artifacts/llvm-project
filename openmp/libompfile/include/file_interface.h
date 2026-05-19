@@ -16,6 +16,14 @@ enum omp_file_io_hint_flags {
   OMPFILE_IO_HINT_HAS_EPOCH = 1u << 0,
   OMPFILE_IO_HINT_HAS_STREAM = 1u << 1,
   OMPFILE_IO_HINT_HAS_TILE = 1u << 2,
+  OMPFILE_IO_HINT_HAS_ROLE = 1u << 3,
+};
+
+enum omp_file_io_hint_role {
+  OMPFILE_IO_ROLE_UNKNOWN = 0,
+  OMPFILE_IO_ROLE_SOURCE_READ = 1,
+  OMPFILE_IO_ROLE_TARGET_READ = 2,
+  OMPFILE_IO_ROLE_WRITE = 3,
 };
 
 typedef struct omp_file_io_hint_v1 {
@@ -24,6 +32,7 @@ typedef struct omp_file_io_hint_v1 {
   uint64_t epoch_id;
   uint64_t stream_id;
   uint64_t tile_id;
+  uint32_t role;
 } omp_file_io_hint_v1;
 
 int omp_file_open(const char *filename);

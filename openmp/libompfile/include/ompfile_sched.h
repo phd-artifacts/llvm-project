@@ -17,6 +17,14 @@ enum OmpFileIOHintFlags : uint32_t {
   OMPFILE_IO_HINT_HAS_EPOCH = 1u << 0,
   OMPFILE_IO_HINT_HAS_STREAM = 1u << 1,
   OMPFILE_IO_HINT_HAS_TILE = 1u << 2,
+  OMPFILE_IO_HINT_HAS_ROLE = 1u << 3,
+};
+
+enum OmpFileIOHintRole : uint32_t {
+  OMPFILE_IO_ROLE_UNKNOWN = 0,
+  OMPFILE_IO_ROLE_SOURCE_READ = 1,
+  OMPFILE_IO_ROLE_TARGET_READ = 2,
+  OMPFILE_IO_ROLE_WRITE = 3,
 };
 
 struct OmpFileIOHint {
@@ -25,6 +33,7 @@ struct OmpFileIOHint {
   uint64_t EpochId = 0;
   uint64_t StreamId = 0;
   uint64_t TileId = 0;
+  uint32_t Role = OMPFILE_IO_ROLE_UNKNOWN;
 };
 
 enum class OmpFileIOOp : uint32_t {

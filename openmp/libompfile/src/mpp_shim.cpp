@@ -19,6 +19,7 @@ using MppOpenOnRankFn = int (*)(const char *, int, int, int, int *);
 using MppCloseFn = int (*)(int);
 using MppPreadFn = int (*)(int, int64_t, void *, uint64_t);
 using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
+using MppPreadNoStageExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
 using MppPwriteExFn = int (*)(int, int64_t, const void *, uint64_t, uint64_t *);
 using MppStageInvalidatePathKeyFn = int (*)(uint64_t, uint64_t, const char *);
@@ -39,6 +40,7 @@ struct MppApi {
   MppCloseFn close = nullptr;
   MppPreadFn pread = nullptr;
   MppPreadExFn pread_ex = nullptr;
+  MppPreadNoStageExFn pread_no_stage_ex = nullptr;
   MppPwriteFn pwrite = nullptr;
   MppPwriteExFn pwrite_ex = nullptr;
   MppStageInvalidatePathKeyFn stage_invalidate_path_key = nullptr;
@@ -64,6 +66,8 @@ MppApi loadMppApi() {
                                                        "ompfile_mpp_pread"));
   loaded.pread_ex = reinterpret_cast<MppPreadExFn>(
       dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_ex"));
+  loaded.pread_no_stage_ex = reinterpret_cast<MppPreadNoStageExFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_no_stage_ex"));
   loaded.pwrite = reinterpret_cast<MppPwriteFn>(dlsym(RTLD_DEFAULT,
                                                         "ompfile_mpp_pwrite"));
   loaded.pwrite_ex = reinterpret_cast<MppPwriteExFn>(
@@ -323,6 +327,34 @@ bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
   if (rc != 0)
     return false;
   bytes_read = size;
+  return true;
+}
+
+bool preadNoStageEx(int handle, int64_t offset, void *buffer, size_t size,
+                    size_t &bytes_read) {
+  bytes_read = 0;
+  if (!buffer && size > 0)
+    return false;
+
+  if (!init())
+    return false;
+
+  auto &api = getMppApi();
+  if (!api.pread_no_stage_ex)
+    api = loadMppApi();
+
+  if (!api.pread_no_stage_ex)
+    return preadEx(handle, offset, buffer, size, bytes_read);
+
+  uint64_t remote_bytes_read = 0;
+  const int rc = api.pread_no_stage_ex(handle, offset, buffer, size,
+                                       &remote_bytes_read);
+  if (rc != 0)
+    return false;
+  if (remote_bytes_read >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+    return false;
+  bytes_read = static_cast<size_t>(remote_bytes_read);
   return true;
 }
 

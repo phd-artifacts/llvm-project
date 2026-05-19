@@ -2262,7 +2262,8 @@ struct ProxyDevice {
   }
 
   bool preadWithOptionalStage(int Fd, int64_t Offset, void *Buffer, uint64_t Size,
-                              uint64_t *BytesReadOut, int &ErrnoOut) {
+                              uint64_t *BytesReadOut, int &ErrnoOut,
+                              bool AllowStage = true) {
     ErrnoOut = 0;
     if (BytesReadOut)
       *BytesReadOut = 0;
@@ -2270,7 +2271,7 @@ struct ProxyDevice {
     int ReadFd = Fd;
     std::string SourcePath;
     std::shared_ptr<OmpFileStageEntry> HeldStageEntry;
-    if (Offset >= 0 && Size > 0 && isReadthroughStageEnabled() &&
+    if (AllowStage && Offset >= 0 && Size > 0 && isReadthroughStageEnabled() &&
         getTrackedOmpFileFdPath(Fd, SourcePath)) {
       int StageFd = -1;
       int StageErrno = 0;
@@ -2317,6 +2318,10 @@ struct ProxyDevice {
     const uint64_t Bytes = static_cast<uint64_t>(BytesRead);
     if (BytesReadOut)
       *BytesReadOut = Bytes;
+    if (!AllowStage && Bytes > 0) {
+      OmpFileStatsStageBypassReads.fetch_add(1, std::memory_order_relaxed);
+      OmpFileStatsStageBypassBytes.fetch_add(Bytes, std::memory_order_relaxed);
+    }
     if (ReadFd != Fd && Bytes > 0) {
       OmpFileStatsStagedReadHits.fetch_add(1, std::memory_order_relaxed);
       OmpFileStatsStagedReadBytes.fetch_add(Bytes, std::memory_order_relaxed);
@@ -2683,6 +2688,10 @@ struct ProxyDevice {
         OmpFileStatsStagedReadHits.load(std::memory_order_relaxed);
     uint64_t StagedReadBytes =
         OmpFileStatsStagedReadBytes.load(std::memory_order_relaxed);
+    uint64_t StageBypassReads =
+        OmpFileStatsStageBypassReads.load(std::memory_order_relaxed);
+    uint64_t StageBypassBytes =
+        OmpFileStatsStageBypassBytes.load(std::memory_order_relaxed);
     uint64_t StageLookupHits =
         OmpFileStatsStageLookupHits.load(std::memory_order_relaxed);
     uint64_t StageLookupMisses =
@@ -2767,6 +2776,7 @@ struct ProxyDevice {
             "stage_populate_mode=%s stage_window_bytes=%llu "
             "stage_min_free_bytes=%llu "
             "staged_read_hits=%llu staged_read_bytes=%llu "
+            "staging_bypass_reads=%llu staging_bypass_bytes=%llu "
             "staged_write_updates=%llu staged_write_bytes=%llu "
             "stage_lookup_hits=%llu stage_lookup_misses=%llu "
             "stage_populate_count=%llu stage_populate_failures=%llu "
@@ -2818,6 +2828,8 @@ struct ProxyDevice {
             static_cast<unsigned long long>(OmpFileStageMinFreeBytes),
             static_cast<unsigned long long>(StagedReadHits),
             static_cast<unsigned long long>(StagedReadBytes),
+            static_cast<unsigned long long>(StageBypassReads),
+            static_cast<unsigned long long>(StageBypassBytes),
             static_cast<unsigned long long>(StagedWriteUpdates),
             static_cast<unsigned long long>(StagedWriteBytes),
             static_cast<unsigned long long>(StageLookupHits),
@@ -2912,7 +2924,8 @@ struct ProxyDevice {
     co_return (co_await RequestManager);
   }
 
-  EventTy ompfilePread(MPIRequestManagerTy RequestManager) {
+  EventTy ompfilePread(MPIRequestManagerTy RequestManager,
+                       bool AllowStage = true) {
     int Fd = -1;
     int64_t Offset = 0;
     uint64_t Size = 0;
@@ -2932,7 +2945,7 @@ struct ProxyDevice {
     uint64_t PayloadSize = 0;
     const bool Ok =
         Size == 0 || preadWithOptionalStage(Fd, Offset, Buffer.data(), Size,
-                                            &PayloadSize, Errno);
+                                            &PayloadSize, Errno, AllowStage);
     int Ret = Ok ? 0 : -1;
 
     RequestManager.send(&Ret, 1, MPI_INT);
@@ -2941,11 +2954,12 @@ struct ProxyDevice {
     if (PayloadSize > 0)
       RequestManager.sendInBatchs(Buffer.data(), PayloadSize);
     traceOmpFile("event ompfilePread fd=%d offset=%lld size=%llu buf=%p "
-                 "ret=%d errno=%d bytes=%llu\n",
-                 Fd, static_cast<long long>(Offset),
-                 static_cast<unsigned long long>(Size),
-                 static_cast<void *>(Buffer.data()), Ret, Errno,
-                 static_cast<unsigned long long>(PayloadSize));
+                  "ret=%d errno=%d bytes=%llu allow_stage=%d\n",
+                  Fd, static_cast<long long>(Offset),
+                  static_cast<unsigned long long>(Size),
+                  static_cast<void *>(Buffer.data()), Ret, Errno,
+                  static_cast<unsigned long long>(PayloadSize),
+                  static_cast<int>(AllowStage));
 
     RequestManager.send(nullptr, 0, MPI_BYTE);
     co_return (co_await RequestManager);
@@ -3391,7 +3405,8 @@ struct ProxyDevice {
   }
 
   bool preadOnRank(int Rank, int RemoteHandle, int64_t Offset, void *Buffer,
-                   uint64_t Size, uint64_t *BytesReadOut = nullptr) {
+                   uint64_t Size, uint64_t *BytesReadOut = nullptr,
+                   bool AllowStage = true) {
     if (!Buffer && Size > 0) {
       errno = EINVAL;
       return false;
@@ -3403,7 +3418,7 @@ struct ProxyDevice {
       int ReadErrno = 0;
       uint64_t Bytes = 0;
       if (!preadWithOptionalStage(RemoteHandle, Offset, Buffer, Size, &Bytes,
-                                  ReadErrno)) {
+                                  ReadErrno, AllowStage)) {
         errno = ReadErrno;
         return false;
       }
@@ -3419,7 +3434,10 @@ struct ProxyDevice {
     int RemoteErrno = 0;
     uint64_t Bytes = 0;
     EventTy Event = createRankEvent(
-        OriginEvents::ompfilePread, EventTypeTy::OMPFILE_PREAD, Rank,
+        OriginEvents::ompfilePread,
+        AllowStage ? EventTypeTy::OMPFILE_PREAD
+                   : EventTypeTy::OMPFILE_PREAD_NO_STAGE,
+        Rank,
         /*TargetDeviceId=*/0, RemoteHandle, Offset, Buffer, Size, &IoRet,
         &RemoteErrno, &Bytes);
     if (!waitForEvent(Event, "pread"))
@@ -3673,7 +3691,21 @@ struct ProxyDevice {
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
     if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
-                     BytesRead))
+                      BytesRead))
+      return OFFLOAD_FAIL;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppPreadNoStageEx(int Handle, int64_t Offset, void *Buffer, uint64_t Size,
+                        uint64_t *BytesRead) {
+    if (!BytesRead)
+      return OFFLOAD_FAIL;
+    *BytesRead = 0;
+    OmpFileHandleEntry Entry{};
+    if (!findRemoteHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+    if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
+                     BytesRead, /*AllowStage=*/false))
       return OFFLOAD_FAIL;
     return OFFLOAD_SUCCESS;
   }
@@ -4213,6 +4245,10 @@ struct ProxyDevice {
       case OMPFILE_PREAD:
         NewEvent = ompfilePread(std::move(RequestManager));
         break;
+      case OMPFILE_PREAD_NO_STAGE:
+        NewEvent = ompfilePread(std::move(RequestManager),
+                                /*AllowStage=*/false);
+        break;
       case OMPFILE_PWRITE:
         NewEvent = ompfilePwrite(std::move(RequestManager));
         break;
@@ -4332,6 +4368,8 @@ private:
   std::atomic<uint64_t> OmpFileStatsPwriteFailures{0};
   std::atomic<uint64_t> OmpFileStatsStagedReadHits{0};
   std::atomic<uint64_t> OmpFileStatsStagedReadBytes{0};
+  std::atomic<uint64_t> OmpFileStatsStageBypassReads{0};
+  std::atomic<uint64_t> OmpFileStatsStageBypassBytes{0};
   std::atomic<uint64_t> OmpFileStatsStagedWriteUpdates{0};
   std::atomic<uint64_t> OmpFileStatsStagedWriteBytes{0};
   std::atomic<uint64_t> OmpFileStatsStageLookupHits{0};
@@ -4437,11 +4475,19 @@ int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
 }
 
 int ompfile_mpp_pread_ex(int Handle, int64_t Offset, void *Buffer,
-                         uint64_t Size, uint64_t *BytesRead) {
+                          uint64_t Size, uint64_t *BytesRead) {
   ProxyDevice *PD = getActiveProxyDevice();
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppPreadEx(Handle, Offset, Buffer, Size, BytesRead);
+}
+
+int ompfile_mpp_pread_no_stage_ex(int Handle, int64_t Offset, void *Buffer,
+                                  uint64_t Size, uint64_t *BytesRead) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppPreadNoStageEx(Handle, Offset, Buffer, Size, BytesRead);
 }
 
 int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,

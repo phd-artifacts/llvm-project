@@ -153,6 +153,12 @@ private:
   std::atomic<uint64_t> forecast_hint_write_count{0};
   std::atomic<uint64_t> forecast_hint_read_bytes_total{0};
   std::atomic<uint64_t> forecast_hint_write_bytes_total{0};
+  std::atomic<uint64_t> forecast_source_read_stageable_count{0};
+  std::atomic<uint64_t> forecast_source_read_stageable_bytes_total{0};
+  std::atomic<uint64_t> forecast_target_read_bypass_count{0};
+  std::atomic<uint64_t> forecast_target_read_bypass_bytes_total{0};
+  std::atomic<uint64_t> forecast_role_unknown_count{0};
+  std::atomic<uint64_t> forecast_role_unknown_bytes_total{0};
   bool two_phase_batch_in_progress = false;
   bool write_batch_in_progress = false;
 
@@ -411,6 +417,12 @@ public:
     uint64_t HintWrites = 0;
     uint64_t HintReadBytes = 0;
     uint64_t HintWriteBytes = 0;
+    uint64_t SourceReadStageable = 0;
+    uint64_t SourceReadStageableBytes = 0;
+    uint64_t TargetReadBypasses = 0;
+    uint64_t TargetReadBypassBytes = 0;
+    uint64_t RoleUnknown = 0;
+    uint64_t RoleUnknownBytes = 0;
   };
   void recordForecastReadForTesting(const ompfile::OmpFileIOHint &hint,
                                     size_t size) {
@@ -420,11 +432,25 @@ public:
                                      size_t size) {
     recordForecastWrite(hint, size);
   }
+  bool shouldBypassStageForForecastReadForTesting(
+      const ompfile::OmpFileIOHint &hint) const {
+    return shouldBypassStageForForecastRead(hint);
+  }
   ForecastCountersForTesting forecastCountersForTesting() const {
     return {forecast_hint_read_count.load(std::memory_order_relaxed),
             forecast_hint_write_count.load(std::memory_order_relaxed),
             forecast_hint_read_bytes_total.load(std::memory_order_relaxed),
-            forecast_hint_write_bytes_total.load(std::memory_order_relaxed)};
+            forecast_hint_write_bytes_total.load(std::memory_order_relaxed),
+            forecast_source_read_stageable_count.load(
+                std::memory_order_relaxed),
+            forecast_source_read_stageable_bytes_total.load(
+                std::memory_order_relaxed),
+            forecast_target_read_bypass_count.load(std::memory_order_relaxed),
+            forecast_target_read_bypass_bytes_total.load(
+                std::memory_order_relaxed),
+            forecast_role_unknown_count.load(std::memory_order_relaxed),
+            forecast_role_unknown_bytes_total.load(
+                std::memory_order_relaxed)};
   }
 
   int open(const char *filename) override;
@@ -448,7 +474,8 @@ private:
                      uint64_t group_key);
   int readAtFallback(int file_id, long offset, void *data, size_t size);
   int readAtFallbackWithBytes(int file_id, long offset, void *data, size_t size,
-                              size_t &bytes_read);
+                              size_t &bytes_read,
+                              const ompfile::OmpFileIOHint *hint = nullptr);
   int readAtTwoPhase(const ompfile::OmpFileReadRequestContext &context,
                      void *data, size_t size);
   void processTwoPhaseBatch(std::vector<TwoPhaseReadRequest *> &batch);
@@ -491,6 +518,9 @@ private:
   static bool shouldReportStats();
   bool getFilePathKey(int file_id, uint64_t &path_key_out);
   bool isForecastHintValid(const ompfile::OmpFileIOHint &hint) const;
+  bool isForecastRoleHintValid(const ompfile::OmpFileIOHint &hint) const;
+  bool shouldBypassStageForForecastRead(
+      const ompfile::OmpFileIOHint &hint) const;
   void recordForecastRead(const ompfile::OmpFileIOHint &hint, size_t size);
   void recordForecastWrite(const ompfile::OmpFileIOHint &hint, size_t size);
   void rememberFilePathKey(int file_id, const char *path);

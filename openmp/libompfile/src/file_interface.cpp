@@ -77,6 +77,7 @@ static void applyIoHint(ompfile::OmpFileIOHint &dst,
   dst.EpochId = src->epoch_id;
   dst.StreamId = src->stream_id;
   dst.TileId = src->tile_id;
+  dst.Role = src->role;
 }
 
 class IOScheduler {

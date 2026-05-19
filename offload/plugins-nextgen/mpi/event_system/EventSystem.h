@@ -128,6 +128,7 @@ enum class EventTypeTy : unsigned int {
   // Local event used to wait on other events.
   SYNC,
   OMPFILE_STAGE_INVALIDATE = 36, // Invalidate staged data for a file on a proxy.
+  OMPFILE_PREAD_NO_STAGE = 37, // Read from a proxy while bypassing staging.
 
   // Internal event system commands.
   EXIT = 35 // Stops the event system execution at the remote process.
@@ -142,6 +143,8 @@ static_assert(static_cast<unsigned int>(EventTypeTy::SYNC) == 34);
 static_assert(static_cast<unsigned int>(EventTypeTy::EXIT) == 35);
 static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_STAGE_INVALIDATE) ==
               36);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_PREAD_NO_STAGE) ==
+              37);
 
 std::string EventTypeToString(EventTypeTy eventType);
 

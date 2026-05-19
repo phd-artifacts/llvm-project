@@ -713,7 +713,9 @@ int MPIIOBackend::readAtWithContext(
            "offset=%ld size=%zu\n",
            static_cast<unsigned long long>(context.RequestId), file_id, offset,
            size);
-  return readAtFallback(file_id, offset, data, size);
+  size_t bytes_read = 0;
+  return readAtFallbackWithBytes(file_id, offset, data, size, bytes_read,
+                                 &context.Hint);
 }
 
 int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
@@ -723,7 +725,8 @@ int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
 }
 
 int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
-                                          size_t size, size_t &bytes_read) {
+                                          size_t size, size_t &bytes_read,
+                                          const ompfile::OmpFileIOHint *hint) {
   bytes_read = 0;
   if (offset < 0) {
     errno = EINVAL;
@@ -755,8 +758,13 @@ int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
     bool pread_ok = false;
     {
       const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-      pread_ok =
-          ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
+      if (hint && shouldBypassStageForForecastRead(*hint)) {
+        pread_ok = ompfile::mpp::preadNoStageEx(remote_handle, offset, data,
+                                                size, bytes_read);
+      } else {
+        pread_ok =
+            ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
+      }
     }
     if (!pread_ok) {
       io_log("MPP pread failed for file %d\n", file_id);
@@ -1268,7 +1276,7 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
 
     if (rc != 0) {
       rc = readAtFallbackWithBytes(file_id, item.Start, buffer.data(), read_size,
-                                   bytes_read);
+                                   bytes_read, &item.Requests.front()->Hint);
     }
     if (rc != 0) {
       const int errnum = errno;
@@ -1894,12 +1902,45 @@ bool MPIIOBackend::isForecastHintValid(
   return (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0;
 }
 
+bool MPIIOBackend::isForecastRoleHintValid(
+    const ompfile::OmpFileIOHint &hint) const {
+  return isForecastHintValid(hint) &&
+         (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_ROLE) != 0;
+}
+
+bool MPIIOBackend::shouldBypassStageForForecastRead(
+    const ompfile::OmpFileIOHint &hint) const {
+  return isForecastRoleHintValid(hint) &&
+         hint.Role == ompfile::OMPFILE_IO_ROLE_TARGET_READ;
+}
+
 void MPIIOBackend::recordForecastRead(const ompfile::OmpFileIOHint &hint,
                                       size_t size) {
   if (!isForecastHintValid(hint))
     return;
   forecast_hint_read_count.fetch_add(1, std::memory_order_relaxed);
   forecast_hint_read_bytes_total.fetch_add(size, std::memory_order_relaxed);
+  if (!isForecastRoleHintValid(hint)) {
+    forecast_role_unknown_count.fetch_add(1, std::memory_order_relaxed);
+    forecast_role_unknown_bytes_total.fetch_add(size,
+                                                std::memory_order_relaxed);
+    return;
+  }
+  if (hint.Role == ompfile::OMPFILE_IO_ROLE_SOURCE_READ) {
+    forecast_source_read_stageable_count.fetch_add(1,
+                                                   std::memory_order_relaxed);
+    forecast_source_read_stageable_bytes_total.fetch_add(
+        size, std::memory_order_relaxed);
+    return;
+  }
+  if (shouldBypassStageForForecastRead(hint)) {
+    forecast_target_read_bypass_count.fetch_add(1, std::memory_order_relaxed);
+    forecast_target_read_bypass_bytes_total.fetch_add(
+        size, std::memory_order_relaxed);
+    return;
+  }
+  forecast_role_unknown_count.fetch_add(1, std::memory_order_relaxed);
+  forecast_role_unknown_bytes_total.fetch_add(size, std::memory_order_relaxed);
 }
 
 void MPIIOBackend::recordForecastWrite(const ompfile::OmpFileIOHint &hint,
@@ -2846,6 +2887,18 @@ void MPIIOBackend::reportPhase0Stats() const {
       forecast_hint_read_bytes_total.load(std::memory_order_relaxed);
   const uint64_t forecast_hint_write_bytes =
       forecast_hint_write_bytes_total.load(std::memory_order_relaxed);
+  const uint64_t forecast_source_read_stageable =
+      forecast_source_read_stageable_count.load(std::memory_order_relaxed);
+  const uint64_t forecast_source_read_stageable_bytes =
+      forecast_source_read_stageable_bytes_total.load(std::memory_order_relaxed);
+  const uint64_t forecast_target_read_bypasses =
+      forecast_target_read_bypass_count.load(std::memory_order_relaxed);
+  const uint64_t forecast_target_read_bypass_bytes =
+      forecast_target_read_bypass_bytes_total.load(std::memory_order_relaxed);
+  const uint64_t forecast_role_unknown =
+      forecast_role_unknown_count.load(std::memory_order_relaxed);
+  const uint64_t forecast_role_unknown_bytes =
+      forecast_role_unknown_bytes_total.load(std::memory_order_relaxed);
 
   const double avg_remote_bytes =
       remote_events == 0 ? 0.0
@@ -2909,6 +2962,11 @@ void MPIIOBackend::reportPhase0Stats() const {
          "forecast_mode=%s forecast_hint_reads=%llu "
          "forecast_hint_writes=%llu forecast_hint_read_bytes=%llu "
          "forecast_hint_write_bytes=%llu "
+         "forecast_source_read_stageable=%llu "
+         "forecast_source_read_stageable_bytes=%llu "
+         "forecast_target_read_bypasses=%llu "
+         "forecast_target_read_bypass_bytes=%llu "
+         "forecast_role_unknown=%llu forecast_role_unknown_bytes=%llu "
          "write_batch_enabled=%d "
          "two_phase_enabled=%d "
          "two_phase_active=%d two_phase_policy=%s window_us=%llu "
@@ -2984,6 +3042,12 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(forecast_hint_writes),
          static_cast<unsigned long long>(forecast_hint_read_bytes),
          static_cast<unsigned long long>(forecast_hint_write_bytes),
+         static_cast<unsigned long long>(forecast_source_read_stageable),
+         static_cast<unsigned long long>(forecast_source_read_stageable_bytes),
+         static_cast<unsigned long long>(forecast_target_read_bypasses),
+         static_cast<unsigned long long>(forecast_target_read_bypass_bytes),
+         static_cast<unsigned long long>(forecast_role_unknown),
+         static_cast<unsigned long long>(forecast_role_unknown_bytes),
          static_cast<int>(write_batch_enabled),
          static_cast<int>(two_phase_enabled),
          static_cast<int>(isTwoPhaseActive()),
