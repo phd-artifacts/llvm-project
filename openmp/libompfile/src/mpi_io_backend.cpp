@@ -129,12 +129,13 @@ MPIIOBackend::MPIIOBackend() {
   write_batch_max_batch_bytes =
       parseUint64Env("LIBOMPFILE_OPT_WRITE_BATCH_MAX_BATCH_BYTES",
                      write_batch_enabled ? kDefaultWriteBatchMaxBatchBytes : 0);
+  forecast_mode = parseForecastMode(std::getenv("LIBOMPFILE_IO_FORECAST"));
 
   io_log("Two-phase guard config: policy=%s enabled=%d window_us=%llu "
          "max_batch_bytes=%llu sieve_bytes=%llu write_batch_policy=%s "
          "write_batch_enabled=%d write_batch_window_us=%llu "
          "write_batch_max_batch_bytes=%llu scheduler=%s remote_only=%d "
-         "writable_read_rebalance=%d\n",
+         "writable_read_rebalance=%d forecast_mode=%s\n",
          twoPhasePolicyToString(two_phase_policy),
          static_cast<int>(two_phase_enabled),
          static_cast<unsigned long long>(two_phase_window_us),
@@ -146,7 +147,8 @@ MPIIOBackend::MPIIOBackend() {
          static_cast<unsigned long long>(write_batch_max_batch_bytes),
          scheduler_env ? scheduler_env : "(unset)",
          static_cast<int>(mpp_remote_only),
-         static_cast<int>(writable_read_rebalance_enabled));
+         static_cast<int>(writable_read_rebalance_enabled),
+         forecastModeToString(forecast_mode));
 
   if (isTwoPhaseActive()) {
     io_log("Two-phase batching active (leader/follower mode).\n");
@@ -631,6 +633,7 @@ int MPIIOBackend::readAtWithContext(
     return -1;
   }
   pread_request_count.fetch_add(1, std::memory_order_relaxed);
+  recordForecastRead(context.Hint, size);
   io_trace("MPIIOBackend::readAtWithContext enter this=%p req_id=%llu file=%d "
            "offset=%ld size=%zu ctx_flags=0x%x has_plan=%d has_path_key=%d "
            "plan_status=%d aggregator=%d remote_handle=%d\n",
@@ -1096,11 +1099,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
     segment.FileHandle = item.Requests.front()->FileHandle;
     segment.ClientRank = item.Requests.front()->ClientRank;
     segment.Offset = item.Start;
-    segment.Size = static_cast<uint64_t>(
-        computeTwoPhaseTargetReadSize(item.Start, item.End,
-                                      item.Requests.size(), mpp_remote_only,
-                                      two_phase_sieve_bytes,
-                                      two_phase_max_batch_bytes));
+    segment.Size = static_cast<uint64_t>(computeForecastTargetReadSize(
+        item.Requests.front()->Hint, item.Start, item.End,
+        item.Requests.size(), mpp_remote_only, two_phase_sieve_bytes,
+        two_phase_max_batch_bytes));
     segment.PathKey = item.Requests.front()->HasPathKey
                           ? item.Requests.front()->PathKey
                           : static_cast<uint64_t>(0);
@@ -1198,9 +1200,10 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       continue;
     }
 
-    const size_t read_size = computeTwoPhaseTargetReadSize(
-        item.Start, item.End, item.Requests.size(), mpp_remote_only,
-        two_phase_sieve_bytes, two_phase_max_batch_bytes);
+    const size_t read_size = computeForecastTargetReadSize(
+        item.Requests.front()->Hint, item.Start, item.End,
+        item.Requests.size(), mpp_remote_only, two_phase_sieve_bytes,
+        two_phase_max_batch_bytes);
     two_phase_coalesced_bytes_total.fetch_add(read_size,
                                               std::memory_order_relaxed);
     std::vector<char> buffer(read_size);
@@ -1450,6 +1453,7 @@ int MPIIOBackend::writeAtWithContext(
     errno = EINVAL;
     return -1;
   }
+  recordForecastWrite(context.Hint, size);
   invalidateTwoPhaseReadCacheForFile(file_id);
 
   io_log("Writing %zu bytes to file %d at offset %lld\n", size, file_id,
@@ -1881,6 +1885,29 @@ bool MPIIOBackend::getFilePathKey(int file_id, uint64_t &path_key_out) {
     return false;
   path_key_out = it->second;
   return true;
+}
+
+bool MPIIOBackend::isForecastHintValid(
+    const ompfile::OmpFileIOHint &hint) const {
+  if (forecast_mode != ForecastMode::CholeskyOracle)
+    return false;
+  return (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0;
+}
+
+void MPIIOBackend::recordForecastRead(const ompfile::OmpFileIOHint &hint,
+                                      size_t size) {
+  if (!isForecastHintValid(hint))
+    return;
+  forecast_hint_read_count.fetch_add(1, std::memory_order_relaxed);
+  forecast_hint_read_bytes_total.fetch_add(size, std::memory_order_relaxed);
+}
+
+void MPIIOBackend::recordForecastWrite(const ompfile::OmpFileIOHint &hint,
+                                       size_t size) {
+  if (!isForecastHintValid(hint))
+    return;
+  forecast_hint_write_count.fetch_add(1, std::memory_order_relaxed);
+  forecast_hint_write_bytes_total.fetch_add(size, std::memory_order_relaxed);
 }
 
 void MPIIOBackend::rememberFilePathKey(int file_id, const char *path) {
@@ -2565,6 +2592,20 @@ MPIIOBackend::parseTwoPhasePolicy(const char *env_value) {
   return TwoPhasePolicy::Disabled;
 }
 
+MPIIOBackend::ForecastMode
+MPIIOBackend::parseForecastMode(const char *env_value) {
+  if (!env_value || env_value[0] == '\0' || std::strcmp(env_value, "off") == 0 ||
+      std::strcmp(env_value, "OFF") == 0 || std::strcmp(env_value, "0") == 0) {
+    return ForecastMode::Off;
+  }
+
+  if (std::strcmp(env_value, "cholesky-oracle") == 0)
+    return ForecastMode::CholeskyOracle;
+
+  io_log("Invalid LIBOMPFILE_IO_FORECAST='%s'; using off mode.\n", env_value);
+  return ForecastMode::Off;
+}
+
 const char *
 MPIIOBackend::twoPhasePolicyToString(TwoPhasePolicy policy) {
   switch (policy) {
@@ -2574,6 +2615,16 @@ MPIIOBackend::twoPhasePolicyToString(TwoPhasePolicy policy) {
     return "enabled";
   case TwoPhasePolicy::Auto:
     return "auto";
+  }
+  return "unknown";
+}
+
+const char *MPIIOBackend::forecastModeToString(ForecastMode mode) {
+  switch (mode) {
+  case ForecastMode::Off:
+    return "off";
+  case ForecastMode::CholeskyOracle:
+    return "cholesky-oracle";
   }
   return "unknown";
 }
@@ -2638,6 +2689,18 @@ size_t MPIIOBackend::computeTwoPhaseTargetReadSize(
   if (target_size < static_cast<uint64_t>(read_size))
     return read_size;
   return static_cast<size_t>(target_size);
+}
+
+size_t MPIIOBackend::computeForecastTargetReadSize(
+    const ompfile::OmpFileIOHint &hint, long start, long end,
+    size_t request_count, bool remote_only, uint64_t sieve_bytes,
+    uint64_t max_batch_bytes) const {
+  assert(start >= 0 && end >= start &&
+         "Forecast read range must be monotonic.");
+  if (isForecastHintValid(hint))
+    return static_cast<size_t>(end - start);
+  return computeTwoPhaseTargetReadSize(start, end, request_count, remote_only,
+                                       sieve_bytes, max_batch_bytes);
 }
 
 bool MPIIOBackend::shouldReportStats() {
@@ -2775,6 +2838,14 @@ void MPIIOBackend::reportPhase0Stats() const {
       write_batch_exec_us_total.load(std::memory_order_relaxed);
   const uint64_t write_request_wait_us =
       write_request_wait_us_total.load(std::memory_order_relaxed);
+  const uint64_t forecast_hint_reads =
+      forecast_hint_read_count.load(std::memory_order_relaxed);
+  const uint64_t forecast_hint_writes =
+      forecast_hint_write_count.load(std::memory_order_relaxed);
+  const uint64_t forecast_hint_read_bytes =
+      forecast_hint_read_bytes_total.load(std::memory_order_relaxed);
+  const uint64_t forecast_hint_write_bytes =
+      forecast_hint_write_bytes_total.load(std::memory_order_relaxed);
 
   const double avg_remote_bytes =
       remote_events == 0 ? 0.0
@@ -2835,6 +2906,9 @@ void MPIIOBackend::reportPhase0Stats() const {
          "write_follower_waits=%llu write_follower_wait_us=%llu "
          "write_window_wait_us=%llu write_batch_exec_us=%llu "
          "write_request_wait_us=%llu "
+         "forecast_mode=%s forecast_hint_reads=%llu "
+         "forecast_hint_writes=%llu forecast_hint_read_bytes=%llu "
+         "forecast_hint_write_bytes=%llu "
          "write_batch_enabled=%d "
          "two_phase_enabled=%d "
          "two_phase_active=%d two_phase_policy=%s window_us=%llu "
@@ -2905,6 +2979,11 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(write_window_wait_us),
          static_cast<unsigned long long>(write_batch_exec_us),
          static_cast<unsigned long long>(write_request_wait_us),
+         forecastModeToString(forecast_mode),
+         static_cast<unsigned long long>(forecast_hint_reads),
+         static_cast<unsigned long long>(forecast_hint_writes),
+         static_cast<unsigned long long>(forecast_hint_read_bytes),
+         static_cast<unsigned long long>(forecast_hint_write_bytes),
          static_cast<int>(write_batch_enabled),
          static_cast<int>(two_phase_enabled),
          static_cast<int>(isTwoPhaseActive()),

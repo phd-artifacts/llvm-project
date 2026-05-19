@@ -24,6 +24,11 @@ private:
     Auto,
   };
 
+  enum class ForecastMode {
+    Off,
+    CholeskyOracle,
+  };
+
   MPI_Comm file_comm = MPI_COMM_NULL;
   int externally_initialized;
   std::unordered_map<int, MPI_File> file_handle_map;
@@ -67,6 +72,7 @@ private:
   bool two_phase_enabled = false;
   TwoPhasePolicy write_batch_policy = TwoPhasePolicy::Disabled;
   bool write_batch_enabled = false;
+  ForecastMode forecast_mode = ForecastMode::Off;
   static constexpr uint64_t kDefaultTwoPhaseWindowUs = 2000;
   static constexpr uint64_t kDefaultTwoPhaseMaxBatchBytes = 8 * 1024 * 1024;
   static constexpr uint64_t kDefaultTwoPhaseSieveBytes = 256 * 1024;
@@ -143,6 +149,10 @@ private:
   std::atomic<uint64_t> write_batch_exec_us_total{0};
   std::atomic<uint64_t> write_request_wait_us_total{0};
   std::atomic<uint64_t> write_batch_request_id{1};
+  std::atomic<uint64_t> forecast_hint_read_count{0};
+  std::atomic<uint64_t> forecast_hint_write_count{0};
+  std::atomic<uint64_t> forecast_hint_read_bytes_total{0};
+  std::atomic<uint64_t> forecast_hint_write_bytes_total{0};
   bool two_phase_batch_in_progress = false;
   bool write_batch_in_progress = false;
 
@@ -219,6 +229,14 @@ public:
       uint64_t sieve_bytes, uint64_t max_batch_bytes) {
     return computeTwoPhaseTargetReadSize(start, end, request_count, remote_only,
                                          sieve_bytes, max_batch_bytes);
+  }
+  size_t computeForecastTargetReadSizeForTesting(
+      const ompfile::OmpFileIOHint &hint, long start, long end,
+      size_t request_count, bool remote_only, uint64_t sieve_bytes,
+      uint64_t max_batch_bytes) const {
+    return computeForecastTargetReadSize(hint, start, end, request_count,
+                                         remote_only, sieve_bytes,
+                                         max_batch_bytes);
   }
   struct PlannerCounterSnapshotForTesting {
     uint64_t Rebalanced = 0;
@@ -388,6 +406,26 @@ public:
             write_batch_exec_us_total.load(std::memory_order_relaxed),
             write_request_wait_us_total.load(std::memory_order_relaxed)};
   }
+  struct ForecastCountersForTesting {
+    uint64_t HintReads = 0;
+    uint64_t HintWrites = 0;
+    uint64_t HintReadBytes = 0;
+    uint64_t HintWriteBytes = 0;
+  };
+  void recordForecastReadForTesting(const ompfile::OmpFileIOHint &hint,
+                                    size_t size) {
+    recordForecastRead(hint, size);
+  }
+  void recordForecastWriteForTesting(const ompfile::OmpFileIOHint &hint,
+                                     size_t size) {
+    recordForecastWrite(hint, size);
+  }
+  ForecastCountersForTesting forecastCountersForTesting() const {
+    return {forecast_hint_read_count.load(std::memory_order_relaxed),
+            forecast_hint_write_count.load(std::memory_order_relaxed),
+            forecast_hint_read_bytes_total.load(std::memory_order_relaxed),
+            forecast_hint_write_bytes_total.load(std::memory_order_relaxed)};
+  }
 
   int open(const char *filename) override;
   int openWithPlan(const char *filename,
@@ -428,16 +466,23 @@ private:
   bool hasUsablePlannedRead(const ompfile::OmpFileReadRequestContext &context) const;
   int getNextFileHandle();
   static TwoPhasePolicy parseTwoPhasePolicy(const char *env_value);
+  static ForecastMode parseForecastMode(const char *env_value);
   static const char *twoPhasePolicyToString(TwoPhasePolicy policy);
+  static const char *forecastModeToString(ForecastMode mode);
   static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
   static void updateAtomicMax(std::atomic<uint64_t> &counter,
                               uint64_t candidate);
   static size_t computeTwoPhaseTargetReadSize(long start, long end,
-                                              size_t request_count,
-                                              bool remote_only,
-                                             uint64_t sieve_bytes,
-                                             uint64_t max_batch_bytes);
+                                               size_t request_count,
+                                               bool remote_only,
+                                               uint64_t sieve_bytes,
+                                               uint64_t max_batch_bytes);
+  size_t computeForecastTargetReadSize(const ompfile::OmpFileIOHint &hint,
+                                       long start, long end,
+                                       size_t request_count, bool remote_only,
+                                       uint64_t sieve_bytes,
+                                       uint64_t max_batch_bytes) const;
   static uint64_t computePathKey(const char *path);
   static uint64_t mixHintIntoKey(uint64_t base_key,
                                  const ompfile::OmpFileIOHint &hint);
@@ -445,6 +490,9 @@ private:
                                       const ompfile::OmpFileIOHint &hint);
   static bool shouldReportStats();
   bool getFilePathKey(int file_id, uint64_t &path_key_out);
+  bool isForecastHintValid(const ompfile::OmpFileIOHint &hint) const;
+  void recordForecastRead(const ompfile::OmpFileIOHint &hint, size_t size);
+  void recordForecastWrite(const ompfile::OmpFileIOHint &hint, size_t size);
   void rememberFilePathKey(int file_id, const char *path);
   void rememberFilePath(int file_id, const char *path);
   void forgetFilePath(int file_id);
