@@ -1251,23 +1251,7 @@ void MPIIOBackend::processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &grou
       if (remote_rebalanced_ok) {
         two_phase_planner_rebalanced_applied_count.fetch_add(
             1, std::memory_order_relaxed);
-        bool count_writable_read_applied = false;
-        if (mpp_remote_only) {
-          const std::lock_guard<std::mutex> lock(handle_mutex);
-          auto it = file_write_epoch_history.find(file_id);
-          const bool has_local_write_history =
-              it != file_write_epoch_history.end() && !it->second.empty();
-          const bool has_file_metadata =
-              logical_handle_set.find(file_id) != logical_handle_set.end() ||
-              file_path_map.find(file_id) != file_path_map.end() ||
-              file_path_key_map.find(file_id) != file_path_key_map.end();
-          count_writable_read_applied =
-              has_file_metadata || has_local_write_history;
-        }
-        if (count_writable_read_applied) {
-          writable_read_rebalance_applied_count.fetch_add(
-              1, std::memory_order_relaxed);
-        }
+        noteAppliedRebalancedReadForFile(file_id);
       } else if (eligible_for_rebalance) {
         read_errno = errno != 0 ? errno : EIO;
         two_phase_planner_rebalanced_skipped_count.fetch_add(
@@ -1473,8 +1457,10 @@ int MPIIOBackend::writeAtWithContext(
 
   if (isWriteBatchActive()) {
     const int batched_rc = writeAtBatched(file_id, offset, data, size, group_key);
-    if (batched_rc == 0)
+    if (batched_rc == 0) {
       recordWriteEpochForContext(file_id, offset, size, context.Hint);
+      triggerStageInvalidationAfterSuccessfulRemoteWrite(file_id);
+    }
     return batched_rc;
   }
 
@@ -1503,6 +1489,7 @@ int MPIIOBackend::writeAtWithContext(
     assert(bytes_written == size && "Remote pwrite must complete full request");
 
     recordWriteEpochForContext(file_id, offset, size, context.Hint);
+    triggerStageInvalidationAfterSuccessfulRemoteWrite(file_id);
     io_log("MPP write at offset completed.\n");
     return 0;
   }
@@ -1953,10 +1940,117 @@ void MPIIOBackend::recordWriteEpochForContext(
   entry.Sequence = next_write_sequence++;
   auto &history = file_write_epoch_history[file_id];
   history.push_back(entry);
+  auto &coherence = writable_stage_coherence[file_id];
+  ++coherence.WriteGeneration;
+  coherence.InvalidationFailed = false;
   constexpr size_t kMaxWriteEpochHistory = 8192;
   if (history.size() > kMaxWriteEpochHistory) {
     history.erase(history.begin(),
                   history.begin() + (history.size() - kMaxWriteEpochHistory));
+  }
+}
+
+bool MPIIOBackend::hasCompletedStageInvalidationForTesting(
+    int file_id) const {
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  auto it = writable_stage_coherence.find(file_id);
+  if (it == writable_stage_coherence.end())
+    return false;
+  const WritableStageCoherenceState &coherence = it->second;
+  return coherence.WriteGeneration != 0 && !coherence.InvalidationFailed &&
+         coherence.InvalidatedGeneration >= coherence.WriteGeneration;
+}
+
+bool MPIIOBackend::globallyInvalidateStageForFile(int file_id) {
+  uint64_t path_key = 0;
+  uint64_t generation = 0;
+  std::string path;
+  {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    auto path_key_it = file_path_key_map.find(file_id);
+    auto path_it = file_path_map.find(file_id);
+    auto coherence_it = writable_stage_coherence.find(file_id);
+    if (path_key_it == file_path_key_map.end() || path_key_it->second == 0 ||
+        path_it == file_path_map.end() || path_it->second.empty() ||
+        coherence_it == writable_stage_coherence.end() ||
+        coherence_it->second.WriteGeneration == 0) {
+      stage_global_invalidations_failed.fetch_add(1,
+                                                  std::memory_order_relaxed);
+      return false;
+    }
+    path_key = path_key_it->second;
+    path = path_it->second;
+    generation = coherence_it->second.WriteGeneration;
+  }
+
+  stage_global_invalidations_requested.fetch_add(1, std::memory_order_relaxed);
+  bool ok = false;
+  {
+    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    ok = ompfile::mpp::stageInvalidatePathKey(path_key, generation,
+                                             path.c_str());
+  }
+
+  completeStageInvalidationForFile(file_id, generation, ok);
+  return ok;
+}
+
+void MPIIOBackend::completeStageInvalidationForFile(int file_id,
+                                                    uint64_t generation,
+                                                    bool ok) {
+  const std::lock_guard<std::mutex> lock(handle_mutex);
+  auto &coherence = writable_stage_coherence[file_id];
+  if (!ok) {
+    if (generation == coherence.WriteGeneration)
+      coherence.InvalidationFailed = true;
+    stage_global_invalidations_failed.fetch_add(1,
+                                                std::memory_order_relaxed);
+    return;
+  }
+
+  if (generation == coherence.WriteGeneration) {
+    coherence.InvalidatedGeneration = generation;
+    coherence.InvalidationFailed = false;
+  }
+  stage_global_invalidations_completed.fetch_add(1,
+                                                 std::memory_order_relaxed);
+}
+
+void MPIIOBackend::triggerStageInvalidationAfterSuccessfulRemoteWrite(
+    int file_id) {
+  if (writable_read_rebalance_enabled && mpp_remote_only)
+    (void)globallyInvalidateStageForFile(file_id);
+}
+
+void MPIIOBackend::noteAppliedRebalancedReadForFile(int file_id) {
+  bool count_writable_read_applied = false;
+  bool count_after_invalidation_applied = false;
+  if (mpp_remote_only) {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    auto it = file_write_epoch_history.find(file_id);
+    const bool has_local_write_history =
+        it != file_write_epoch_history.end() && !it->second.empty();
+    const bool has_file_metadata =
+        logical_handle_set.find(file_id) != logical_handle_set.end() ||
+        file_path_map.find(file_id) != file_path_map.end() ||
+        file_path_key_map.find(file_id) != file_path_key_map.end();
+    count_writable_read_applied = has_file_metadata || has_local_write_history;
+    auto coherence_it = writable_stage_coherence.find(file_id);
+    count_after_invalidation_applied =
+        has_local_write_history &&
+        coherence_it != writable_stage_coherence.end() &&
+        coherence_it->second.WriteGeneration != 0 &&
+        !coherence_it->second.InvalidationFailed &&
+        coherence_it->second.InvalidatedGeneration >=
+            coherence_it->second.WriteGeneration;
+  }
+  if (count_writable_read_applied) {
+    writable_read_rebalance_applied_count.fetch_add(
+        1, std::memory_order_relaxed);
+  }
+  if (count_after_invalidation_applied) {
+    writable_read_rebalance_after_invalidation_applied.fetch_add(
+        1, std::memory_order_relaxed);
   }
 }
 
@@ -1982,6 +2076,11 @@ void MPIIOBackend::noteWritableReadRebalanceBlocked(const char *reason) {
   }
   if (std::strcmp(reason, "invalid-read-range") == 0) {
     writable_read_rebalance_blocked_invalid_destination_count.fetch_add(
+        1, std::memory_order_relaxed);
+    return;
+  }
+  if (std::strcmp(reason, "unsafe-write-history") == 0) {
+    writable_read_rebalance_blocked_pending_invalidation.fetch_add(
         1, std::memory_order_relaxed);
     return;
   }
@@ -2093,10 +2192,21 @@ bool MPIIOBackend::canApplyRebalancedRead(
   }
 
   if (has_remote_only_writable_context && has_local_write_history) {
-    reason_out = "unsafe-write-history";
-    reason_errno_out = EAGAIN;
-    noteWritableReadRebalanceBlocked(reason_out);
-    return false;
+    auto coherence_it = writable_stage_coherence.find(file_id);
+    const bool invalidation_complete =
+        coherence_it != writable_stage_coherence.end() &&
+        coherence_it->second.WriteGeneration != 0 &&
+        !coherence_it->second.InvalidationFailed &&
+        coherence_it->second.InvalidatedGeneration >=
+            coherence_it->second.WriteGeneration;
+    if (!invalidation_complete) {
+      reason_out = "unsafe-write-history";
+      reason_errno_out = EAGAIN;
+      noteWritableReadRebalanceBlocked(reason_out);
+      return false;
+    }
+    writable_read_rebalance_after_invalidation_eligible.fetch_add(
+        1, std::memory_order_relaxed);
   }
 
   if (has_remote_only_writable_context) {
@@ -2606,6 +2716,21 @@ void MPIIOBackend::reportPhase0Stats() const {
   const uint64_t writable_read_blocked_invalid_destination =
       writable_read_rebalance_blocked_invalid_destination_count.load(
           std::memory_order_relaxed);
+  const uint64_t stage_invalidations_requested =
+      stage_global_invalidations_requested.load(std::memory_order_relaxed);
+  const uint64_t stage_invalidations_completed =
+      stage_global_invalidations_completed.load(std::memory_order_relaxed);
+  const uint64_t stage_invalidations_failed =
+      stage_global_invalidations_failed.load(std::memory_order_relaxed);
+  const uint64_t writable_read_blocked_pending_invalidation =
+      writable_read_rebalance_blocked_pending_invalidation.load(
+          std::memory_order_relaxed);
+  const uint64_t writable_read_after_invalidation_eligible =
+      writable_read_rebalance_after_invalidation_eligible.load(
+          std::memory_order_relaxed);
+  const uint64_t writable_read_after_invalidation_applied =
+      writable_read_rebalance_after_invalidation_applied.load(
+          std::memory_order_relaxed);
   const uint64_t planner_scalar_fallbacks =
       two_phase_planner_scalar_fallback_count.load(std::memory_order_relaxed);
   const uint64_t planner_errors =
@@ -2691,6 +2816,12 @@ void MPIIOBackend::reportPhase0Stats() const {
          "writable_read_rebalance_blocked_stale_metadata=%llu "
          "writable_read_rebalance_blocked_unsafe_overlap=%llu "
          "writable_read_rebalance_blocked_invalid_destination=%llu "
+         "stage_global_invalidations_requested=%llu "
+         "stage_global_invalidations_completed=%llu "
+         "stage_global_invalidations_failed=%llu "
+         "writable_read_rebalance_blocked_pending_invalidation=%llu "
+         "writable_read_rebalance_after_invalidation_eligible=%llu "
+         "writable_read_rebalance_after_invalidation_applied=%llu "
          "planner_scalar_fallbacks=%llu planner_errors=%llu "
          "cache_hits=%llu fallbacks=%llu "
          "write_batch_count=%llu coalesced_writes=%llu "
@@ -2741,6 +2872,15 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(writable_read_blocked_unsafe_overlap),
          static_cast<unsigned long long>(
              writable_read_blocked_invalid_destination),
+         static_cast<unsigned long long>(stage_invalidations_requested),
+         static_cast<unsigned long long>(stage_invalidations_completed),
+         static_cast<unsigned long long>(stage_invalidations_failed),
+         static_cast<unsigned long long>(
+             writable_read_blocked_pending_invalidation),
+         static_cast<unsigned long long>(
+             writable_read_after_invalidation_eligible),
+         static_cast<unsigned long long>(
+             writable_read_after_invalidation_applied),
          static_cast<unsigned long long>(planner_scalar_fallbacks),
          static_cast<unsigned long long>(planner_errors),
          static_cast<unsigned long long>(cache_hits),

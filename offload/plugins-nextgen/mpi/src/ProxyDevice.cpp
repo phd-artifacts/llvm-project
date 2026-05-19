@@ -644,6 +644,7 @@ struct ProxyDevice {
     std::vector<OmpFileStageExtent> CoveredExtents;
     bool FullyPopulated = false;
     bool PopulateInProgress = false;
+    bool Invalidated = false;
     uint64_t SourceSize = 0;
     bool SourceSizeKnown = false;
 
@@ -1967,15 +1968,23 @@ struct ProxyDevice {
     auto It = OmpFileStageEntries.find(SourcePath);
     if (It == OmpFileStageEntries.end())
       return;
-    if (CountInvalidation && InvalidatedBytes == 0) {
-      for (const OmpFileStageExtent &Extent : It->second->CoveredExtents) {
-        if (Extent.End > Extent.Begin)
-          InvalidatedBytes += (Extent.End - Extent.Begin);
+    std::shared_ptr<OmpFileStageEntry> Entry = It->second;
+    {
+      std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
+      if (CountInvalidation && InvalidatedBytes == 0) {
+        for (const OmpFileStageExtent &Extent : Entry->CoveredExtents) {
+          if (Extent.End > Extent.Begin)
+            InvalidatedBytes += (Extent.End - Extent.Begin);
+        }
       }
+      Entry->Invalidated = true;
+      Entry->FullyPopulated = false;
+      Entry->PopulateInProgress = false;
+      Entry->Cond.notify_all();
     }
-    if (!It->second->StagePath.empty()) {
-      (void)::unlink(It->second->StagePath.c_str());
-      It->second->StagePath.clear();
+    if (!Entry->StagePath.empty()) {
+      (void)::unlink(Entry->StagePath.c_str());
+      Entry->StagePath.clear();
     }
     OmpFileStageEntries.erase(It);
     OmpFileStatsStagingEvictions.fetch_add(1, std::memory_order_relaxed);
@@ -1997,6 +2006,47 @@ struct ProxyDevice {
     invalidateStageEntryLocked(SourcePath, /*CountInvalidation=*/true);
   }
 
+  OmpFileStageInvalidateReply invalidateStageForRequest(
+      const OmpFileStageInvalidateRequest &Request, const std::string &Path) {
+    OmpFileStageInvalidateReply Reply{};
+    Reply.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
+    if (Request.AbiVersion != OMPFILE_STAGE_INVALIDATE_ABI_VERSION) {
+      Reply.Status = -1;
+      Reply.Errno = EPROTO;
+      return Reply;
+    }
+    if (Path.empty() || Request.PathKey == 0) {
+      Reply.Status = -1;
+      Reply.Errno = ENOKEY;
+      return Reply;
+    }
+
+    const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
+    auto It = OmpFileStageEntries.find(Path);
+    if (It == OmpFileStageEntries.end()) {
+      OmpFileStatsStageGlobalInvalidationCompletions.fetch_add(
+          1, std::memory_order_relaxed);
+      return Reply;
+    }
+
+    uint64_t InvalidatedBytes = 0;
+    {
+      const std::shared_ptr<OmpFileStageEntry> Entry = It->second;
+      std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
+      for (const OmpFileStageExtent &Extent : Entry->CoveredExtents) {
+        if (Extent.End > Extent.Begin)
+          InvalidatedBytes += (Extent.End - Extent.Begin);
+      }
+    }
+    invalidateStageEntryLocked(Path, /*CountInvalidation=*/true,
+                               InvalidatedBytes, /*FullInvalidation=*/true);
+    Reply.InvalidatedEntries = 1;
+    Reply.InvalidatedBytes = InvalidatedBytes;
+    OmpFileStatsStageGlobalInvalidationCompletions.fetch_add(
+        1, std::memory_order_relaxed);
+    return Reply;
+  }
+
   void invalidateStageRangeForPath(const std::string &SourcePath,
                                    uint64_t Offset, uint64_t Size) {
     if (SourcePath.empty() || Size == 0)
@@ -2008,28 +2058,30 @@ struct ProxyDevice {
     if (It == OmpFileStageEntries.end())
       return;
 
-    const std::shared_ptr<OmpFileStageEntry> &Entry = It->second;
+    const std::shared_ptr<OmpFileStageEntry> Entry = It->second;
     std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
     const uint64_t InvalidatedBytes =
         removeCoveredRange(Entry->CoveredExtents, Offset, End);
     if (InvalidatedBytes == 0)
       return;
 
+    Entry->Invalidated = true;
     Entry->FullyPopulated = false;
+    Entry->PopulateInProgress = false;
+    Entry->Cond.notify_all();
+    Entry->CoveredExtents.clear();
     OmpFileStatsStagingInvalidations.fetch_add(1, std::memory_order_relaxed);
     OmpFileStatsStagingRangeInvalidations.fetch_add(1,
                                                     std::memory_order_relaxed);
     OmpFileStatsStagingInvalidatedBytes.fetch_add(InvalidatedBytes,
                                                   std::memory_order_relaxed);
 
-    if (Entry->CoveredExtents.empty()) {
-      if (!Entry->StagePath.empty()) {
-        (void)::unlink(Entry->StagePath.c_str());
-        Entry->StagePath.clear();
-      }
-      OmpFileStageEntries.erase(It);
-      OmpFileStatsStagingEvictions.fetch_add(1, std::memory_order_relaxed);
+    if (!Entry->StagePath.empty()) {
+      (void)::unlink(Entry->StagePath.c_str());
+      Entry->StagePath.clear();
     }
+    OmpFileStageEntries.erase(It);
+    OmpFileStatsStagingEvictions.fetch_add(1, std::memory_order_relaxed);
   }
 
   bool ensureStageEntryForPath(const std::string &SourcePath, uint64_t Offset,
@@ -2061,6 +2113,14 @@ struct ProxyDevice {
     if (It != OmpFileStageEntries.end()) {
       OmpFileStatsStageLookupHits.fetch_add(1, std::memory_order_relaxed);
       Entry = It->second;
+      {
+        std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
+        if (Entry->Invalidated) {
+          ErrnoOut = ESTALE;
+          recordLockHold();
+          return false;
+        }
+      }
       recordLockHold();
     } else {
       OmpFileStatsStageLookupMisses.fetch_add(1, std::memory_order_relaxed);
@@ -2094,6 +2154,11 @@ struct ProxyDevice {
     Lock.unlock();
 
     if (Size == 0) {
+      std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
+      if (Entry->Invalidated) {
+        ErrnoOut = ESTALE;
+        return false;
+      }
       if (EntryOut)
         *EntryOut = Entry;
       StageFd = Entry->StageFd;
@@ -2103,6 +2168,10 @@ struct ProxyDevice {
     const uint64_t RequestedEnd = saturatingAdd(Offset, Size);
     std::unique_lock<std::mutex> EntryLock(Entry->Mutex);
     while (true) {
+      if (Entry->Invalidated) {
+        ErrnoOut = ESTALE;
+        return false;
+      }
       const bool Covered =
           Entry->FullyPopulated ||
           isCoveredByExtents(Entry->CoveredExtents, Offset, RequestedEnd);
@@ -2133,7 +2202,8 @@ struct ProxyDevice {
 
     EntryLock.lock();
     Entry->PopulateInProgress = false;
-    if (PopulateOk) {
+    const bool StageStillValid = !Entry->Invalidated;
+    if (PopulateOk && StageStillValid) {
       Entry->SourceSize = SourceSize;
       Entry->SourceSizeKnown = true;
       if (!useWindowedStagePopulate() ||
@@ -2144,7 +2214,9 @@ struct ProxyDevice {
     EntryLock.unlock();
     Entry->Cond.notify_all();
 
-    if (!PopulateOk) {
+    if (!PopulateOk || !StageStillValid) {
+      if (PopulateOk && !StageStillValid)
+        ErrnoOut = ESTALE;
       const std::lock_guard<std::mutex> StageLock(OmpFileStageMutex);
       auto MapIt = OmpFileStageEntries.find(SourcePath);
       if (MapIt != OmpFileStageEntries.end() && MapIt->second == Entry) {
@@ -2215,6 +2287,17 @@ struct ProxyDevice {
       }
     }
 
+    const auto PreadStart = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> StageReadLock;
+    if (ReadFd != Fd && HeldStageEntry) {
+      StageReadLock = std::unique_lock<std::mutex>(HeldStageEntry->Mutex);
+      if (HeldStageEntry->Invalidated) {
+        StageReadLock.unlock();
+        HeldStageEntry.reset();
+        ReadFd = Fd;
+      }
+    }
+
     if (ReadFd == Fd && Size > 0) {
       int RefreshErrno = 0;
       if (!refreshTrackedOmpFileFdForRead(Fd, RefreshErrno)) {
@@ -2223,7 +2306,6 @@ struct ProxyDevice {
       }
     }
 
-    const auto PreadStart = std::chrono::steady_clock::now();
     const ssize_t BytesRead =
         ::pread(ReadFd, Buffer, Size, static_cast<off_t>(Offset));
     const auto PreadEnd = std::chrono::steady_clock::now();
@@ -2623,6 +2705,15 @@ struct ProxyDevice {
         OmpFileStatsStageLockWaitUs.load(std::memory_order_relaxed);
     uint64_t StageLockHoldUs =
         OmpFileStatsStageLockHoldUs.load(std::memory_order_relaxed);
+    uint64_t StageGlobalInvalidationRequests =
+        OmpFileStatsStageGlobalInvalidationRequests.load(
+            std::memory_order_relaxed);
+    uint64_t StageGlobalInvalidationCompletions =
+        OmpFileStatsStageGlobalInvalidationCompletions.load(
+            std::memory_order_relaxed);
+    uint64_t StageGlobalInvalidationFailures =
+        OmpFileStatsStageGlobalInvalidationFailures.load(
+            std::memory_order_relaxed);
     uint64_t SourcePreadBytes =
         OmpFileStatsSourcePreadBytes.load(std::memory_order_relaxed);
     uint64_t SourcePreadUs =
@@ -2682,7 +2773,10 @@ struct ProxyDevice {
             "stage_populate_bytes=%llu stage_populate_us_total=%llu "
             "stage_copy_us_total=%llu stage_fsync_us_total=%llu "
             "stage_reopen_us_total=%llu stage_lock_wait_us_total=%llu "
-            "stage_lock_hold_us_total=%llu source_pread_bytes=%llu "
+            "stage_lock_hold_us_total=%llu "
+            "stage_global_invalidations_requested=%llu "
+            "stage_global_invalidations_completed=%llu "
+            "stage_global_invalidations_failed=%llu source_pread_bytes=%llu "
             "source_pread_us_total=%llu staged_pread_us_total=%llu "
             "staging_invalidations=%llu staging_range_invalidations=%llu "
             "staging_full_invalidations=%llu "
@@ -2737,6 +2831,9 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StageReopenUs),
             static_cast<unsigned long long>(StageLockWaitUs),
             static_cast<unsigned long long>(StageLockHoldUs),
+            static_cast<unsigned long long>(StageGlobalInvalidationRequests),
+            static_cast<unsigned long long>(StageGlobalInvalidationCompletions),
+            static_cast<unsigned long long>(StageGlobalInvalidationFailures),
             static_cast<unsigned long long>(SourcePreadBytes),
             static_cast<unsigned long long>(SourcePreadUs),
             static_cast<unsigned long long>(StagedPreadUs),
@@ -2915,7 +3012,55 @@ struct ProxyDevice {
     co_return (co_await RequestManager);
   }
 
+  EventTy ompfileStageInvalidate(MPIRequestManagerTy RequestManager) {
+    OmpFileStageInvalidateRequest Request{};
+    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
 
+    OmpFileStatsStageGlobalInvalidationRequests.fetch_add(
+        1, std::memory_order_relaxed);
+
+    OmpFileStageInvalidateReply Reply{};
+    Reply.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
+    constexpr uint32_t MaxStageInvalidatePathSize =
+        static_cast<uint32_t>(PATH_MAX) + 1;
+    if (Request.PathSize > static_cast<uint32_t>(INT_MAX) ||
+        Request.PathSize > MaxStageInvalidatePathSize) {
+      Reply.Status = -1;
+      Reply.Errno = EOVERFLOW;
+      OmpFileStatsStageGlobalInvalidationFailures.fetch_add(
+          1, std::memory_order_relaxed);
+      RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
+      RequestManager.send(nullptr, 0, MPI_BYTE);
+      co_return (co_await RequestManager);
+    }
+
+    std::vector<char> PathBytes;
+    if (Request.PathSize > 0) {
+      PathBytes.resize(Request.PathSize);
+      RequestManager.receive(PathBytes.data(), static_cast<int>(Request.PathSize),
+                             MPI_CHAR);
+      if (auto Error = co_await RequestManager; Error)
+        co_return Error;
+    }
+
+    std::string Path;
+    if (!PathBytes.empty()) {
+      const char *Begin = PathBytes.data();
+      const size_t Len = PathBytes.back() == '\0' ? PathBytes.size() - 1
+                                                  : PathBytes.size();
+      Path.assign(Begin, Begin + Len);
+    }
+
+    Reply = invalidateStageForRequest(Request, Path);
+    if (Reply.Status != 0)
+      OmpFileStatsStageGlobalInvalidationFailures.fetch_add(
+          1, std::memory_order_relaxed);
+    RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
 
   bool isWorkerRank(int Rank) const {
     return Rank >= 0 && Rank < EventSystem.WorldSize - 1;
@@ -3341,6 +3486,25 @@ struct ProxyDevice {
     return true;
   }
 
+  bool stageInvalidateOnRank(int Rank,
+                             const OmpFileStageInvalidateRequest &Request,
+                             const char *Path,
+                             OmpFileStageInvalidateReply &Reply) {
+    Reply = {};
+    Reply.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
+
+    if (Rank == EventSystem.LocalRank) {
+      Reply = invalidateStageForRequest(Request, Path ? Path : "");
+      return true;
+    }
+
+    EventTy Event = createRankEvent(
+        OriginEvents::ompfileStageInvalidate,
+        EventTypeTy::OMPFILE_STAGE_INVALIDATE, Rank, /*TargetDeviceId=*/0,
+        &Request, Path, &Reply);
+    return waitForEvent(Event, "stage_invalidate");
+  }
+
   int selectAggregatorRankForOpen(const char *Path, int Flags, int Mode) {
     int Rank = isWorkerRank(EventSystem.LocalRank) ? EventSystem.LocalRank : 0;
     const char *SchedulerEnv = std::getenv("LIBOMPFILE_SCHEDULER");
@@ -3550,6 +3714,42 @@ struct ProxyDevice {
       return OFFLOAD_FAIL;
     }
     return OFFLOAD_SUCCESS;
+  }
+
+  int mppStageInvalidatePathKey(uint64_t PathKey, uint64_t Generation,
+                                const char *Path) {
+    if (PathKey == 0 || !Path || Path[0] == '\0')
+      return ENOKEY;
+
+    const size_t PathSize = std::strlen(Path) + 1;
+    if (PathSize > static_cast<size_t>(INT_MAX) ||
+        PathSize > static_cast<size_t>(PATH_MAX) + 1)
+      return EOVERFLOW;
+
+    OmpFileStageInvalidateRequest Request{};
+    Request.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
+    Request.PathSize = static_cast<uint32_t>(PathSize);
+    Request.PathKey = PathKey;
+    Request.Generation = Generation;
+
+    int FirstErrno = 0;
+    for (int Rank = 0; Rank < EventSystem.WorldSize - 1; ++Rank) {
+      OmpFileStageInvalidateReply Reply{};
+      if (!stageInvalidateOnRank(Rank, Request, Path, Reply)) {
+        if (FirstErrno == 0)
+          FirstErrno = errno != 0 ? errno : EIO;
+        continue;
+      }
+      if (Reply.AbiVersion != OMPFILE_STAGE_INVALIDATE_ABI_VERSION) {
+        if (FirstErrno == 0)
+          FirstErrno = EPROTO;
+        continue;
+      }
+      if (Reply.Status != 0 && FirstErrno == 0)
+        FirstErrno = Reply.Errno != 0 ? Reply.Errno : EIO;
+    }
+
+    return FirstErrno;
   }
 
   int mppSchedRequest(const OmpFileIORequest *Request, const char *Path,
@@ -4016,6 +4216,9 @@ struct ProxyDevice {
       case OMPFILE_PWRITE:
         NewEvent = ompfilePwrite(std::move(RequestManager));
         break;
+      case OMPFILE_STAGE_INVALIDATE:
+        NewEvent = ompfileStageInvalidate(std::move(RequestManager));
+        break;
       case OMPFILE_SCHED_REQUEST:
         NewEvent = ompfileSchedRequest(std::move(RequestManager));
         break;
@@ -4142,6 +4345,9 @@ private:
   std::atomic<uint64_t> OmpFileStatsStageReopenUs{0};
   std::atomic<uint64_t> OmpFileStatsStageLockWaitUs{0};
   std::atomic<uint64_t> OmpFileStatsStageLockHoldUs{0};
+  std::atomic<uint64_t> OmpFileStatsStageGlobalInvalidationRequests{0};
+  std::atomic<uint64_t> OmpFileStatsStageGlobalInvalidationCompletions{0};
+  std::atomic<uint64_t> OmpFileStatsStageGlobalInvalidationFailures{0};
   std::atomic<uint64_t> OmpFileStatsSourcePreadBytes{0};
   std::atomic<uint64_t> OmpFileStatsSourcePreadUs{0};
   std::atomic<uint64_t> OmpFileStatsStagedPreadUs{0};
@@ -4252,6 +4458,15 @@ int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppPwriteEx(Handle, Offset, Buffer, Size, BytesWritten);
+}
+
+int ompfile_mpp_stage_invalidate_path_key(uint64_t PathKey,
+                                          uint64_t Generation,
+                                          const char *Path) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return EHOSTDOWN;
+  return PD->mppStageInvalidatePathKey(PathKey, Generation, Path);
 }
 
 int ompfile_mpp_poll(uint64_t Token, int *Done) {

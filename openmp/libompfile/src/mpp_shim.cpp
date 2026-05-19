@@ -21,6 +21,7 @@ using MppPreadFn = int (*)(int, int64_t, void *, uint64_t);
 using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
 using MppPwriteExFn = int (*)(int, int64_t, const void *, uint64_t, uint64_t *);
+using MppStageInvalidatePathKeyFn = int (*)(uint64_t, uint64_t, const char *);
 using MppSchedRequestFn = int (*)(const ompfile::OmpFileIORequest *,
                                   const char *, ompfile::OmpFileIOPlan *);
 using MppSchedBatchRequestFn = int (*)(const ompfile::OmpFileIOBatchRequest *,
@@ -40,6 +41,7 @@ struct MppApi {
   MppPreadExFn pread_ex = nullptr;
   MppPwriteFn pwrite = nullptr;
   MppPwriteExFn pwrite_ex = nullptr;
+  MppStageInvalidatePathKeyFn stage_invalidate_path_key = nullptr;
   MppSchedRequestFn sched_request = nullptr;
   MppSchedBatchRequestFn sched_batch_request = nullptr;
   MppPollFn poll = nullptr;
@@ -66,6 +68,9 @@ MppApi loadMppApi() {
                                                         "ompfile_mpp_pwrite"));
   loaded.pwrite_ex = reinterpret_cast<MppPwriteExFn>(
       dlsym(RTLD_DEFAULT, "ompfile_mpp_pwrite_ex"));
+  loaded.stage_invalidate_path_key =
+      reinterpret_cast<MppStageInvalidatePathKeyFn>(
+          dlsym(RTLD_DEFAULT, "ompfile_mpp_stage_invalidate_path_key"));
   loaded.sched_request = reinterpret_cast<MppSchedRequestFn>(dlsym(
       RTLD_DEFAULT, "ompfile_mpp_sched_request"));
   loaded.sched_batch_request =
@@ -124,6 +129,9 @@ bool init() {
                         reinterpret_cast<void *>(api.pwrite));
   io_trace_symbol_owner("ompfile_mpp_pwrite_ex",
                         reinterpret_cast<void *>(api.pwrite_ex));
+  io_trace_symbol_owner(
+      "ompfile_mpp_stage_invalidate_path_key",
+      reinterpret_cast<void *>(api.stage_invalidate_path_key));
   io_trace_symbol_owner("ompfile_mpp_sched_request",
                         reinterpret_cast<void *>(api.sched_request));
   io_trace_symbol_owner("ompfile_mpp_sched_request_batch",
@@ -377,6 +385,34 @@ bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {
     return false;
   }
   return true;
+}
+
+bool stageInvalidatePathKey(uint64_t path_key, uint64_t generation,
+                            const char *path) {
+  const uint64_t call_id = nextShimCallId();
+  auto &api = getMppApi();
+  if (!api.stage_invalidate_path_key)
+    api = loadMppApi();
+
+  if (!api.stage_invalidate_path_key) {
+    io_log("MPP shim not available "
+           "(ompfile_mpp_stage_invalidate_path_key missing).\n");
+    errno = ENOSYS;
+    return false;
+  }
+
+  if (!init())
+    return false;
+
+  const int rc = api.stage_invalidate_path_key(path_key, generation, path);
+  io_trace("mpp_shim::stageInvalidatePathKey call=%llu path_key=%llu "
+           "generation=%llu rc=%d\n",
+           static_cast<unsigned long long>(call_id),
+           static_cast<unsigned long long>(path_key),
+           static_cast<unsigned long long>(generation), rc);
+  if (rc != 0)
+    errno = rc < 0 ? EIO : rc;
+  return rc == 0;
 }
 
 bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,

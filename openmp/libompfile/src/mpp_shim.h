@@ -24,6 +24,8 @@ bool pread(int handle, int64_t offset, void *buffer, size_t size);
 bool pwriteEx(int handle, int64_t offset, const void *buffer, size_t size,
               size_t &bytes_written);
 bool pwrite(int handle, int64_t offset, const void *buffer, size_t size);
+bool stageInvalidatePathKey(uint64_t path_key, uint64_t generation,
+                            const char *path);
 bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,
                   ompfile::OmpFileIOPlan &plan);
 bool schedBatchRequest(

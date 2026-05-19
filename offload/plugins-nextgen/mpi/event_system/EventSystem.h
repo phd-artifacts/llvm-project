@@ -127,10 +127,21 @@ enum class EventTypeTy : unsigned int {
 
   // Local event used to wait on other events.
   SYNC,
+  OMPFILE_STAGE_INVALIDATE = 36, // Invalidate staged data for a file on a proxy.
 
   // Internal event system commands.
-  EXIT // Stops the event system execution at the remote process.
+  EXIT = 35 // Stops the event system execution at the remote process.
 };
+
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_SCHED_REQUEST) ==
+              31);
+static_assert(
+    static_cast<unsigned int>(EventTypeTy::OMPFILE_SCHED_REQUEST_BATCH) == 32);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_SCHED_PLAN) == 33);
+static_assert(static_cast<unsigned int>(EventTypeTy::SYNC) == 34);
+static_assert(static_cast<unsigned int>(EventTypeTy::EXIT) == 35);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_STAGE_INVALIDATE) ==
+              36);
 
 std::string EventTypeToString(EventTypeTy eventType);
 
@@ -255,6 +266,25 @@ struct OmpFileIOCompletion {
   uint64_t Bytes = 0;
 };
 
+constexpr uint32_t OMPFILE_STAGE_INVALIDATE_ABI_VERSION = 1u;
+
+struct OmpFileStageInvalidateRequest {
+  uint32_t AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
+  uint32_t PathSize = 0;
+  uint64_t PathKey = 0;
+  uint64_t Generation = 0;
+};
+
+struct OmpFileStageInvalidateReply {
+  uint32_t AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  uint32_t InvalidatedEntries = 0;
+  uint32_t Reserved0 = 0;
+  uint32_t Reserved1 = 0;
+  uint64_t InvalidatedBytes = 0;
+};
+
 static_assert(std::is_standard_layout_v<OmpFileIORequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOPlan>);
 static_assert(std::is_standard_layout_v<OmpFileIOHint>);
@@ -263,6 +293,21 @@ static_assert(std::is_standard_layout_v<OmpFileIOBatchRequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchPlanEntry>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchPlan>);
 static_assert(std::is_standard_layout_v<OmpFileIOCompletion>);
+static_assert(std::is_standard_layout_v<OmpFileStageInvalidateRequest>);
+static_assert(std::is_standard_layout_v<OmpFileStageInvalidateReply>);
+static_assert(sizeof(OmpFileStageInvalidateRequest) == 24);
+static_assert(offsetof(OmpFileStageInvalidateRequest, AbiVersion) == 0);
+static_assert(offsetof(OmpFileStageInvalidateRequest, PathSize) == 4);
+static_assert(offsetof(OmpFileStageInvalidateRequest, PathKey) == 8);
+static_assert(offsetof(OmpFileStageInvalidateRequest, Generation) == 16);
+static_assert(sizeof(OmpFileStageInvalidateReply) == 32);
+static_assert(offsetof(OmpFileStageInvalidateReply, AbiVersion) == 0);
+static_assert(offsetof(OmpFileStageInvalidateReply, Status) == 4);
+static_assert(offsetof(OmpFileStageInvalidateReply, Errno) == 8);
+static_assert(offsetof(OmpFileStageInvalidateReply, InvalidatedEntries) == 12);
+static_assert(offsetof(OmpFileStageInvalidateReply, Reserved0) == 16);
+static_assert(offsetof(OmpFileStageInvalidateReply, Reserved1) == 20);
+static_assert(offsetof(OmpFileStageInvalidateReply, InvalidatedBytes) == 24);
 
 /// Coroutine events
 ///
@@ -470,6 +515,9 @@ public:
   /// Send a buffer with determined size to target in batchs.
   void sendInBatchs(void *Buffer, int64_t Size);
 
+  /// Sends a buffer with determined size to target using blocking MPI calls.
+  llvm::Error sendInBatchsBlocking(const void *Buffer, uint64_t Size);
+
   /// Receives a buffer of given datatype items with determined size from
   /// target.
   void receive(void *Buffer, int Size, MPI_Datatype Datatype);
@@ -550,6 +598,10 @@ EventTy ompfilePread(MPIRequestManagerTy RequestManager, int RemoteHandle,
 EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
                       int64_t Offset, const void *Buffer, uint64_t Size,
                       int *IoRet, int *RemoteErrno, uint64_t *Bytes);
+EventTy ompfileStageInvalidate(MPIRequestManagerTy RequestManager,
+                               const OmpFileStageInvalidateRequest *Request,
+                               const char *Path,
+                               OmpFileStageInvalidateReply *Reply);
 EventTy ompfileSchedRequest(MPIRequestManagerTy RequestManager,
                             const OmpFileIORequest *Request, const char *Path,
                             OmpFileIOPlan *Plan);
@@ -773,6 +825,7 @@ EventTy EventSystemTy::NotificationEvent(EventFuncTy EventFunc, EventTypeTy Even
 
   if (EventType != EventTypeTy::IS_PLUGIN_COMPATIBLE &&
       EventType != EventTypeTy::RETRIEVE_NUM_DEVICES &&
+      EventType != EventTypeTy::OMPFILE_STAGE_INVALIDATE &&
       EventType != EventTypeTy::EXIT)
     std::tie(RemoteRank, RemoteDeviceId) = mapDeviceId(DstDeviceID);
 

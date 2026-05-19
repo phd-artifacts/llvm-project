@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -1818,6 +1819,67 @@ int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,
     return OFFLOAD_FAIL;
   }
   return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_stage_invalidate_path_key(uint64_t PathKey,
+                                          uint64_t Generation,
+                                          const char *Path) {
+  using namespace llvm::omp::target::plugin;
+  if (PathKey == 0 || !Path || Path[0] == '\0')
+    return ENOKEY;
+
+  const size_t PathSize = std::strlen(Path) + 1;
+  if (PathSize > static_cast<size_t>(INT_MAX) ||
+      PathSize > static_cast<size_t>(PATH_MAX) + 1)
+    return EOVERFLOW;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return EHOSTDOWN;
+
+  if (auto Err = Plugin->init())
+    return EHOSTDOWN;
+
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return EHOSTDOWN;
+
+  OmpFileStageInvalidateRequest Request{};
+  Request.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
+  Request.PathSize = static_cast<uint32_t>(PathSize);
+  Request.PathKey = PathKey;
+  Request.Generation = Generation;
+
+  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
+  int FirstErrno = 0;
+  for (int Rank = 0; Rank < EventSystem.getNumWorkers(); ++Rank) {
+    OmpFileStageInvalidateReply Reply{};
+    EventTy Event = EventSystem.createEvent(
+        OriginEvents::ompfileStageInvalidate,
+        EventTypeTy::OMPFILE_STAGE_INVALIDATE, /*DstDeviceID=*/Rank, &Request,
+        Path, &Reply);
+    if (Event.empty()) {
+      if (FirstErrno == 0)
+        FirstErrno = EIO;
+      continue;
+    }
+
+    Event.wait();
+    if (auto Error = Event.getError()) {
+      if (FirstErrno == 0)
+        FirstErrno = EIO;
+      continue;
+    }
+
+    if (Reply.AbiVersion != OMPFILE_STAGE_INVALIDATE_ABI_VERSION) {
+      if (FirstErrno == 0)
+        FirstErrno = EPROTO;
+      continue;
+    }
+    if (Reply.Status != 0 && FirstErrno == 0)
+      FirstErrno = Reply.Errno != 0 ? Reply.Errno : EIO;
+  }
+
+  return FirstErrno;
 }
 
 int ompfile_mpp_poll(uint64_t Token, int *Done) {

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdarg>
@@ -84,6 +85,8 @@ std::string EventTypeToString(EventTypeTy eventType) {
       return "OMPFILE_SCHED_REQUEST_BATCH";
     case EventTypeTy::OMPFILE_SCHED_PLAN: return "OMPFILE_SCHED_PLAN";
     case EventTypeTy::SYNC: return "SYNC";
+    case EventTypeTy::OMPFILE_STAGE_INVALIDATE:
+      return "OMPFILE_STAGE_INVALIDATE";
     case EventTypeTy::EXIT: return "EXIT";
     default: return "UNKNOWN_EVENT_TYPE";
   }
@@ -351,6 +354,40 @@ void MPIRequestManagerTy::receiveInBatchs(void *Buffer, int64_t Size) {
     Offset += Chunk;
     RemainingBytes -= Chunk;
   }
+}
+
+llvm::Error MPIRequestManagerTy::sendInBatchsBlocking(const void *Buffer,
+                                                      uint64_t Size) {
+  if (Size <= 0)
+    return llvm::Error::success();
+  if (!Buffer)
+    return createError("Blocking batch send missing source buffer.");
+
+  const int64_t FragmentSize = MPIFragmentSize.get();
+  if (FragmentSize <= 0)
+    return createError("Invalid MPI fragment size %lld for blocking send.",
+                       static_cast<long long>(FragmentSize));
+
+  constexpr int64_t MaxMPIChunk =
+      static_cast<int64_t>(std::numeric_limits<int>::max());
+
+  const char *BufferByteArray = reinterpret_cast<const char *>(Buffer);
+  uint64_t RemainingBytes = Size;
+  uint64_t Offset = 0;
+  while (RemainingBytes > 0) {
+    const int64_t Chunk = std::min(
+        {static_cast<int64_t>(std::min<uint64_t>(
+             RemainingBytes, static_cast<uint64_t>(MaxMPIChunk))),
+         FragmentSize, MaxMPIChunk});
+    assert(Chunk > 0 && "MPI fragment chunk must be positive.");
+    if (auto Error = sendBlocking(&BufferByteArray[Offset],
+                                  static_cast<int>(Chunk), MPI_BYTE))
+      return Error;
+    Offset += Chunk;
+    RemainingBytes -= Chunk;
+  }
+
+  return llvm::Error::success();
 }
 
 llvm::Error MPIRequestManagerTy::receiveInBatchsBlocking(void *Buffer,
@@ -798,19 +835,24 @@ EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
                       int *IoRet, int *RemoteErrno, uint64_t *Bytes) {
   if (!IoRet || !RemoteErrno || !Bytes)
     co_return createError("OMPFile pwrite missing output buffers.");
+  if (Size > 0 && !Buffer)
+    co_return createError("OMPFile pwrite missing payload buffer.");
   *Bytes = 0;
 
   RequestManager.send(&RemoteHandle, 1, MPI_INT);
   RequestManager.send(&Offset, 1, MPI_INT64_T);
   RequestManager.send(&Size, 1, MPI_UINT64_T);
-  if (Size > 0)
-    RequestManager.sendInBatchs(const_cast<void *>(Buffer), Size);
 
-  // Complete the outgoing payload first. Keeping the request set one-way here
-  // avoids MPICH internal_Testall failures seen when large non-streaming write
-  // cases mix payload Isends and completion Irecvs in a single wait set.
+  // Complete local ownership of the control sends before the blocking payload
+  // send. The proxy receives the control header before posting its matching
+  // blocking payload receive, so this keeps the payload path out of Testall.
   if (auto Error = co_await RequestManager; Error)
     co_return Error;
+
+  if (Size > 0) {
+    if (auto Error = RequestManager.sendInBatchsBlocking(Buffer, Size))
+      co_return Error;
+  }
 
   RequestManager.receive(IoRet, 1, MPI_INT);
   RequestManager.receive(RemoteErrno, 1, MPI_INT);
@@ -820,6 +862,35 @@ EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
     co_return Error;
 
   // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileStageInvalidate(MPIRequestManagerTy RequestManager,
+                               const OmpFileStageInvalidateRequest *Request,
+                               const char *Path,
+                               OmpFileStageInvalidateReply *Reply) {
+  if (!Request || !Reply)
+    co_return createError("OMPFile stage invalidate missing buffers.");
+  if (Request->PathSize > 0 && !Path)
+    co_return createError("OMPFile stage invalidate missing path.");
+  if (Request->PathSize > static_cast<uint32_t>(INT_MAX))
+    co_return createError("OMPFile stage invalidate path too large.");
+  if (Request->PathSize > static_cast<uint32_t>(PATH_MAX) + 1)
+    co_return createError("OMPFile stage invalidate path too large.");
+
+  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
+  if (Request->PathSize > 0)
+    RequestManager.send(Path, static_cast<int>(Request->PathSize), MPI_CHAR);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
   RequestManager.receive(nullptr, 0, MPI_BYTE);
   co_return (co_await RequestManager);
 }

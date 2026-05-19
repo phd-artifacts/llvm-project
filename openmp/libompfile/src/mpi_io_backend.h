@@ -31,6 +31,11 @@ private:
   std::unordered_map<int, std::unordered_map<int, int>> remote_read_handle_cache;
   std::unordered_map<int, std::string> file_path_map;
   std::unordered_map<int, uint64_t> file_path_key_map;
+  struct WritableStageCoherenceState {
+    uint64_t WriteGeneration = 0;
+    uint64_t InvalidatedGeneration = 0;
+    bool InvalidationFailed = false;
+  };
   struct WriteEpochEntry {
     long Start = 0;
     long End = 0;
@@ -41,10 +46,12 @@ private:
     bool HasTile = false;
   };
   std::unordered_map<int, std::vector<WriteEpochEntry>> file_write_epoch_history;
+  std::unordered_map<int, WritableStageCoherenceState>
+      writable_stage_coherence;
   uint64_t next_write_sequence = 1;
   std::unordered_set<int> logical_handle_set;
   std::atomic<int> next_file_handle{0};
-  std::mutex handle_mutex;
+  mutable std::mutex handle_mutex;
   std::mutex mpp_call_mutex;
   bool mpp_open_enabled = false;
   bool mpp_io_enabled = false;
@@ -104,6 +111,15 @@ private:
   std::atomic<uint64_t> writable_read_rebalance_blocked_unsafe_overlap_count{0};
   std::atomic<uint64_t>
       writable_read_rebalance_blocked_invalid_destination_count{0};
+  std::atomic<uint64_t> stage_global_invalidations_requested{0};
+  std::atomic<uint64_t> stage_global_invalidations_completed{0};
+  std::atomic<uint64_t> stage_global_invalidations_failed{0};
+  std::atomic<uint64_t>
+      writable_read_rebalance_blocked_pending_invalidation{0};
+  std::atomic<uint64_t>
+      writable_read_rebalance_after_invalidation_eligible{0};
+  std::atomic<uint64_t>
+      writable_read_rebalance_after_invalidation_applied{0};
   std::atomic<uint64_t> two_phase_cache_hit_count{0};
   std::atomic<uint64_t> two_phase_planner_batch_id{1};
   std::atomic<uint64_t> two_phase_request_id{1};
@@ -221,7 +237,38 @@ public:
     uint64_t BlockedStaleMetadata = 0;
     uint64_t BlockedUnsafeOverlap = 0;
     uint64_t BlockedInvalidDestination = 0;
+    uint64_t BlockedPendingInvalidation = 0;
+    uint64_t AfterInvalidationEligible = 0;
+    uint64_t AfterInvalidationApplied = 0;
+    uint64_t StageInvalidationsRequested = 0;
+    uint64_t StageInvalidationsCompleted = 0;
+    uint64_t StageInvalidationsFailed = 0;
   };
+  bool globallyInvalidateStageForTesting(int file_id) {
+    return globallyInvalidateStageForFile(file_id);
+  }
+  bool hasCompletedStageInvalidationForTesting(int file_id) const;
+  void markStageInvalidationCompleteForTesting(int file_id) {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    auto &coherence = writable_stage_coherence[file_id];
+    coherence.InvalidatedGeneration = coherence.WriteGeneration;
+    coherence.InvalidationFailed = false;
+  }
+  uint64_t writableStageWriteGenerationForTesting(int file_id) const {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    auto it = writable_stage_coherence.find(file_id);
+    return it == writable_stage_coherence.end() ? 0 : it->second.WriteGeneration;
+  }
+  void completeStageInvalidationForTesting(int file_id, uint64_t generation,
+                                           bool ok) {
+    completeStageInvalidationForFile(file_id, generation, ok);
+  }
+  void noteAppliedRebalancedWritableReadForTesting(int file_id) {
+    noteAppliedRebalancedReadForFile(file_id);
+  }
+  void triggerPostSuccessfulRemoteWriteInvalidationForTesting(int file_id) {
+    triggerStageInvalidationAfterSuccessfulRemoteWrite(file_id);
+  }
   void addPlannerCountersForTesting(uint64_t rebalanced, uint64_t applied,
                                     uint64_t skipped, uint64_t conflicts,
                                     uint64_t errors) {
@@ -264,7 +311,18 @@ public:
             writable_read_rebalance_blocked_unsafe_overlap_count.load(
                 std::memory_order_relaxed),
             writable_read_rebalance_blocked_invalid_destination_count.load(
-                std::memory_order_relaxed)};
+                std::memory_order_relaxed),
+            writable_read_rebalance_blocked_pending_invalidation.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_after_invalidation_eligible.load(
+                std::memory_order_relaxed),
+            writable_read_rebalance_after_invalidation_applied.load(
+                std::memory_order_relaxed),
+            stage_global_invalidations_requested.load(
+                std::memory_order_relaxed),
+            stage_global_invalidations_completed.load(
+                std::memory_order_relaxed),
+            stage_global_invalidations_failed.load(std::memory_order_relaxed)};
   }
   struct QueueCoordinationCountersForTesting {
     uint64_t TwoPhaseQueueMaxDepth = 0;
@@ -396,6 +454,11 @@ private:
   bool rangesOverlap(long a_start, long a_end, long b_start, long b_end) const;
   void recordWriteEpochForContext(int file_id, long offset, size_t size,
                                   const ompfile::OmpFileIOHint &hint);
+  bool globallyInvalidateStageForFile(int file_id);
+  void completeStageInvalidationForFile(int file_id, uint64_t generation,
+                                        bool ok);
+  void triggerStageInvalidationAfterSuccessfulRemoteWrite(int file_id);
+  void noteAppliedRebalancedReadForFile(int file_id);
   bool canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint, int file_id,
                               long start, size_t size,
                               const char *&reason_out,
