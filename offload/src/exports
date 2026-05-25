@@ -76,8 +76,16 @@ VERS1.0 {
     ompfile_mpp_init;
     ompfile_mpp_submit;
     ompfile_mpp_open;
+    ompfile_mpp_open_on_rank;
+    ompfile_mpp_handle_owner_rank;
     ompfile_mpp_sched_request;
     ompfile_mpp_sched_request_batch;
+    ompfile_mpp_freshness_query;
+    ompfile_mpp_freshness_write_commit;
+    ompfile_mpp_proxy_copy_tile;
+    ompfile_mpp_freshness_mark_fresh;
+    ompfile_mpp_flush_dirty_tile;
+    ompfile_mpp_stage_invalidate_path_key;
     ompfile_mpp_close;
     ompfile_mpp_pread;
     ompfile_mpp_pread_ex;

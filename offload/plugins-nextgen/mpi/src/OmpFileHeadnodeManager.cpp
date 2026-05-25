@@ -952,6 +952,11 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
       Plan.PlanFlags |= OMPFILE_BATCH_PLAN_REBALANCED;
 
     Plan.RemoteHandle = static_cast<int32_t>(Entry.GlobalFileId & 0x7fffffffU);
+
+    const std::string PathKeyStr = std::to_string(PathKey);
+    emitFreshnessTrace("compat_sched_open", PathKeyStr, Request.ClientRank,
+                       Request.ClientRank, HandlerRank, 0, 0, "route", "ok",
+                       "legacy_entrypoint", "na");
   } else if (Request.Op == OmpFileIOOp::PWRITE) {
     uint64_t PathKey = 0;
     bool HasPathKey = false;
@@ -966,6 +971,10 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
 
     if (HasPathKey) {
       recordWriteVersionUnlocked(PathKey, Request);
+      const std::string PathKeyStr = std::to_string(PathKey);
+      emitFreshnessTrace("compat_write_version", PathKeyStr, Request.ClientRank,
+                         Request.ClientRank, HandlerRank, 0, 0, "record",
+                         "ok", "legacy_entrypoint", "na");
       fprintf(stderr,
               "[ompfile-mpp][sched] write-version path_key=%llu offset=%lld "
               "size=%llu has_epoch=%d epoch=%llu has_tile=%d tile=%llu\n",
