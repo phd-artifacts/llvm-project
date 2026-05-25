@@ -36,6 +36,8 @@
 
 #include "llvm/ADT/SmallVector.h"
 
+#include "../../../../openmp/libompfile/include/ompfile_sched.h"
+
 #include "Shared/APITypes.h"
 #include "Shared/EnvironmentVar.h"
 #include "Shared/Utils.h"
@@ -129,6 +131,11 @@ enum class EventTypeTy : unsigned int {
   SYNC,
   OMPFILE_STAGE_INVALIDATE = 36, // Invalidate staged data for a file on a proxy.
   OMPFILE_PREAD_NO_STAGE = 37, // Read from a proxy while bypassing staging.
+  OMPFILE_FRESHNESS_QUERY = 38, // Query freshness decision from headnode.
+  OMPFILE_PROXY_COPY_TILE = 39, // Copy a tile from source rank to destination rank.
+  OMPFILE_FRESHNESS_MARK_FRESH = 40, // Mark destination rank fresh for version.
+  OMPFILE_FRESHNESS_WRITE_COMMIT = 41, // Report a successful tile write.
+  OMPFILE_FLUSH_DIRTY_TILE = 42, // Flush dirty tile metadata on headnode.
 
   // Internal event system commands.
   EXIT = 35 // Stops the event system execution at the remote process.
@@ -145,6 +152,93 @@ static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_STAGE_INVALIDATE) =
               36);
 static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_PREAD_NO_STAGE) ==
               37);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_FRESHNESS_QUERY) ==
+              38);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_PROXY_COPY_TILE) ==
+              39);
+static_assert(
+    static_cast<unsigned int>(EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH) ==
+    40);
+static_assert(
+    static_cast<unsigned int>(EventTypeTy::OMPFILE_FRESHNESS_WRITE_COMMIT) ==
+    41);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE) ==
+              42);
+
+using OmpFileFreshnessDecision = ompfile::OmpFileFreshnessDecision;
+using OmpFileFreshnessQueryRequest = ompfile::OmpFileFreshnessQueryRequest;
+using OmpFileFreshnessQueryReply = ompfile::OmpFileFreshnessQueryReply;
+
+constexpr uint32_t OMPFILE_FRESHNESS_QUERY_ABI_VERSION =
+    ompfile::OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+
+struct OmpFileProxyCopyTileRequest {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  uint32_t Reserved0 = 0;
+  uint64_t PathKey = 0;
+  uint64_t TileId = 0;
+  int32_t SourceRank = -1;
+  int32_t DestRank = -1;
+  uint64_t Version = 0;
+};
+
+struct OmpFileProxyCopyTileReply {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  int32_t Reserved0 = 0;
+  uint64_t BytesCopied = 0;
+};
+
+struct OmpFileFreshnessMarkFreshRequest {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  uint32_t Reserved0 = 0;
+  uint64_t PathKey = 0;
+  uint64_t Version = 0;
+  int32_t Rank = -1;
+  int32_t Reserved1 = 0;
+};
+
+struct OmpFileFreshnessMarkFreshReply {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  int32_t Reserved0 = 0;
+};
+
+struct OmpFileFreshnessWriteCommitRequest {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  uint32_t WriteThroughMode = 0;
+  uint64_t PathKey = 0;
+  uint64_t TileId = 0;
+  int32_t WriterRank = -1;
+  int32_t Reserved0 = 0;
+};
+
+struct OmpFileFreshnessWriteCommitReply {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  int32_t Reserved0 = 0;
+  uint64_t CommittedVersion = 0;
+};
+
+struct OmpFileFlushDirtyTileRequest {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  uint32_t Action = 0; // 0=prepare, 1=complete
+  uint64_t PathKey = 0;
+  int32_t SourceRank = -1;
+  int32_t Success = 0;
+  uint64_t Version = 0;
+};
+
+struct OmpFileFlushDirtyTileReply {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  int32_t SourceRank = -1;
+  uint64_t FlushedVersion = 0;
+};
 
 std::string EventTypeToString(EventTypeTy eventType);
 
@@ -298,6 +392,8 @@ static_assert(std::is_standard_layout_v<OmpFileIOBatchPlan>);
 static_assert(std::is_standard_layout_v<OmpFileIOCompletion>);
 static_assert(std::is_standard_layout_v<OmpFileStageInvalidateRequest>);
 static_assert(std::is_standard_layout_v<OmpFileStageInvalidateReply>);
+static_assert(std::is_standard_layout_v<OmpFileFreshnessQueryRequest>);
+static_assert(std::is_standard_layout_v<OmpFileFreshnessQueryReply>);
 static_assert(sizeof(OmpFileStageInvalidateRequest) == 24);
 static_assert(offsetof(OmpFileStageInvalidateRequest, AbiVersion) == 0);
 static_assert(offsetof(OmpFileStageInvalidateRequest, PathSize) == 4);
@@ -311,6 +407,18 @@ static_assert(offsetof(OmpFileStageInvalidateReply, InvalidatedEntries) == 12);
 static_assert(offsetof(OmpFileStageInvalidateReply, Reserved0) == 16);
 static_assert(offsetof(OmpFileStageInvalidateReply, Reserved1) == 20);
 static_assert(offsetof(OmpFileStageInvalidateReply, InvalidatedBytes) == 24);
+static_assert(sizeof(OmpFileFreshnessQueryRequest) == 32);
+static_assert(offsetof(OmpFileFreshnessQueryRequest, AbiVersion) == 0);
+static_assert(offsetof(OmpFileFreshnessQueryRequest, PathKey) == 8);
+static_assert(offsetof(OmpFileFreshnessQueryRequest, LocalVersion) == 16);
+static_assert(offsetof(OmpFileFreshnessQueryRequest, RequesterRank) == 24);
+static_assert(sizeof(OmpFileFreshnessQueryReply) == 32);
+static_assert(offsetof(OmpFileFreshnessQueryReply, AbiVersion) == 0);
+static_assert(offsetof(OmpFileFreshnessQueryReply, Decision) == 4);
+static_assert(offsetof(OmpFileFreshnessQueryReply, SourceRank) == 8);
+static_assert(offsetof(OmpFileFreshnessQueryReply, Status) == 12);
+static_assert(offsetof(OmpFileFreshnessQueryReply, Errno) == 16);
+static_assert(offsetof(OmpFileFreshnessQueryReply, SelectedVersion) == 24);
 
 /// Coroutine events
 ///
@@ -605,9 +713,26 @@ EventTy ompfileStageInvalidate(MPIRequestManagerTy RequestManager,
                                const OmpFileStageInvalidateRequest *Request,
                                const char *Path,
                                OmpFileStageInvalidateReply *Reply);
+EventTy ompfileFreshnessQuery(MPIRequestManagerTy RequestManager,
+                               const OmpFileFreshnessQueryRequest *Request,
+                               OmpFileFreshnessQueryReply *Reply);
+EventTy ompfileFreshnessWriteCommit(
+    MPIRequestManagerTy RequestManager,
+    const OmpFileFreshnessWriteCommitRequest *Request,
+    OmpFileFreshnessWriteCommitReply *Reply);
+EventTy ompfileProxyCopyTile(MPIRequestManagerTy RequestManager,
+                             const OmpFileProxyCopyTileRequest *Request,
+                             OmpFileProxyCopyTileReply *Reply);
+EventTy ompfileFreshnessMarkFresh(
+    MPIRequestManagerTy RequestManager,
+    const OmpFileFreshnessMarkFreshRequest *Request,
+    OmpFileFreshnessMarkFreshReply *Reply);
+EventTy ompfileFlushDirtyTile(MPIRequestManagerTy RequestManager,
+                              const OmpFileFlushDirtyTileRequest *Request,
+                              OmpFileFlushDirtyTileReply *Reply);
 EventTy ompfileSchedRequest(MPIRequestManagerTy RequestManager,
-                            const OmpFileIORequest *Request, const char *Path,
-                            OmpFileIOPlan *Plan);
+                              const OmpFileIORequest *Request, const char *Path,
+                              OmpFileIOPlan *Plan);
 EventTy ompfileSchedBatchRequest(MPIRequestManagerTy RequestManager,
                                  const OmpFileIOBatchRequest *Request,
                                  const void *RequestPayload,

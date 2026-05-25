@@ -12,10 +12,21 @@
 
 namespace {
 
+extern "C" int ompfile_mpp_freshness_write_commit(uint64_t, int, uint64_t, int,
+                                                     uint64_t *)
+    __attribute__((weak));
+extern "C" int ompfile_mpp_proxy_copy_tile(uint64_t, uint64_t, int, int,
+                                             uint64_t) __attribute__((weak));
+extern "C" int ompfile_mpp_freshness_mark_fresh(uint64_t, int, uint64_t)
+    __attribute__((weak));
+extern "C" int ompfile_mpp_flush_dirty_tile(uint64_t, int *, uint64_t *)
+    __attribute__((weak));
+
 using MppInitFn = int (*)();
 using MppSubmitFn = int (*)(uint64_t);
 using MppOpenFn = int (*)(const char *, int, int, int *);
 using MppOpenOnRankFn = int (*)(const char *, int, int, int, int *);
+using MppHandleOwnerRankFn = int (*)(int, int *);
 using MppCloseFn = int (*)(int);
 using MppPreadFn = int (*)(int, int64_t, void *, uint64_t);
 using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
@@ -23,6 +34,13 @@ using MppPreadNoStageExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
 using MppPwriteExFn = int (*)(int, int64_t, const void *, uint64_t, uint64_t *);
 using MppStageInvalidatePathKeyFn = int (*)(uint64_t, uint64_t, const char *);
+using MppFreshnessQueryFn = int (*)(const ompfile::OmpFileFreshnessQueryRequest *,
+                                    ompfile::OmpFileFreshnessQueryReply *);
+using MppFreshnessWriteCommitFn = int (*)(uint64_t, int, uint64_t, int,
+                                          uint64_t *);
+using MppProxyCopyTileFn = int (*)(uint64_t, uint64_t, int, int, uint64_t);
+using MppFreshnessMarkFreshFn = int (*)(uint64_t, int, uint64_t);
+using MppFlushDirtyTileFn = int (*)(uint64_t, int *, uint64_t *);
 using MppSchedRequestFn = int (*)(const ompfile::OmpFileIORequest *,
                                   const char *, ompfile::OmpFileIOPlan *);
 using MppSchedBatchRequestFn = int (*)(const ompfile::OmpFileIOBatchRequest *,
@@ -37,6 +55,7 @@ struct MppApi {
   MppSubmitFn submit = nullptr;
   MppOpenFn open = nullptr;
   MppOpenOnRankFn open_on_rank = nullptr;
+  MppHandleOwnerRankFn handle_owner_rank = nullptr;
   MppCloseFn close = nullptr;
   MppPreadFn pread = nullptr;
   MppPreadExFn pread_ex = nullptr;
@@ -44,6 +63,11 @@ struct MppApi {
   MppPwriteFn pwrite = nullptr;
   MppPwriteExFn pwrite_ex = nullptr;
   MppStageInvalidatePathKeyFn stage_invalidate_path_key = nullptr;
+  MppFreshnessQueryFn freshness_query = nullptr;
+  MppFreshnessWriteCommitFn freshness_write_commit = nullptr;
+  MppProxyCopyTileFn proxy_copy_tile = nullptr;
+  MppFreshnessMarkFreshFn freshness_mark_fresh = nullptr;
+  MppFlushDirtyTileFn flush_dirty_tile = nullptr;
   MppSchedRequestFn sched_request = nullptr;
   MppSchedBatchRequestFn sched_batch_request = nullptr;
   MppPollFn poll = nullptr;
@@ -60,6 +84,8 @@ MppApi loadMppApi() {
                                                        "ompfile_mpp_open"));
   loaded.open_on_rank = reinterpret_cast<MppOpenOnRankFn>(
       dlsym(RTLD_DEFAULT, "ompfile_mpp_open_on_rank"));
+  loaded.handle_owner_rank = reinterpret_cast<MppHandleOwnerRankFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_handle_owner_rank"));
   loaded.close = reinterpret_cast<MppCloseFn>(dlsym(RTLD_DEFAULT,
                                                         "ompfile_mpp_close"));
   loaded.pread = reinterpret_cast<MppPreadFn>(dlsym(RTLD_DEFAULT,
@@ -77,6 +103,16 @@ MppApi loadMppApi() {
           dlsym(RTLD_DEFAULT, "ompfile_mpp_stage_invalidate_path_key"));
   loaded.sched_request = reinterpret_cast<MppSchedRequestFn>(dlsym(
       RTLD_DEFAULT, "ompfile_mpp_sched_request"));
+  loaded.freshness_query = reinterpret_cast<MppFreshnessQueryFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_freshness_query"));
+  loaded.freshness_write_commit = reinterpret_cast<MppFreshnessWriteCommitFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_freshness_write_commit"));
+  loaded.proxy_copy_tile = reinterpret_cast<MppProxyCopyTileFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_proxy_copy_tile"));
+  loaded.freshness_mark_fresh = reinterpret_cast<MppFreshnessMarkFreshFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_freshness_mark_fresh"));
+  loaded.flush_dirty_tile = reinterpret_cast<MppFlushDirtyTileFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_flush_dirty_tile"));
   loaded.sched_batch_request =
       reinterpret_cast<MppSchedBatchRequestFn>(dlsym(
           RTLD_DEFAULT, "ompfile_mpp_sched_request_batch"));
@@ -250,6 +286,28 @@ bool openOnRank(const char *path, int flags, int mode, int rank, int &handle) {
 
   io_trace("mpp_shim::openOnRank success call=%llu handle=%d rank=%d\n",
            static_cast<unsigned long long>(call_id), handle, rank);
+  return true;
+}
+
+bool handleOwnerRank(int handle, int &rank_out) {
+  rank_out = -1;
+  if (!init())
+    return false;
+
+  auto &api = getMppApi();
+  if (!api.handle_owner_rank)
+    api = loadMppApi();
+  if (!api.handle_owner_rank) {
+    errno = ENOSYS;
+    return false;
+  }
+
+  const int rc = api.handle_owner_rank(handle, &rank_out);
+  if (rc != 0 || rank_out < 0) {
+    errno = rc != 0 ? (rc < 0 ? EIO : rc) : EIO;
+    rank_out = -1;
+    return false;
+  }
   return true;
 }
 
@@ -445,6 +503,216 @@ bool stageInvalidatePathKey(uint64_t path_key, uint64_t generation,
   if (rc != 0)
     errno = rc < 0 ? EIO : rc;
   return rc == 0;
+}
+
+bool freshnessQuery(uint64_t path_key, uint64_t local_version,
+                    int requester_rank, uint32_t &decision_out,
+                    int &source_rank_out, uint64_t &selected_version_out) {
+  decision_out = static_cast<uint32_t>(ompfile::OmpFileFreshnessDecision::WAIT_OR_FAIL);
+  source_rank_out = -1;
+  selected_version_out = 0;
+  if (path_key == 0 || requester_rank < 0) {
+    errno = EINVAL;
+    return false;
+  }
+  if (!init())
+    return false;
+
+  auto &api = getMppApi();
+  if (!api.freshness_query)
+    api = loadMppApi();
+  if (!api.freshness_query) {
+    errno = ENOSYS;
+    return false;
+  }
+
+  ompfile::OmpFileFreshnessQueryRequest request{};
+  request.AbiVersion = ompfile::OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  request.PathKey = path_key;
+  request.LocalVersion = local_version;
+  request.RequesterRank = requester_rank;
+
+  ompfile::OmpFileFreshnessQueryReply reply{};
+  const int rc = api.freshness_query(&request, &reply);
+  if (rc != 0) {
+    errno = rc < 0 ? EIO : rc;
+    return false;
+  }
+  if (reply.Status != 0) {
+    errno = reply.Errno != 0 ? reply.Errno : EIO;
+    return false;
+  }
+
+  if (reply.AbiVersion != ompfile::OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+    errno = EPROTO;
+    return false;
+  }
+
+  if (reply.Decision >
+      static_cast<uint32_t>(ompfile::OmpFileFreshnessDecision::COPY_FROM_RANK)) {
+    errno = EPROTO;
+    return false;
+  }
+
+  decision_out = reply.Decision;
+  source_rank_out = reply.SourceRank;
+  selected_version_out = reply.SelectedVersion;
+  return true;
+}
+
+bool freshnessWriteCommit(uint64_t path_key, int writer_rank, uint64_t tile_id,
+                          bool write_through_mode,
+                          uint64_t &committed_version_out) {
+  committed_version_out = 0;
+  if (path_key == 0 || writer_rank < 0) {
+    errno = EINVAL;
+    return false;
+  }
+  const int mode = write_through_mode ? 1 : 0;
+  if (ompfile_mpp_freshness_write_commit) {
+    const int rc = ompfile_mpp_freshness_write_commit(
+        path_key, writer_rank, tile_id, mode, &committed_version_out);
+    if (rc != 0) {
+      errno = rc < 0 ? EIO : rc;
+      committed_version_out = 0;
+      return false;
+    }
+    return true;
+  }
+
+  if (!init())
+    return false;
+
+  auto &api = getMppApi();
+  if (!api.freshness_write_commit)
+    api = loadMppApi();
+  if (!api.freshness_write_commit) {
+    errno = ENOSYS;
+    return false;
+  }
+
+  const int rc = api.freshness_write_commit(path_key, writer_rank, tile_id,
+                                            mode, &committed_version_out);
+  if (rc != 0) {
+    errno = rc < 0 ? EIO : rc;
+    committed_version_out = 0;
+    return false;
+  }
+  return true;
+}
+
+bool proxyCopyTile(uint64_t path_key, uint64_t tile_id, int source_rank,
+                   int dest_rank, uint64_t version) {
+  if (path_key == 0 || source_rank < 0 || dest_rank < 0 || version == 0) {
+    errno = EINVAL;
+    return false;
+  }
+
+  if (ompfile_mpp_proxy_copy_tile) {
+    const int rc = ompfile_mpp_proxy_copy_tile(path_key, tile_id, source_rank,
+                                               dest_rank, version);
+    if (rc != 0) {
+      errno = rc < 0 ? EIO : rc;
+      return false;
+    }
+    return true;
+  }
+
+  if (!init())
+    return false;
+
+  auto &api = getMppApi();
+  if (!api.proxy_copy_tile)
+    api = loadMppApi();
+  if (!api.proxy_copy_tile) {
+    errno = ENOSYS;
+    return false;
+  }
+
+  const int rc =
+      api.proxy_copy_tile(path_key, tile_id, source_rank, dest_rank, version);
+  if (rc != 0) {
+    errno = rc < 0 ? EIO : rc;
+    return false;
+  }
+  return true;
+}
+
+bool freshnessMarkFresh(uint64_t path_key, int rank, uint64_t version) {
+  if (path_key == 0 || rank < 0 || version == 0) {
+    errno = EINVAL;
+    return false;
+  }
+
+  if (ompfile_mpp_freshness_mark_fresh) {
+    const int rc = ompfile_mpp_freshness_mark_fresh(path_key, rank, version);
+    if (rc != 0) {
+      errno = rc < 0 ? EIO : rc;
+      return false;
+    }
+    return true;
+  }
+
+  if (!init())
+    return false;
+
+  auto &api = getMppApi();
+  if (!api.freshness_mark_fresh)
+    api = loadMppApi();
+  if (!api.freshness_mark_fresh) {
+    errno = ENOSYS;
+    return false;
+  }
+
+  const int rc = api.freshness_mark_fresh(path_key, rank, version);
+  if (rc != 0) {
+    errno = rc < 0 ? EIO : rc;
+    return false;
+  }
+  return true;
+}
+
+bool flushDirtyTile(uint64_t path_key, int &source_rank_out,
+                    uint64_t &flushed_version_out) {
+  source_rank_out = -1;
+  flushed_version_out = 0;
+  if (path_key == 0) {
+    errno = EINVAL;
+    return false;
+  }
+
+  if (ompfile_mpp_flush_dirty_tile) {
+    const int rc = ompfile_mpp_flush_dirty_tile(path_key, &source_rank_out,
+                                                &flushed_version_out);
+    if (rc != 0) {
+      errno = rc < 0 ? EIO : rc;
+      source_rank_out = -1;
+      flushed_version_out = 0;
+      return false;
+    }
+    return true;
+  }
+
+  if (!init())
+    return false;
+
+  auto &api = getMppApi();
+  if (!api.flush_dirty_tile)
+    api = loadMppApi();
+  if (!api.flush_dirty_tile) {
+    errno = ENOSYS;
+    return false;
+  }
+
+  const int rc =
+      api.flush_dirty_tile(path_key, &source_rank_out, &flushed_version_out);
+  if (rc != 0) {
+    errno = rc < 0 ? EIO : rc;
+    source_rank_out = -1;
+    flushed_version_out = 0;
+    return false;
+  }
+  return true;
 }
 
 bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,

@@ -3076,6 +3076,163 @@ struct ProxyDevice {
     co_return (co_await RequestManager);
   }
 
+  EventTy ompfileFreshnessQuery(MPIRequestManagerTy RequestManager) {
+    OmpFileFreshnessQueryRequest Request{};
+    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    OmpFileFreshnessQueryReply Reply{};
+    OmpFileHeadnodeManager::instance().handleFreshnessQueryRequest(Request,
+                                                                    Reply);
+
+    RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfileProxyCopyTile(MPIRequestManagerTy RequestManager) {
+    OmpFileProxyCopyTileRequest Request{};
+    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    OmpFileProxyCopyTileReply Reply{};
+    Reply.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+    const std::string PathKeyStr = std::to_string(Request.PathKey);
+    const std::string TileIdStr = std::to_string(Request.TileId);
+    OmpFileHeadnodeManager::instance().emitFreshnessTrace(
+        "copy_req", PathKeyStr, Request.DestRank, Request.SourceRank,
+        Request.DestRank, Request.Version, Request.Version, "copy", "start", "",
+        TileIdStr.c_str());
+    if (Request.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      Reply.Status = -1;
+      Reply.Errno = EPROTO;
+      OmpFileHeadnodeManager::instance().emitFreshnessTrace(
+          "copy_done", PathKeyStr, Request.DestRank, Request.SourceRank,
+          Request.DestRank, Request.Version, Request.Version, "copy", "fail",
+          "abi_mismatch", TileIdStr.c_str());
+    } else if (!isWorkerRank(Request.SourceRank) ||
+               !isWorkerRank(Request.DestRank) || Request.PathKey == 0 ||
+               Request.Version == 0) {
+      Reply.Status = -1;
+      Reply.Errno = EINVAL;
+      OmpFileHeadnodeManager::instance().emitFreshnessTrace(
+          "copy_done", PathKeyStr, Request.DestRank, Request.SourceRank,
+          Request.DestRank, Request.Version, Request.Version, "copy", "fail",
+          "invalid_request", TileIdStr.c_str());
+    } else {
+      if (EventSystem.LocalRank == getHeadnodeRank()) {
+        if (!OmpFileHeadnodeManager::instance().registerTileCopy(
+                Request.PathKey, Request.SourceRank, Request.DestRank,
+                Request.Version)) {
+          Reply.Status = -1;
+          Reply.Errno = errno != 0 ? errno : EIO;
+          OmpFileHeadnodeManager::instance().emitFreshnessTrace(
+              "copy_done", PathKeyStr, Request.DestRank, Request.SourceRank,
+              Request.DestRank, Request.Version, Request.Version, "copy", "fail",
+              "register_copy_failed", TileIdStr.c_str());
+        }
+      }
+      if (Reply.Status == 0) {
+        Reply.Errno = 0;
+        Reply.BytesCopied = 0;
+        OmpFileHeadnodeManager::instance().emitFreshnessTrace(
+            "copy_done", PathKeyStr, Request.DestRank, Request.SourceRank,
+            Request.DestRank, Request.Version, Request.Version, "copy", "ok", "",
+            TileIdStr.c_str());
+      }
+    }
+
+    RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfileFreshnessMarkFresh(MPIRequestManagerTy RequestManager) {
+    OmpFileFreshnessMarkFreshRequest Request{};
+    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    OmpFileFreshnessMarkFreshReply Reply{};
+    Reply.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+    if (Request.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      Reply.Status = -1;
+      Reply.Errno = EPROTO;
+    } else if (!OmpFileHeadnodeManager::instance().markTileFreshFromCopy(
+                   Request.PathKey, Request.Rank, Request.Version)) {
+      Reply.Status = -1;
+      Reply.Errno = errno != 0 ? errno : EIO;
+    }
+
+    RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfileFreshnessWriteCommit(MPIRequestManagerTy RequestManager) {
+    OmpFileFreshnessWriteCommitRequest Request{};
+    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    OmpFileFreshnessWriteCommitReply Reply{};
+    Reply.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+    if (Request.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      Reply.Status = -1;
+      Reply.Errno = EPROTO;
+    } else if (!OmpFileHeadnodeManager::instance().commitTileFreshnessWrite(
+                   Request.PathKey, Request.WriterRank,
+                   Request.WriteThroughMode != 0, Reply.CommittedVersion)) {
+      Reply.Status = -1;
+      Reply.Errno = errno != 0 ? errno : EIO;
+    }
+
+    RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfileFlushDirtyTile(MPIRequestManagerTy RequestManager) {
+    OmpFileFlushDirtyTileRequest Request{};
+    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    OmpFileFlushDirtyTileReply Reply{};
+    Reply.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+    if (Request.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      Reply.Status = -1;
+      Reply.Errno = EPROTO;
+    } else if (Request.Action == 0) {
+      if (!OmpFileHeadnodeManager::instance().flushDirtyTile(
+              Request.PathKey, Reply.SourceRank, Reply.FlushedVersion)) {
+        Reply.Status = -1;
+        Reply.Errno = errno != 0 ? errno : EIO;
+      }
+    } else if (Request.Action == 1) {
+      if (!OmpFileHeadnodeManager::instance().completeDirtyFlush(
+              Request.PathKey, Request.SourceRank, Request.Version,
+              Request.Success != 0)) {
+        Reply.Status = -1;
+        Reply.Errno = errno != 0 ? errno : EIO;
+      }
+      Reply.SourceRank = Request.SourceRank;
+      Reply.FlushedVersion = Request.Version;
+    } else if (Request.Action == 2) {
+      Reply.SourceRank = EventSystem.LocalRank;
+      Reply.FlushedVersion = Request.Version;
+    } else {
+      Reply.Status = -1;
+      Reply.Errno = EINVAL;
+    }
+
+    RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
   bool isWorkerRank(int Rank) const {
     return Rank >= 0 && Rank < EventSystem.WorldSize - 1;
   }
@@ -3523,6 +3680,218 @@ struct ProxyDevice {
     return waitForEvent(Event, "stage_invalidate");
   }
 
+  bool freshnessQueryOnHeadnode(const OmpFileFreshnessQueryRequest &Request,
+                                OmpFileFreshnessQueryReply &Reply) {
+    Reply = {};
+    if (EventSystem.LocalRank == getHeadnodeRank()) {
+      OmpFileHeadnodeManager::instance().handleFreshnessQueryRequest(Request,
+                                                                      Reply);
+      return true;
+    }
+
+    EventTy Event = createRankEvent(OriginEvents::ompfileFreshnessQuery,
+                                    EventTypeTy::OMPFILE_FRESHNESS_QUERY,
+                                    getHeadnodeRank(), /*TargetDeviceId=*/0,
+                                    &Request, &Reply);
+    return waitForEvent(Event, "freshness_query");
+  }
+
+  bool freshnessWriteCommitOnHeadnode(uint64_t PathKey, int WriterRank,
+                                      uint64_t TileId, bool WriteThroughMode,
+                                      uint64_t &CommittedVersionOut) {
+    (void)TileId;
+    CommittedVersionOut = 0;
+    if (PathKey == 0 || WriterRank < 0) {
+      errno = EINVAL;
+      return false;
+    }
+
+    if (EventSystem.LocalRank == getHeadnodeRank()) {
+      return OmpFileHeadnodeManager::instance().commitTileFreshnessWrite(
+          PathKey, WriterRank, WriteThroughMode, CommittedVersionOut);
+    }
+
+    OmpFileFreshnessWriteCommitRequest Request{};
+    Request.PathKey = PathKey;
+    Request.TileId = TileId;
+    Request.WriterRank = WriterRank;
+    Request.WriteThroughMode = WriteThroughMode ? 1u : 0u;
+    OmpFileFreshnessWriteCommitReply Reply{};
+    EventTy Event = createRankEvent(
+        OriginEvents::ompfileFreshnessWriteCommit,
+        EventTypeTy::OMPFILE_FRESHNESS_WRITE_COMMIT, getHeadnodeRank(),
+        /*TargetDeviceId=*/0, &Request, &Reply);
+    if (!waitForEvent(Event, "freshness_write_commit"))
+      return false;
+    if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      errno = EPROTO;
+      return false;
+    }
+    if (Reply.Status != 0) {
+      errno = Reply.Errno != 0 ? Reply.Errno : EIO;
+      return false;
+    }
+    CommittedVersionOut = Reply.CommittedVersion;
+    return true;
+  }
+
+  bool flushDirtyTileOnHeadnode(uint64_t PathKey, int &SourceRankOut,
+                                uint64_t &FlushedVersionOut) {
+    SourceRankOut = -1;
+    FlushedVersionOut = 0;
+    if (PathKey == 0) {
+      errno = EINVAL;
+      return false;
+    }
+
+    if (EventSystem.LocalRank == getHeadnodeRank()) {
+      return OmpFileHeadnodeManager::instance().flushDirtyTile(
+          PathKey, SourceRankOut, FlushedVersionOut);
+    }
+
+    OmpFileFlushDirtyTileRequest Request{};
+    Request.PathKey = PathKey;
+    Request.Action = 0;
+    OmpFileFlushDirtyTileReply Reply{};
+    EventTy Event = createRankEvent(OriginEvents::ompfileFlushDirtyTile,
+                                    EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE,
+                                    getHeadnodeRank(), /*TargetDeviceId=*/0,
+                                    &Request, &Reply);
+    if (!waitForEvent(Event, "flush_dirty_tile"))
+      return false;
+    if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      errno = EPROTO;
+      return false;
+    }
+    if (Reply.Status != 0) {
+      errno = Reply.Errno != 0 ? Reply.Errno : EIO;
+      return false;
+    }
+    SourceRankOut = Reply.SourceRank;
+    FlushedVersionOut = Reply.FlushedVersion;
+    return true;
+  }
+
+  bool completeDirtyFlushOnHeadnode(uint64_t PathKey, int SourceRank,
+                                    uint64_t Version, bool Success) {
+    if (PathKey == 0 || SourceRank < 0 || Version == 0) {
+      errno = EINVAL;
+      return false;
+    }
+    if (EventSystem.LocalRank == getHeadnodeRank()) {
+      return OmpFileHeadnodeManager::instance().completeDirtyFlush(
+          PathKey, SourceRank, Version, Success);
+    }
+
+    OmpFileFlushDirtyTileRequest Request{};
+    Request.Action = 1;
+    Request.PathKey = PathKey;
+    Request.SourceRank = SourceRank;
+    Request.Version = Version;
+    Request.Success = Success ? 1 : 0;
+    OmpFileFlushDirtyTileReply Reply{};
+    EventTy Event = createRankEvent(OriginEvents::ompfileFlushDirtyTile,
+                                    EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE,
+                                    getHeadnodeRank(), /*TargetDeviceId=*/0,
+                                    &Request, &Reply);
+    if (!waitForEvent(Event, "flush_dirty_tile_complete"))
+      return false;
+    if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      errno = EPROTO;
+      return false;
+    }
+    if (Reply.Status != 0) {
+      errno = Reply.Errno != 0 ? Reply.Errno : EIO;
+      return false;
+    }
+    return true;
+  }
+
+  bool freshnessMarkFreshOnHeadnode(uint64_t PathKey, int Rank,
+                                    uint64_t Version) {
+    if (PathKey == 0 || Rank < 0 || Version == 0) {
+      errno = EINVAL;
+      return false;
+    }
+
+    if (EventSystem.LocalRank == getHeadnodeRank()) {
+      return OmpFileHeadnodeManager::instance().markTileFreshFromCopy(
+          PathKey, Rank, Version);
+    }
+
+    OmpFileFreshnessMarkFreshRequest Request{};
+    Request.PathKey = PathKey;
+    Request.Rank = Rank;
+    Request.Version = Version;
+    OmpFileFreshnessMarkFreshReply Reply{};
+    EventTy Event = createRankEvent(OriginEvents::ompfileFreshnessMarkFresh,
+                                    EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH,
+                                    getHeadnodeRank(), /*TargetDeviceId=*/0,
+                                    &Request, &Reply);
+    if (!waitForEvent(Event, "freshness_mark_fresh"))
+      return false;
+    if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      errno = EPROTO;
+      return false;
+    }
+    if (Reply.Status != 0) {
+      errno = Reply.Errno != 0 ? Reply.Errno : EIO;
+      return false;
+    }
+    return true;
+  }
+
+  bool proxyCopyTileEvent(uint64_t PathKey, uint64_t TileId, int SourceRank,
+                          int DestRank, uint64_t Version) {
+    if (PathKey == 0 || Version == 0 || !isWorkerRank(SourceRank) ||
+        !isWorkerRank(DestRank)) {
+      errno = EINVAL;
+      return false;
+    }
+    OmpFileProxyCopyTileRequest Request{};
+    Request.PathKey = PathKey;
+    Request.TileId = TileId;
+    Request.SourceRank = SourceRank;
+    Request.DestRank = DestRank;
+    Request.Version = Version;
+
+    OmpFileProxyCopyTileReply HeadnodeReply{};
+    EventTy HeadnodeEvent = createRankEvent(
+        OriginEvents::ompfileProxyCopyTile,
+        EventTypeTy::OMPFILE_PROXY_COPY_TILE,
+        getHeadnodeRank(), /*TargetDeviceId=*/0, &Request, &HeadnodeReply);
+    if (!waitForEvent(HeadnodeEvent, "proxy_copy_tile_register"))
+      return false;
+    if (HeadnodeReply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      errno = EPROTO;
+      return false;
+    }
+    if (HeadnodeReply.Status != 0) {
+      errno = HeadnodeReply.Errno != 0 ? HeadnodeReply.Errno : EIO;
+      return false;
+    }
+
+    if (SourceRank == DestRank)
+      return true;
+
+    OmpFileProxyCopyTileReply Reply{};
+    EventTy Event = createRankEvent(OriginEvents::ompfileProxyCopyTile,
+                                    EventTypeTy::OMPFILE_PROXY_COPY_TILE,
+                                    DestRank, /*TargetDeviceId=*/0, &Request,
+                                    &Reply);
+    if (!waitForEvent(Event, "proxy_copy_tile"))
+      return false;
+    if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      errno = EPROTO;
+      return false;
+    }
+    if (Reply.Status != 0) {
+      errno = Reply.Errno != 0 ? Reply.Errno : EIO;
+      return false;
+    }
+    return true;
+  }
+
   int selectAggregatorRankForOpen(const char *Path, int Flags, int Mode) {
     int Rank = isWorkerRank(EventSystem.LocalRank) ? EventSystem.LocalRank : 0;
     const char *SchedulerEnv = std::getenv("LIBOMPFILE_SCHEDULER");
@@ -3664,6 +4033,17 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
+  int mppHandleOwnerRank(int Handle, int *RankOut) {
+    if (!RankOut)
+      return EINVAL;
+    *RankOut = -1;
+    OmpFileHandleEntry Entry{};
+    if (!findRemoteHandle(Handle, Entry))
+      return errno != 0 ? errno : EIO;
+    *RankOut = Entry.Rank;
+    return OFFLOAD_SUCCESS;
+  }
+
   int mppPread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
     traceOmpFile("mppPread enter local=%d offset=%lld size=%llu\n", Handle,
                  static_cast<long long>(Offset),
@@ -3795,6 +4175,87 @@ struct ProxyDevice {
          EventSystem.LocalRank);
       return OFFLOAD_FAIL;
     }
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppFreshnessQuery(const OmpFileFreshnessQueryRequest *Request,
+                        OmpFileFreshnessQueryReply *Reply) {
+    if (!Request || !Reply)
+      return EINVAL;
+    if (!freshnessQueryOnHeadnode(*Request, *Reply))
+      return errno != 0 ? errno : EIO;
+    if (Reply->Status != 0)
+      return Reply->Errno != 0 ? Reply->Errno : EIO;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppFreshnessWriteCommit(uint64_t PathKey, int WriterRank, uint64_t TileId,
+                              int WriteThroughMode,
+                              uint64_t *CommittedVersion) {
+    if (!CommittedVersion)
+      return EINVAL;
+    *CommittedVersion = 0;
+    uint64_t Committed = 0;
+    if (!freshnessWriteCommitOnHeadnode(PathKey, WriterRank, TileId,
+                                        WriteThroughMode != 0, Committed)) {
+      return errno != 0 ? errno : EIO;
+    }
+    *CommittedVersion = Committed;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppProxyCopyTile(uint64_t PathKey, uint64_t TileId, int SourceRank,
+                       int DestRank, uint64_t Version) {
+    if (!proxyCopyTileEvent(PathKey, TileId, SourceRank, DestRank, Version))
+      return errno != 0 ? errno : EIO;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppFreshnessMarkFresh(uint64_t PathKey, int Rank, uint64_t Version) {
+    if (!freshnessMarkFreshOnHeadnode(PathKey, Rank, Version))
+      return errno != 0 ? errno : EIO;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppFlushDirtyTile(uint64_t PathKey, int *SourceRank,
+                        uint64_t *FlushedVersion) {
+    if (!SourceRank || !FlushedVersion)
+      return EINVAL;
+    *SourceRank = -1;
+    *FlushedVersion = 0;
+    if (PathKey == 0)
+      return EINVAL;
+
+    int Source = -1;
+    uint64_t Version = 0;
+    if (!flushDirtyTileOnHeadnode(PathKey, Source, Version))
+      return errno != 0 ? errno : EIO;
+
+    if (Source >= 0) {
+      OmpFileFlushDirtyTileRequest WritebackReq{};
+      WritebackReq.Action = 2;
+      WritebackReq.PathKey = PathKey;
+      WritebackReq.SourceRank = Source;
+      WritebackReq.Version = Version;
+      WritebackReq.Success = 1;
+      OmpFileFlushDirtyTileReply WritebackReply{};
+      EventTy WritebackEvent = createRankEvent(
+          OriginEvents::ompfileFlushDirtyTile,
+          EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE, Source,
+          /*TargetDeviceId=*/0, &WritebackReq, &WritebackReply);
+      if (!waitForEvent(WritebackEvent, "flush_dirty_tile_writeback"))
+        return errno != 0 ? errno : EIO;
+      if (WritebackReply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+        return EPROTO;
+      if (WritebackReply.Status != 0)
+        return WritebackReply.Errno != 0 ? WritebackReply.Errno : EIO;
+      if (!completeDirtyFlushOnHeadnode(PathKey, Source, Version,
+                                        /*Success=*/true))
+        return errno != 0 ? errno : EIO;
+    }
+
+    *SourceRank = Source;
+    *FlushedVersion = Version;
     return OFFLOAD_SUCCESS;
   }
 
@@ -4255,6 +4716,21 @@ struct ProxyDevice {
       case OMPFILE_STAGE_INVALIDATE:
         NewEvent = ompfileStageInvalidate(std::move(RequestManager));
         break;
+      case OMPFILE_FRESHNESS_QUERY:
+        NewEvent = ompfileFreshnessQuery(std::move(RequestManager));
+        break;
+      case OMPFILE_PROXY_COPY_TILE:
+        NewEvent = ompfileProxyCopyTile(std::move(RequestManager));
+        break;
+      case OMPFILE_FRESHNESS_MARK_FRESH:
+        NewEvent = ompfileFreshnessMarkFresh(std::move(RequestManager));
+        break;
+      case OMPFILE_FRESHNESS_WRITE_COMMIT:
+        NewEvent = ompfileFreshnessWriteCommit(std::move(RequestManager));
+        break;
+      case OMPFILE_FLUSH_DIRTY_TILE:
+        NewEvent = ompfileFlushDirtyTile(std::move(RequestManager));
+        break;
       case OMPFILE_SCHED_REQUEST:
         NewEvent = ompfileSchedRequest(std::move(RequestManager));
         break;
@@ -4467,6 +4943,13 @@ int ompfile_mpp_close(int Handle) {
   return PD->mppClose(Handle);
 }
 
+int ompfile_mpp_handle_owner_rank(int Handle, int *RankOut) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return EHOSTDOWN;
+  return PD->mppHandleOwnerRank(Handle, RankOut);
+}
+
 int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
   ProxyDevice *PD = getActiveProxyDevice();
   if (!PD)
@@ -4515,6 +4998,49 @@ int ompfile_mpp_stage_invalidate_path_key(uint64_t PathKey,
   return PD->mppStageInvalidatePathKey(PathKey, Generation, Path);
 }
 
+int ompfile_mpp_freshness_query(const OmpFileFreshnessQueryRequest *Request,
+                                OmpFileFreshnessQueryReply *Reply) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return EHOSTDOWN;
+  return PD->mppFreshnessQuery(Request, Reply);
+}
+
+int ompfile_mpp_freshness_write_commit(uint64_t PathKey, int WriterRank,
+                                       uint64_t TileId, int WriteThroughMode,
+                                       uint64_t *CommittedVersion) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return EHOSTDOWN;
+  return PD->mppFreshnessWriteCommit(PathKey, WriterRank, TileId,
+                                     WriteThroughMode, CommittedVersion);
+}
+
+int ompfile_mpp_proxy_copy_tile(uint64_t PathKey, uint64_t TileId,
+                                int SourceRank, int DestRank,
+                                uint64_t Version) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return EHOSTDOWN;
+  return PD->mppProxyCopyTile(PathKey, TileId, SourceRank, DestRank, Version);
+}
+
+int ompfile_mpp_freshness_mark_fresh(uint64_t PathKey, int Rank,
+                                     uint64_t Version) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return EHOSTDOWN;
+  return PD->mppFreshnessMarkFresh(PathKey, Rank, Version);
+}
+
+int ompfile_mpp_flush_dirty_tile(uint64_t PathKey, int *SourceRank,
+                                 uint64_t *FlushedVersion) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return EHOSTDOWN;
+  return PD->mppFlushDirtyTile(PathKey, SourceRank, FlushedVersion);
+}
+
 int ompfile_mpp_poll(uint64_t Token, int *Done) {
   ProxyDevice *PD = getActiveProxyDevice();
   if (!PD)
@@ -4530,8 +5056,10 @@ int ompfile_mpp_finalize() {
 }
 } // extern "C"
 
+#ifndef OMPFILE_PROXYDEVICE_NO_MAIN
 int main(int argc, char **argv) {
   ProxyDevice PD;
   PD.runGateThread();
   return 0;
 }
+#endif

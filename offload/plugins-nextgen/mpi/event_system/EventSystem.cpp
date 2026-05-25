@@ -88,6 +88,16 @@ std::string EventTypeToString(EventTypeTy eventType) {
     case EventTypeTy::OMPFILE_STAGE_INVALIDATE:
       return "OMPFILE_STAGE_INVALIDATE";
     case EventTypeTy::OMPFILE_PREAD_NO_STAGE: return "OMPFILE_PREAD_NO_STAGE";
+    case EventTypeTy::OMPFILE_FRESHNESS_QUERY:
+      return "OMPFILE_FRESHNESS_QUERY";
+    case EventTypeTy::OMPFILE_PROXY_COPY_TILE:
+      return "OMPFILE_PROXY_COPY_TILE";
+    case EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH:
+      return "OMPFILE_FRESHNESS_MARK_FRESH";
+    case EventTypeTy::OMPFILE_FRESHNESS_WRITE_COMMIT:
+      return "OMPFILE_FRESHNESS_WRITE_COMMIT";
+    case EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE:
+      return "OMPFILE_FLUSH_DIRTY_TILE";
     case EventTypeTy::EXIT: return "EXIT";
     default: return "UNKNOWN_EVENT_TYPE";
   }
@@ -889,6 +899,98 @@ EventTy ompfileStageInvalidate(MPIRequestManagerTy RequestManager,
 
   RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
 
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileFreshnessQuery(MPIRequestManagerTy RequestManager,
+                              const OmpFileFreshnessQueryRequest *Request,
+                              OmpFileFreshnessQueryReply *Reply) {
+  if (!Request || !Reply)
+    co_return createError("OMPFile freshness query missing buffers.");
+
+  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileFreshnessWriteCommit(
+    MPIRequestManagerTy RequestManager,
+    const OmpFileFreshnessWriteCommitRequest *Request,
+    OmpFileFreshnessWriteCommitReply *Reply) {
+  if (!Request || !Reply)
+    co_return createError("OMPFile freshness write commit missing buffers.");
+
+  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileProxyCopyTile(MPIRequestManagerTy RequestManager,
+                             const OmpFileProxyCopyTileRequest *Request,
+                             OmpFileProxyCopyTileReply *Reply) {
+  if (!Request || !Reply)
+    co_return createError("OMPFile proxy copy tile missing buffers.");
+
+  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileFreshnessMarkFresh(
+    MPIRequestManagerTy RequestManager,
+    const OmpFileFreshnessMarkFreshRequest *Request,
+    OmpFileFreshnessMarkFreshReply *Reply) {
+  if (!Request || !Reply)
+    co_return createError("OMPFile freshness mark-fresh missing buffers.");
+
+  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileFlushDirtyTile(MPIRequestManagerTy RequestManager,
+                              const OmpFileFlushDirtyTileRequest *Request,
+                              OmpFileFlushDirtyTileReply *Reply) {
+  if (!Request || !Reply)
+    co_return createError("OMPFile flush-dirty-tile missing buffers.");
+
+  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
   if (auto Error = co_await RequestManager; Error)
     co_return Error;
 

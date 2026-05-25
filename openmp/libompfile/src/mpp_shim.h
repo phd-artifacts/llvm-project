@@ -17,6 +17,7 @@ bool ping();
 
 bool open(const char *path, int flags, int mode, int &handle);
 bool openOnRank(const char *path, int flags, int mode, int rank, int &handle);
+bool handleOwnerRank(int handle, int &rank_out);
 bool close(int handle);
 bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
              size_t &bytes_read);
@@ -28,6 +29,17 @@ bool pwriteEx(int handle, int64_t offset, const void *buffer, size_t size,
 bool pwrite(int handle, int64_t offset, const void *buffer, size_t size);
 bool stageInvalidatePathKey(uint64_t path_key, uint64_t generation,
                             const char *path);
+bool freshnessQuery(uint64_t path_key, uint64_t local_version,
+                    int requester_rank, uint32_t &decision_out,
+                    int &source_rank_out, uint64_t &selected_version_out);
+bool freshnessWriteCommit(uint64_t path_key, int writer_rank, uint64_t tile_id,
+                          bool write_through_mode,
+                          uint64_t &committed_version_out);
+bool proxyCopyTile(uint64_t path_key, uint64_t tile_id, int source_rank,
+                   int dest_rank, uint64_t version);
+bool freshnessMarkFresh(uint64_t path_key, int rank, uint64_t version);
+bool flushDirtyTile(uint64_t path_key, int &source_rank_out,
+                    uint64_t &flushed_version_out);
 bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,
                   ompfile::OmpFileIOPlan &plan);
 bool schedBatchRequest(

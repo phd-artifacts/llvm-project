@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstdlib>
+#include <cstdarg>
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -35,7 +36,7 @@ uint64_t OmpFileHeadnodeManager::computePathKey(std::string_view Path) {
 }
 
 uint64_t OmpFileHeadnodeManager::parseUint64Env(const char *Name,
-                                                uint64_t DefaultValue) {
+                                                 uint64_t DefaultValue) {
   const char *Env = std::getenv(Name);
   if (!Env)
     return DefaultValue;
@@ -47,6 +48,57 @@ uint64_t OmpFileHeadnodeManager::parseUint64Env(const char *Name,
     return DefaultValue;
 
   return static_cast<uint64_t>(Value);
+}
+
+bool OmpFileHeadnodeManager::parseBoolEnv(const char *Name,
+                                          bool DefaultValue) {
+  const char *Env = std::getenv(Name);
+  if (!Env)
+    return DefaultValue;
+
+  if (Env[0] == '\0')
+    return false;
+  if (Env[0] == '0' && Env[1] == '\0')
+    return false;
+  return true;
+}
+
+bool OmpFileHeadnodeManager::isFreshnessTraceEnabled() const {
+  return FreshnessTraceEnabled;
+}
+
+void OmpFileHeadnodeManager::emitFreshnessTrace(
+    const char *Event, const std::string &PathKey, int Rank, int SrcRank,
+    int DstRank, uint64_t Version, uint64_t LatestVersion,
+    const char *Decision, const char *Result, const char *Reason,
+    const char *TileId) const {
+  if (!isFreshnessTraceEnabled())
+    return;
+
+  std::fprintf(stderr,
+               "freshness_trace event=%s path_key=%s rank=%d src_rank=%d "
+               "dst_rank=%d version=%llu latest_version=%llu decision=%s "
+               "result=%s reason=%s tile_id=%s\n",
+               Event ? Event : "unknown", PathKey.c_str(), Rank, SrcRank,
+               DstRank, static_cast<unsigned long long>(Version),
+               static_cast<unsigned long long>(LatestVersion),
+               Decision ? Decision : "na", Result ? Result : "na",
+               Reason ? Reason : "na", TileId ? TileId : "na");
+}
+
+void OmpFileHeadnodeManager::freshnessTraceLogUnlocked(const char *Format,
+                                                       ...) const {
+  if (!isFreshnessTraceEnabled())
+    return;
+
+  char Buffer[512] = {0};
+  va_list Args;
+  va_start(Args, Format);
+  std::vsnprintf(Buffer, sizeof(Buffer), Format, Args);
+  va_end(Args);
+
+  emitFreshnessTrace("legacy", "na", -1, -1, -1, 0, 0, "na", "na",
+                     Buffer, "na");
 }
 
 bool OmpFileHeadnodeManager::segmentRangesOverlap(int64_t ReadOffset,
@@ -177,6 +229,7 @@ void OmpFileHeadnodeManager::initialize(int NewWorldSize, int NewHeadnodeRank) {
       parseUint64Env("LIBOMPFILE_SCHED_USE_PLANNED_LOAD_FOR_SKEW", 0) != 0;
   SpreadSamePathOpens =
       parseUint64Env("LIBOMPFILE_MPP_OPEN_SPREAD", 0) != 0;
+  FreshnessTraceEnabled = parseBoolEnv("LIBOMPFILE_FRESHNESS_TRACE", false);
   ensureHandlersUnlocked();
   Initialized = true;
 }
@@ -190,15 +243,476 @@ void OmpFileHeadnodeManager::resetForTesting() {
   BatchStatsReportEvery = 128;
   UsePlannedLoadForSkew = false;
   SpreadSamePathOpens = false;
+  FreshnessTraceEnabled = false;
   FlightplanTable.clear();
   GlobalFileTable.clear();
   PathAffinityTable.clear();
   PathWriteVersions.clear();
+  TileFreshnessTable.clear();
+  PendingTileCopies.clear();
   Handlers.clear();
   Stats = {};
   NextGlobalFileId = 1;
   NextHandlerTieBreaker = 0;
   NextWriteSequence = 1;
+}
+
+bool OmpFileHeadnodeManager::commitTileFreshnessWriteForTesting(
+    uint64_t PathKey, int WriterRank, bool WriteThroughMode,
+    uint64_t &CommittedVersionOut) {
+  return commitTileFreshnessWrite(PathKey, WriterRank, WriteThroughMode,
+                                  CommittedVersionOut);
+}
+
+bool OmpFileHeadnodeManager::commitTileFreshnessWrite(
+    uint64_t PathKey, int WriterRank, bool WriteThroughMode,
+    uint64_t &CommittedVersionOut) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  return commitTileFreshnessWriteUnlocked(PathKey, WriterRank, WriteThroughMode,
+                                          CommittedVersionOut);
+}
+
+bool OmpFileHeadnodeManager::markTileFresh(uint64_t PathKey, int Rank,
+                                           uint64_t Version) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  return markTileFreshUnlocked(PathKey, Rank, Version);
+}
+
+bool OmpFileHeadnodeManager::registerTileCopy(uint64_t PathKey, int SourceRank,
+                                              int DestRank, uint64_t Version) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  return registerTileCopyUnlocked(PathKey, SourceRank, DestRank, Version);
+}
+
+bool OmpFileHeadnodeManager::markTileFreshFromCopy(uint64_t PathKey, int Rank,
+                                                   uint64_t Version) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  return markTileFreshFromCopyUnlocked(PathKey, Rank, Version);
+}
+
+bool OmpFileHeadnodeManager::flushDirtyTile(uint64_t PathKey,
+                                            int &SourceRankOut,
+                                            uint64_t &FlushedVersionOut) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  return flushDirtyTileUnlocked(PathKey, SourceRankOut, FlushedVersionOut);
+}
+
+bool OmpFileHeadnodeManager::completeDirtyFlush(uint64_t PathKey,
+                                                int SourceRank,
+                                                uint64_t Version,
+                                                bool Success) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  return completeDirtyFlushUnlocked(PathKey, SourceRank, Version, Success);
+}
+
+bool OmpFileHeadnodeManager::markTileFreshForTesting(uint64_t PathKey, int Rank,
+                                                     uint64_t Version) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  return markTileFreshUnlocked(PathKey, Rank, Version);
+}
+
+bool OmpFileHeadnodeManager::evaluateTileFreshnessQueryForTesting(
+    uint64_t PathKey, uint64_t LocalVersion, int RequesterRank,
+    OmpFileFreshnessDecision &DecisionOut, int &SourceRankOut,
+    uint64_t &SelectedVersionOut) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  return evaluateTileFreshnessQueryUnlocked(PathKey, LocalVersion, RequesterRank,
+                                            DecisionOut, SourceRankOut,
+                                             SelectedVersionOut);
+}
+
+bool OmpFileHeadnodeManager::handleFreshnessQueryRequest(
+    const OmpFileFreshnessQueryRequest &Request,
+    OmpFileFreshnessQueryReply &Reply) {
+  Reply = {};
+  Reply.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  if (Request.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+    Reply.Status = -1;
+    Reply.Errno = EPROTO;
+    return true;
+  }
+
+  OmpFileFreshnessDecision Decision = OmpFileFreshnessDecision::WAIT_OR_FAIL;
+  int SourceRank = -1;
+  uint64_t SelectedVersion = 0;
+  if (!evaluateTileFreshnessQueryForTesting(Request.PathKey, Request.LocalVersion,
+                                            Request.RequesterRank, Decision,
+                                            SourceRank, SelectedVersion)) {
+    Reply.Status = -1;
+    Reply.Errno = errno != 0 ? errno : EIO;
+    return true;
+  }
+
+  Reply.Decision = static_cast<uint32_t>(Decision);
+  Reply.SourceRank = SourceRank;
+  Reply.SelectedVersion = SelectedVersion;
+  Reply.Status = 0;
+  Reply.Errno = 0;
+  return true;
+}
+
+bool OmpFileHeadnodeManager::clearTileFreshRanksForTesting(uint64_t PathKey) {
+  const std::lock_guard<std::mutex> Lock(Mutex);
+  if (PathKey == 0) {
+    errno = EINVAL;
+    return false;
+  }
+  auto It = TileFreshnessTable.find(PathKey);
+  if (It == TileFreshnessTable.end()) {
+    errno = ENOKEY;
+    return false;
+  }
+  It->second.FreshRanks.clear();
+  return true;
+}
+
+bool OmpFileHeadnodeManager::commitTileFreshnessWriteUnlocked(
+    uint64_t PathKey, int WriterRank, bool WriteThroughMode,
+    uint64_t &CommittedVersionOut) {
+  const std::string PathKeyStr = std::to_string(PathKey);
+  CommittedVersionOut = 0;
+  if (PathKey == 0 || !isWorkerRankUnlocked(WriterRank)) {
+    emitFreshnessTrace("write_commit", PathKeyStr, WriterRank, WriterRank,
+                       WriterRank, 0, 0, "", "fail", "invalid-args", "na");
+    errno = EINVAL;
+    return false;
+  }
+
+  auto &Entry = TileFreshnessTable[PathKey];
+  if (Entry.LatestVersion == std::numeric_limits<uint64_t>::max()) {
+    emitFreshnessTrace("write_commit", PathKeyStr, WriterRank, WriterRank,
+                       WriterRank, Entry.LatestVersion, Entry.LatestVersion, "",
+                       "fail", "version-overflow", "na");
+    errno = EOVERFLOW;
+    return false;
+  }
+  ++Entry.LatestVersion;
+  auto PendingIt = PendingTileCopies.find(PathKey);
+  if (PendingIt != PendingTileCopies.end()) {
+    auto &Pending = PendingIt->second;
+    Pending.erase(std::remove_if(Pending.begin(), Pending.end(),
+                                 [&](const PendingTileCopy &Copy) {
+                                   return Copy.Version < Entry.LatestVersion;
+                                 }),
+                  Pending.end());
+    if (Pending.empty())
+      PendingTileCopies.erase(PendingIt);
+  }
+  Entry.FreshRanks.clear();
+  Entry.FreshRanks.insert(WriterRank);
+  if (WriteThroughMode) {
+    Entry.PfsVersion = Entry.LatestVersion;
+    Entry.Dirty = false;
+  } else {
+    Entry.Dirty = true;
+  }
+  CommittedVersionOut = Entry.LatestVersion;
+  emitFreshnessTrace("write_commit", PathKeyStr, WriterRank, WriterRank,
+                     WriterRank, CommittedVersionOut, Entry.LatestVersion, "",
+                     "ok", WriteThroughMode ? "write-through" : "write-back",
+                     "na");
+  return true;
+}
+
+bool OmpFileHeadnodeManager::markTileFreshUnlocked(uint64_t PathKey, int Rank,
+                                                   uint64_t Version) {
+  const std::string PathKeyStr = std::to_string(PathKey);
+  if (PathKey == 0 || !isWorkerRankUnlocked(Rank) || Version == 0) {
+    emitFreshnessTrace("mark_fresh", PathKeyStr, Rank, Rank, Rank, Version, 0,
+                       "", "fail", "invalid-args", "na");
+    errno = EINVAL;
+    return false;
+  }
+  auto It = TileFreshnessTable.find(PathKey);
+  if (It == TileFreshnessTable.end()) {
+    emitFreshnessTrace("mark_fresh", PathKeyStr, Rank, Rank, Rank, Version, 0,
+                       "", "fail", "missing-entry", "na");
+    errno = ENOKEY;
+    return false;
+  }
+  if (It->second.LatestVersion != Version) {
+    emitFreshnessTrace("mark_fresh", PathKeyStr, Rank, Rank, Rank, Version,
+                       It->second.LatestVersion, "", "fail",
+                       "version-mismatch", "na");
+    errno = ESTALE;
+    return false;
+  }
+  It->second.FreshRanks.insert(Rank);
+  emitFreshnessTrace("mark_fresh", PathKeyStr, Rank, Rank, Rank, Version,
+                     It->second.LatestVersion, "", "ok", "fresh", "na");
+  return true;
+}
+
+bool OmpFileHeadnodeManager::registerTileCopyUnlocked(uint64_t PathKey,
+                                                      int SourceRank,
+                                                      int DestRank,
+                                                      uint64_t Version) {
+  const std::string PathKeyStr = std::to_string(PathKey);
+  if (PathKey == 0 || !isWorkerRankUnlocked(SourceRank) ||
+      !isWorkerRankUnlocked(DestRank) || Version == 0) {
+    emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
+                       DestRank, Version, 0, "copy", "fail",
+                       "invalid-args", "na");
+    errno = EINVAL;
+    return false;
+  }
+  auto It = TileFreshnessTable.find(PathKey);
+  if (It == TileFreshnessTable.end()) {
+    emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
+                       DestRank, Version, 0, "copy", "fail",
+                       "missing-entry", "na");
+    errno = ENOKEY;
+    return false;
+  }
+  const TileFreshnessEntry &Entry = It->second;
+  if (Entry.LatestVersion != Version) {
+    emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
+                       DestRank, Version, Entry.LatestVersion, "copy", "fail",
+                       "version-mismatch", "na");
+    errno = ESTALE;
+    return false;
+  }
+  if (Entry.FreshRanks.find(SourceRank) == Entry.FreshRanks.end()) {
+    emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
+                       DestRank, Version, Entry.LatestVersion, "copy", "fail",
+                       "source-not-fresh", "na");
+    errno = EHOSTUNREACH;
+    return false;
+  }
+
+  auto &Pending = PendingTileCopies[PathKey];
+  for (const PendingTileCopy &Copy : Pending) {
+    if (Copy.DestRank == DestRank && Copy.Version == Version)
+      return true;
+  }
+  Pending.push_back({SourceRank, DestRank, Version});
+  emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
+                     DestRank, Version, Entry.LatestVersion, "copy", "ok",
+                     "pending-added", "na");
+  return true;
+}
+
+bool OmpFileHeadnodeManager::markTileFreshFromCopyUnlocked(uint64_t PathKey,
+                                                           int Rank,
+                                                           uint64_t Version) {
+  if (PathKey == 0 || !isWorkerRankUnlocked(Rank) || Version == 0) {
+    errno = EINVAL;
+    return false;
+  }
+  auto It = TileFreshnessTable.find(PathKey);
+  if (It == TileFreshnessTable.end()) {
+    errno = ENOKEY;
+    return false;
+  }
+  if (It->second.LatestVersion != Version) {
+    errno = ESTALE;
+    return false;
+  }
+
+  auto PendingIt = PendingTileCopies.find(PathKey);
+  if (PendingIt == PendingTileCopies.end()) {
+    errno = ENOKEY;
+    return false;
+  }
+
+  auto &Pending = PendingIt->second;
+  Pending.erase(std::remove_if(Pending.begin(), Pending.end(),
+                               [&](const PendingTileCopy &Copy) {
+                                 return Copy.Version < Version;
+                               }),
+                Pending.end());
+  for (auto VecIt = Pending.begin(); VecIt != Pending.end(); ++VecIt) {
+    if (VecIt->DestRank == Rank && VecIt->Version == Version) {
+      It->second.FreshRanks.insert(Rank);
+      Pending.erase(VecIt);
+      if (Pending.empty())
+        PendingTileCopies.erase(PendingIt);
+      return true;
+    }
+  }
+
+  errno = ENOKEY;
+  return false;
+}
+
+bool OmpFileHeadnodeManager::flushDirtyTileUnlocked(uint64_t PathKey,
+                                                    int &SourceRankOut,
+                                                    uint64_t &FlushedVersionOut) {
+  const std::string PathKeyStr = std::to_string(PathKey);
+  SourceRankOut = -1;
+  FlushedVersionOut = 0;
+  if (PathKey == 0) {
+    emitFreshnessTrace("flush_prepare", PathKeyStr, -1, -1, -1, 0, 0, "",
+                       "fail", "invalid-args", "na");
+    errno = EINVAL;
+    return false;
+  }
+
+  auto It = TileFreshnessTable.find(PathKey);
+  if (It == TileFreshnessTable.end()) {
+    emitFreshnessTrace("flush_prepare", PathKeyStr, -1, -1, -1, 0, 0, "",
+                       "fail", "missing-entry", "na");
+    errno = ENOKEY;
+    return false;
+  }
+
+  TileFreshnessEntry &Entry = It->second;
+  if (!Entry.Dirty || Entry.PfsVersion == Entry.LatestVersion) {
+    FlushedVersionOut = Entry.PfsVersion;
+    emitFreshnessTrace("flush_done", PathKeyStr, SourceRankOut, SourceRankOut,
+                       SourceRankOut, FlushedVersionOut, Entry.LatestVersion, "",
+                       "ok", Entry.Dirty ? "already-pfs-current" : "not-dirty",
+                       "na");
+    return true;
+  }
+
+  for (int Rank : Entry.FreshRanks) {
+    if (isWorkerRankUnlocked(Rank)) {
+      emitFreshnessTrace("flush_prepare", PathKeyStr, Rank, Rank, Rank,
+                         Entry.LatestVersion, Entry.LatestVersion, "", "ok",
+                         "", "na");
+      SourceRankOut = Rank;
+      FlushedVersionOut = Entry.LatestVersion;
+      return true;
+    }
+  }
+
+  emitFreshnessTrace("flush_prepare", PathKeyStr, -1, -1, -1,
+                     Entry.LatestVersion, Entry.LatestVersion, "", "fail",
+                     "no-fresh-rank", "na");
+  errno = ENOKEY;
+  return false;
+}
+
+bool OmpFileHeadnodeManager::completeDirtyFlushUnlocked(uint64_t PathKey,
+                                                        int SourceRank,
+                                                        uint64_t Version,
+                                                        bool Success) {
+  const std::string PathKeyStr = std::to_string(PathKey);
+  if (PathKey == 0 || !isWorkerRankUnlocked(SourceRank) || Version == 0) {
+    emitFreshnessTrace("flush_fail", PathKeyStr, SourceRank, SourceRank,
+                       SourceRank, Version, 0, "", "fail", "invalid-args",
+                       "na");
+    errno = EINVAL;
+    return false;
+  }
+  auto It = TileFreshnessTable.find(PathKey);
+  if (It == TileFreshnessTable.end()) {
+    emitFreshnessTrace("flush_fail", PathKeyStr, SourceRank, SourceRank,
+                       SourceRank, Version, 0, "", "fail", "missing-entry",
+                       "na");
+    errno = ENOKEY;
+    return false;
+  }
+
+  TileFreshnessEntry &Entry = It->second;
+  if (Entry.LatestVersion != Version) {
+    emitFreshnessTrace("flush_fail", PathKeyStr, SourceRank, SourceRank,
+                       SourceRank, Version, Entry.LatestVersion, "", "fail",
+                       "version-mismatch", "na");
+    errno = ESTALE;
+    return false;
+  }
+  if (Entry.FreshRanks.find(SourceRank) == Entry.FreshRanks.end()) {
+    emitFreshnessTrace("flush_fail", PathKeyStr, SourceRank, SourceRank,
+                       SourceRank, Version, Entry.LatestVersion, "", "fail",
+                       "source-not-fresh", "na");
+    errno = EHOSTUNREACH;
+    return false;
+  }
+  if (!Success) {
+    emitFreshnessTrace("flush_fail", PathKeyStr, SourceRank, SourceRank,
+                       SourceRank, Version, Entry.LatestVersion, "", "fail",
+                       "flush-reported-failure", "na");
+    errno = EIO;
+    return false;
+  }
+
+  Entry.PfsVersion = Entry.LatestVersion;
+  Entry.Dirty = false;
+  emitFreshnessTrace("flush_done", PathKeyStr, SourceRank, SourceRank,
+                     SourceRank, Version, Entry.LatestVersion, "", "ok",
+                     "", "na");
+  return true;
+}
+
+bool OmpFileHeadnodeManager::evaluateTileFreshnessQueryUnlocked(
+    uint64_t PathKey, uint64_t LocalVersion, int RequesterRank,
+    OmpFileFreshnessDecision &DecisionOut, int &SourceRankOut,
+    uint64_t &SelectedVersionOut) const {
+  const std::string PathKeyStr = std::to_string(PathKey);
+  auto DecisionToString = [](OmpFileFreshnessDecision D) {
+    switch (D) {
+    case OmpFileFreshnessDecision::USE_LOCAL:
+      return "use_local";
+    case OmpFileFreshnessDecision::READ_PFS:
+      return "read_pfs";
+    case OmpFileFreshnessDecision::COPY_FROM_RANK:
+      return "copy_from_rank";
+    case OmpFileFreshnessDecision::WAIT_OR_FAIL:
+      return "wait_or_fail";
+    }
+    return "unknown";
+  };
+  DecisionOut = OmpFileFreshnessDecision::WAIT_OR_FAIL;
+  SourceRankOut = -1;
+  SelectedVersionOut = 0;
+  if (PathKey == 0 || !isWorkerRankUnlocked(RequesterRank)) {
+    emitFreshnessTrace("query", PathKeyStr, RequesterRank, -1, RequesterRank,
+                       LocalVersion, 0, "invalid", "fail", "invalid-args",
+                       "na");
+    errno = EINVAL;
+    return false;
+  }
+
+  auto It = TileFreshnessTable.find(PathKey);
+  if (It == TileFreshnessTable.end()) {
+    DecisionOut = OmpFileFreshnessDecision::READ_PFS;
+    emitFreshnessTrace("query", PathKeyStr, RequesterRank, SourceRankOut,
+                       RequesterRank, SelectedVersionOut, SelectedVersionOut,
+                       DecisionToString(DecisionOut), "ok", "missing-entry",
+                       "na");
+    return true;
+  }
+  const TileFreshnessEntry &Entry = It->second;
+  SelectedVersionOut = Entry.LatestVersion;
+
+  if (LocalVersion == Entry.LatestVersion &&
+      Entry.FreshRanks.find(RequesterRank) != Entry.FreshRanks.end()) {
+    DecisionOut = OmpFileFreshnessDecision::USE_LOCAL;
+    SourceRankOut = RequesterRank;
+    emitFreshnessTrace("query", PathKeyStr, RequesterRank, SourceRankOut,
+                       RequesterRank, SelectedVersionOut, Entry.LatestVersion,
+                       DecisionToString(DecisionOut), "ok", "", "na");
+    return true;
+  }
+
+  if (!Entry.Dirty && Entry.PfsVersion == Entry.LatestVersion) {
+    DecisionOut = OmpFileFreshnessDecision::READ_PFS;
+    emitFreshnessTrace("query", PathKeyStr, RequesterRank, SourceRankOut,
+                       RequesterRank, SelectedVersionOut, Entry.LatestVersion,
+                       DecisionToString(DecisionOut), "ok", "", "na");
+    return true;
+  }
+
+  for (int Rank : Entry.FreshRanks) {
+    if (isWorkerRankUnlocked(Rank)) {
+      DecisionOut = OmpFileFreshnessDecision::COPY_FROM_RANK;
+      SourceRankOut = Rank;
+      emitFreshnessTrace("query", PathKeyStr, RequesterRank, SourceRankOut,
+                         RequesterRank, SelectedVersionOut,
+                         Entry.LatestVersion, DecisionToString(DecisionOut),
+                         "ok", "", "na");
+      return true;
+    }
+  }
+
+  DecisionOut = OmpFileFreshnessDecision::WAIT_OR_FAIL;
+  emitFreshnessTrace("query", PathKeyStr, RequesterRank, SourceRankOut,
+                     RequesterRank, SelectedVersionOut, Entry.LatestVersion,
+                     DecisionToString(DecisionOut), "ok", "no-fresh-rank",
+                     "na");
+  return true;
 }
 
 bool OmpFileHeadnodeManager::classifyRebalanceConflictForTesting(

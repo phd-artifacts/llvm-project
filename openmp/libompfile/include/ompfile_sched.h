@@ -12,6 +12,14 @@ namespace ompfile {
 
 constexpr uint32_t OMPFILE_SCHED_BATCH_ABI_VERSION = 1u;
 constexpr uint32_t OMPFILE_IO_HINT_ABI_VERSION = 1u;
+constexpr uint32_t OMPFILE_FRESHNESS_QUERY_ABI_VERSION = 1u;
+
+enum class OmpFileFreshnessDecision : uint32_t {
+  USE_LOCAL = 0,
+  READ_PFS = 1,
+  WAIT_OR_FAIL = 2,
+  COPY_FROM_RANK = 3,
+};
 
 enum OmpFileIOHintFlags : uint32_t {
   OMPFILE_IO_HINT_HAS_EPOCH = 1u << 0,
@@ -132,6 +140,26 @@ struct OmpFileIOBatchPlan {
   uint32_t Reserved1 = 0;
 };
 
+struct OmpFileFreshnessQueryRequest {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  uint32_t Reserved0 = 0;
+  uint64_t PathKey = 0;
+  uint64_t LocalVersion = 0;
+  int32_t RequesterRank = -1;
+  int32_t Reserved1 = 0;
+};
+
+struct OmpFileFreshnessQueryReply {
+  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  uint32_t Decision =
+      static_cast<uint32_t>(OmpFileFreshnessDecision::WAIT_OR_FAIL);
+  int32_t SourceRank = -1;
+  int32_t Status = 0;
+  int32_t Errno = 0;
+  int32_t Reserved0 = 0;
+  uint64_t SelectedVersion = 0;
+};
+
 static_assert(std::is_standard_layout_v<OmpFileIORequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOPlan>);
 static_assert(std::is_standard_layout_v<OmpFileIOHint>);
@@ -139,6 +167,8 @@ static_assert(std::is_standard_layout_v<OmpFileIOBatchSegment>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchRequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchPlanEntry>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchPlan>);
+static_assert(std::is_standard_layout_v<OmpFileFreshnessQueryRequest>);
+static_assert(std::is_standard_layout_v<OmpFileFreshnessQueryReply>);
 
 inline uint64_t batchSegmentPayloadBytes(uint32_t segment_count) {
   return static_cast<uint64_t>(segment_count) *

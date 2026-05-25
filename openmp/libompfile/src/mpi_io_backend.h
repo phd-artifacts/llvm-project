@@ -11,6 +11,7 @@
 #include <deque>
 #include <mpi.h>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,13 +30,26 @@ private:
     CholeskyOracle,
   };
 
+  enum class StageAffinityMode {
+    Off,
+    CholeskyOracle,
+  };
+
   MPI_Comm file_comm = MPI_COMM_NULL;
   int externally_initialized;
   std::unordered_map<int, MPI_File> file_handle_map;
   std::unordered_map<int, int> remote_file_handle_map;
+  std::unordered_map<int, int> remote_file_owner_rank_map;
   std::unordered_map<int, std::unordered_map<int, int>> remote_read_handle_cache;
   std::unordered_map<int, std::string> file_path_map;
   std::unordered_map<int, uint64_t> file_path_key_map;
+  struct TileFreshnessEntry {
+    uint64_t latest_version = 0;
+    std::set<int> fresh_ranks;
+    bool dirty = false;
+    uint64_t pfs_version = 0;
+  };
+  std::unordered_map<uint64_t, TileFreshnessEntry> tile_freshness_table;
   struct WritableStageCoherenceState {
     uint64_t WriteGeneration = 0;
     uint64_t InvalidatedGeneration = 0;
@@ -73,6 +87,7 @@ private:
   TwoPhasePolicy write_batch_policy = TwoPhasePolicy::Disabled;
   bool write_batch_enabled = false;
   ForecastMode forecast_mode = ForecastMode::Off;
+  StageAffinityMode stage_affinity_mode = StageAffinityMode::Off;
   static constexpr uint64_t kDefaultTwoPhaseWindowUs = 2000;
   static constexpr uint64_t kDefaultTwoPhaseMaxBatchBytes = 8 * 1024 * 1024;
   static constexpr uint64_t kDefaultTwoPhaseSieveBytes = 256 * 1024;
@@ -159,6 +174,11 @@ private:
   std::atomic<uint64_t> forecast_target_read_bypass_bytes_total{0};
   std::atomic<uint64_t> forecast_role_unknown_count{0};
   std::atomic<uint64_t> forecast_role_unknown_bytes_total{0};
+  std::atomic<uint64_t> stage_affinity_source_candidate_count{0};
+  std::atomic<uint64_t> stage_affinity_source_candidate_bytes{0};
+  std::atomic<uint64_t> stage_affinity_source_applied_count{0};
+  std::atomic<uint64_t> stage_affinity_source_applied_bytes{0};
+  std::atomic<uint64_t> stage_affinity_source_fallback_count{0};
   bool two_phase_batch_in_progress = false;
   bool write_batch_in_progress = false;
 
@@ -270,6 +290,9 @@ public:
   };
   bool globallyInvalidateStageForTesting(int file_id) {
     return globallyInvalidateStageForFile(file_id);
+  }
+  bool sourceStageAffinityPreReadInvalidateForTesting(int file_id) {
+    return sourceStageAffinityPreReadInvalidateForFile(file_id);
   }
   bool hasCompletedStageInvalidationForTesting(int file_id) const;
   void markStageInvalidationCompleteForTesting(int file_id) {
@@ -436,6 +459,58 @@ public:
       const ompfile::OmpFileIOHint &hint) const {
     return shouldBypassStageForForecastRead(hint);
   }
+  bool shouldUseNoStageFallbackForTesting(
+      const ompfile::OmpFileIOHint &hint, bool force_no_stage) const {
+    return shouldUseNoStageFallback(hint, force_no_stage);
+  }
+  bool shouldAttemptPlannerRebalancedReadForTesting(
+      int rc, bool force_no_stage_fallback, bool planner_rebalanced,
+      int planned_rank) const {
+    return shouldAttemptPlannerRebalancedRead(
+        rc, force_no_stage_fallback, planner_rebalanced, planned_rank);
+  }
+  bool isSourceStageAffinityEligibleForTesting(
+      const ompfile::OmpFileIOHint &hint, bool has_path_key,
+      bool remote_only) const {
+    return isSourceStageAffinityEligible(hint, has_path_key, remote_only);
+  }
+  bool canAttemptSourceStageAffinityReadForTesting(
+      const ompfile::OmpFileIOHint &hint, int file_id, long start, size_t size,
+      bool has_path_key, bool remote_only, bool planner_force_fallback) {
+    return canAttemptSourceStageAffinityRead(
+        hint, file_id, start, size, has_path_key, remote_only,
+        planner_force_fallback);
+  }
+  bool selectSourceStageAffinityRankForTesting(
+      uint64_t path_key, const ompfile::OmpFileIOHint &hint,
+      const std::vector<int> &worker_ranks, int &rank_out) const {
+    return selectSourceStageAffinityRank(path_key, hint, worker_ranks,
+                                          rank_out);
+  }
+  static std::vector<int> workerRanksForTesting(int world_size,
+                                                int headnode_rank) {
+    return computeWorkerRanks(world_size, headnode_rank);
+  }
+  static uint64_t computePathKeyForTesting(const char *path) {
+    return computePathKey(path);
+  }
+  bool commitTileFreshnessWriteForTesting(uint64_t path_key, int writer_rank,
+                                          bool write_through_mode,
+                                          uint64_t &committed_version_out) {
+    return commitTileFreshnessWrite(path_key, writer_rank, write_through_mode,
+                                    committed_version_out);
+  }
+  bool markTileFreshForTesting(uint64_t path_key, int rank,
+                               uint64_t version) {
+    return markTileFresh(path_key, rank, version);
+  }
+  bool isTileStaleForTesting(uint64_t path_key, int rank,
+                             uint64_t local_version) const {
+    return isTileStale(path_key, rank, local_version);
+  }
+  TileFreshnessEntry tileFreshnessEntryForTesting(uint64_t path_key) const {
+    return tileFreshnessEntry(path_key);
+  }
   ForecastCountersForTesting forecastCountersForTesting() const {
     return {forecast_hint_read_count.load(std::memory_order_relaxed),
             forecast_hint_write_count.load(std::memory_order_relaxed),
@@ -450,6 +525,41 @@ public:
                 std::memory_order_relaxed),
             forecast_role_unknown_count.load(std::memory_order_relaxed),
             forecast_role_unknown_bytes_total.load(
+                std::memory_order_relaxed)};
+  }
+  struct StageAffinityCountersForTesting {
+    uint64_t Candidates = 0;
+    uint64_t CandidateBytes = 0;
+    uint64_t Applied = 0;
+    uint64_t AppliedBytes = 0;
+    uint64_t Fallbacks = 0;
+  };
+  void addStageAffinityCountersForTesting(uint64_t candidates,
+                                          uint64_t candidate_bytes,
+                                          uint64_t applied,
+                                          uint64_t applied_bytes,
+                                          uint64_t fallbacks) {
+    stage_affinity_source_candidate_count.fetch_add(
+        candidates, std::memory_order_relaxed);
+    stage_affinity_source_candidate_bytes.fetch_add(
+        candidate_bytes, std::memory_order_relaxed);
+    stage_affinity_source_applied_count.fetch_add(applied,
+                                                  std::memory_order_relaxed);
+    stage_affinity_source_applied_bytes.fetch_add(
+        applied_bytes, std::memory_order_relaxed);
+    stage_affinity_source_fallback_count.fetch_add(
+        fallbacks, std::memory_order_relaxed);
+  }
+  StageAffinityCountersForTesting stageAffinityCountersForTesting() const {
+    return {stage_affinity_source_candidate_count.load(
+                std::memory_order_relaxed),
+            stage_affinity_source_candidate_bytes.load(
+                std::memory_order_relaxed),
+            stage_affinity_source_applied_count.load(
+                std::memory_order_relaxed),
+            stage_affinity_source_applied_bytes.load(
+                std::memory_order_relaxed),
+            stage_affinity_source_fallback_count.load(
                 std::memory_order_relaxed)};
   }
 
@@ -474,8 +584,9 @@ private:
                      uint64_t group_key);
   int readAtFallback(int file_id, long offset, void *data, size_t size);
   int readAtFallbackWithBytes(int file_id, long offset, void *data, size_t size,
-                              size_t &bytes_read,
-                              const ompfile::OmpFileIOHint *hint = nullptr);
+                               size_t &bytes_read,
+                               const ompfile::OmpFileIOHint *hint = nullptr,
+                               bool force_no_stage = false);
   int readAtTwoPhase(const ompfile::OmpFileReadRequestContext &context,
                      void *data, size_t size);
   void processTwoPhaseBatch(std::vector<TwoPhaseReadRequest *> &batch);
@@ -494,8 +605,10 @@ private:
   int getNextFileHandle();
   static TwoPhasePolicy parseTwoPhasePolicy(const char *env_value);
   static ForecastMode parseForecastMode(const char *env_value);
+  static StageAffinityMode parseStageAffinityMode(const char *env_value);
   static const char *twoPhasePolicyToString(TwoPhasePolicy policy);
   static const char *forecastModeToString(ForecastMode mode);
+  static const char *stageAffinityModeToString(StageAffinityMode mode);
   static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
   static void updateAtomicMax(std::atomic<uint64_t> &counter,
@@ -521,6 +634,24 @@ private:
   bool isForecastRoleHintValid(const ompfile::OmpFileIOHint &hint) const;
   bool shouldBypassStageForForecastRead(
       const ompfile::OmpFileIOHint &hint) const;
+  bool shouldUseNoStageFallback(const ompfile::OmpFileIOHint &hint,
+                                bool force_no_stage) const;
+  bool shouldAttemptPlannerRebalancedRead(int rc, bool force_no_stage_fallback,
+                                          bool planner_rebalanced,
+                                          int planned_rank) const;
+  bool isSourceStageAffinityEligible(const ompfile::OmpFileIOHint &hint,
+                                     bool has_path_key,
+                                     bool remote_only) const;
+  bool canAttemptSourceStageAffinityRead(
+      const ompfile::OmpFileIOHint &hint, int file_id, long start, size_t size,
+      bool has_path_key, bool remote_only, bool planner_force_fallback);
+  static uint64_t computeSourceStageAffinityKey(
+      uint64_t path_key, const ompfile::OmpFileIOHint &hint);
+  static std::vector<int> computeWorkerRanks(int world_size, int headnode_rank);
+  // worker_ranks must be the canonical ordered worker list.
+  static bool selectSourceStageAffinityRank(
+      uint64_t path_key, const ompfile::OmpFileIOHint &hint,
+      const std::vector<int> &worker_ranks, int &rank_out);
   void recordForecastRead(const ompfile::OmpFileIOHint &hint, size_t size);
   void recordForecastWrite(const ompfile::OmpFileIOHint &hint, size_t size);
   void rememberFilePathKey(int file_id, const char *path);
@@ -531,22 +662,34 @@ private:
       const ompfile::OmpFileReadRequestContext &context);
   bool rangesOverlap(long a_start, long a_end, long b_start, long b_end) const;
   void recordWriteEpochForContext(int file_id, long offset, size_t size,
-                                  const ompfile::OmpFileIOHint &hint);
+                                   const ompfile::OmpFileIOHint &hint);
   bool globallyInvalidateStageForFile(int file_id);
+  bool sourceStageAffinityPreReadInvalidateForFile(int file_id);
   void completeStageInvalidationForFile(int file_id, uint64_t generation,
-                                        bool ok);
+                                         bool ok);
   void triggerStageInvalidationAfterSuccessfulRemoteWrite(int file_id);
   void noteAppliedRebalancedReadForFile(int file_id);
   bool canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint, int file_id,
-                              long start, size_t size,
-                              const char *&reason_out,
-                              int &reason_errno_out);
+                               long start, size_t size,
+                               const char *&reason_out,
+                               int &reason_errno_out,
+                               bool record_stats = true);
   void noteWritableReadRebalanceBlocked(const char *reason);
   bool getOrCreateRemoteReadHandleForRank(int file_id, int target_rank,
                                           int &remote_handle_out);
   bool readAtRemoteRankWithBytes(int file_id, int target_rank, long offset,
                                  void *data, size_t size,
                                  size_t &bytes_read);
+  bool readAtSourceStageAffinityRankWithBytes(
+      int file_id, uint64_t path_key, const ompfile::OmpFileIOHint &hint,
+      long offset, void *data, size_t size, size_t &bytes_read,
+      int &rank_out);
+  bool commitTileFreshnessWrite(uint64_t path_key, int writer_rank,
+                                bool write_through_mode,
+                                uint64_t &committed_version_out);
+  bool markTileFresh(uint64_t path_key, int rank, uint64_t version);
+  bool isTileStale(uint64_t path_key, int rank, uint64_t local_version) const;
+  TileFreshnessEntry tileFreshnessEntry(uint64_t path_key) const;
   static bool plannerStatusForcesFallback(int planner_errno,
                                           const char *&reason_out,
                                           int &reason_errno_out) {

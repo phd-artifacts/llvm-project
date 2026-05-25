@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "EventSystem.h"
@@ -59,6 +60,13 @@ public:
     uint64_t Rebalances = 0;
   };
 
+  struct TileFreshnessEntry {
+    uint64_t LatestVersion = 0;
+    std::unordered_set<int> FreshRanks;
+    bool Dirty = false;
+    uint64_t PfsVersion = 0;
+  };
+
   static OmpFileHeadnodeManager &instance();
 
   static uint64_t computePathKeyForTesting(std::string_view Path) {
@@ -80,15 +88,54 @@ public:
                                            const char *&Reason,
                                            int &ReasonErrno);
 
+  bool commitTileFreshnessWrite(uint64_t PathKey, int WriterRank,
+                                bool WriteThroughMode,
+                                uint64_t &CommittedVersionOut);
+  bool markTileFresh(uint64_t PathKey, int Rank, uint64_t Version);
+  bool registerTileCopy(uint64_t PathKey, int SourceRank, int DestRank,
+                        uint64_t Version);
+  bool markTileFreshFromCopy(uint64_t PathKey, int Rank, uint64_t Version);
+  bool flushDirtyTile(uint64_t PathKey, int &SourceRankOut,
+                      uint64_t &FlushedVersionOut);
+  bool completeDirtyFlush(uint64_t PathKey, int SourceRank, uint64_t Version,
+                         bool Success);
+
+  bool commitTileFreshnessWriteForTesting(uint64_t PathKey, int WriterRank,
+                                          bool WriteThroughMode,
+                                          uint64_t &CommittedVersionOut);
+  bool markTileFreshForTesting(uint64_t PathKey, int Rank, uint64_t Version);
+  bool evaluateTileFreshnessQueryForTesting(
+      uint64_t PathKey, uint64_t LocalVersion, int RequesterRank,
+      OmpFileFreshnessDecision &DecisionOut, int &SourceRankOut,
+      uint64_t &SelectedVersionOut);
+  bool handleFreshnessQueryRequest(
+      const OmpFileFreshnessQueryRequest &Request,
+      OmpFileFreshnessQueryReply &Reply);
+  bool handleFreshnessQueryRequestForTesting(
+      const OmpFileFreshnessQueryRequest &Request,
+      OmpFileFreshnessQueryReply &Reply) {
+    return handleFreshnessQueryRequest(Request, Reply);
+  }
+  bool clearTileFreshRanksForTesting(uint64_t PathKey);
+
   void completeRequest(const OmpFileIOPlan &Plan);
   std::vector<HandlerInfo> snapshotHandlersForTesting();
   void resetForTesting();
+
+  bool isFreshnessTraceEnabled() const;
+  void emitFreshnessTrace(const char *Event, const std::string &PathKey,
+                          int Rank, int SrcRank, int DstRank,
+                          uint64_t Version, uint64_t LatestVersion,
+                          const char *Decision, const char *Result,
+                          const char *Reason, const char *TileId) const;
 
 private:
   OmpFileHeadnodeManager() = default;
 
   static uint64_t computePathKey(std::string_view Path);
   static uint64_t parseUint64Env(const char *Name, uint64_t DefaultValue);
+  static bool parseBoolEnv(const char *Name, bool DefaultValue);
+  void freshnessTraceLogUnlocked(const char *Format, ...) const;
   bool segmentRangesOverlap(int64_t ReadOffset, uint64_t ReadSize,
                             int64_t WriteOffset, uint64_t WriteSize) const;
   uint64_t nextWriteSequenceUnlocked();
@@ -105,6 +152,22 @@ private:
   void bumpHandlerLoadUnlocked(int Rank);
   void noteBatchPlanUnlocked(int Rank);
   void registerPathAffinityUnlocked(uint64_t PathKey, int Rank);
+  bool commitTileFreshnessWriteUnlocked(uint64_t PathKey, int WriterRank,
+                                        bool WriteThroughMode,
+                                        uint64_t &CommittedVersionOut);
+  bool markTileFreshUnlocked(uint64_t PathKey, int Rank, uint64_t Version);
+  bool registerTileCopyUnlocked(uint64_t PathKey, int SourceRank, int DestRank,
+                                uint64_t Version);
+  bool markTileFreshFromCopyUnlocked(uint64_t PathKey, int Rank,
+                                     uint64_t Version);
+  bool flushDirtyTileUnlocked(uint64_t PathKey, int &SourceRankOut,
+                              uint64_t &FlushedVersionOut);
+  bool completeDirtyFlushUnlocked(uint64_t PathKey, int SourceRank,
+                                  uint64_t Version, bool Success);
+  bool evaluateTileFreshnessQueryUnlocked(
+      uint64_t PathKey, uint64_t LocalVersion, int RequesterRank,
+      OmpFileFreshnessDecision &DecisionOut, int &SourceRankOut,
+      uint64_t &SelectedVersionOut) const;
   int pickRankForPathKeyUnlocked(uint64_t PathKey, bool HasPathKey,
                                  int ClientRank, bool &AffinityHit,
                                  bool &Rebalanced);
@@ -120,11 +183,19 @@ private:
   uint64_t BatchStatsReportEvery = 128;
   bool UsePlannedLoadForSkew = false;
   bool SpreadSamePathOpens = false;
+  bool FreshnessTraceEnabled = false;
 
   std::unordered_map<uint64_t, OmpFileIOPlan> FlightplanTable;
   std::unordered_map<std::string, GlobalFileEntry> GlobalFileTable;
   std::unordered_map<uint64_t, int> PathAffinityTable;
   std::unordered_map<uint64_t, std::vector<WriteVersionEntry>> PathWriteVersions;
+  std::unordered_map<uint64_t, TileFreshnessEntry> TileFreshnessTable;
+  struct PendingTileCopy {
+    int SourceRank = -1;
+    int DestRank = -1;
+    uint64_t Version = 0;
+  };
+  std::unordered_map<uint64_t, std::vector<PendingTileCopy>> PendingTileCopies;
   std::vector<HandlerInfo> Handlers;
   BatchPlanStats Stats;
   uint64_t NextGlobalFileId = 1;
