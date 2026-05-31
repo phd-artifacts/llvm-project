@@ -1939,6 +1939,258 @@ int ompfile_mpp_stage_invalidate_path_key(uint64_t PathKey,
   return FirstErrno;
 }
 
+int ompfile_mpp_freshness_query(const OmpFileFreshnessQueryRequest *Request,
+                                OmpFileFreshnessQueryReply *Reply) {
+  using namespace llvm::omp::target::plugin;
+  if (!Request || !Reply)
+    return EINVAL;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return EHOSTDOWN;
+  if (auto Err = Plugin->init())
+    return EHOSTDOWN;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return EHOSTDOWN;
+
+  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
+  EventTy Event = EventSystem.createEvent(
+      OriginEvents::ompfileFreshnessQuery,
+      EventTypeTy::OMPFILE_FRESHNESS_QUERY, /*DstDeviceID=*/0, Request, Reply);
+  if (Event.empty())
+    return EIO;
+  Event.wait();
+  if (auto Error = Event.getError())
+    return EIO;
+  if (Reply->AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+    return EPROTO;
+  if (Reply->Status != 0)
+    return Reply->Errno != 0 ? Reply->Errno : EIO;
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_freshness_write_commit(uint64_t PathKey, int WriterRank,
+                                       uint64_t TileId, int WriteThroughMode,
+                                       uint64_t *CommittedVersion) {
+  using namespace llvm::omp::target::plugin;
+  if (PathKey == 0 || WriterRank < 0 || !CommittedVersion)
+    return EINVAL;
+  *CommittedVersion = 0;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return EHOSTDOWN;
+  if (auto Err = Plugin->init())
+    return EHOSTDOWN;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return EHOSTDOWN;
+
+  OmpFileFreshnessWriteCommitRequest Request{};
+  Request.PathKey = PathKey;
+  Request.TileId = TileId;
+  Request.WriterRank = WriterRank;
+  Request.WriteThroughMode = WriteThroughMode != 0 ? 1u : 0u;
+  OmpFileFreshnessWriteCommitReply Reply{};
+
+  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
+  EventTy Event = EventSystem.createEvent(
+      OriginEvents::ompfileFreshnessWriteCommit,
+      EventTypeTy::OMPFILE_FRESHNESS_WRITE_COMMIT, /*DstDeviceID=*/0, &Request,
+      &Reply);
+  if (Event.empty())
+    return EIO;
+  Event.wait();
+  if (auto Error = Event.getError())
+    return EIO;
+  if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+    return EPROTO;
+  if (Reply.Status != 0)
+    return Reply.Errno != 0 ? Reply.Errno : EIO;
+  *CommittedVersion = Reply.CommittedVersion;
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_proxy_copy_tile(uint64_t PathKey, uint64_t TileId,
+                                int SourceRank, int DestRank,
+                                uint64_t Version) {
+  using namespace llvm::omp::target::plugin;
+  if (PathKey == 0 || SourceRank < 0 || DestRank < 0 || Version == 0)
+    return EINVAL;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return EHOSTDOWN;
+  if (auto Err = Plugin->init())
+    return EHOSTDOWN;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return EHOSTDOWN;
+
+  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
+  if (SourceRank >= EventSystem.getNumWorkers() ||
+      DestRank >= EventSystem.getNumWorkers())
+    return EINVAL;
+
+  OmpFileProxyCopyTileRequest Request{};
+  Request.PathKey = PathKey;
+  Request.TileId = TileId;
+  Request.SourceRank = SourceRank;
+  Request.DestRank = DestRank;
+  Request.Version = Version;
+
+  OmpFileProxyCopyTileReply HeadnodeReply{};
+  EventTy HeadnodeEvent = EventSystem.createEvent(
+      OriginEvents::ompfileProxyCopyTile, EventTypeTy::OMPFILE_PROXY_COPY_TILE,
+      /*DstDeviceID=*/0, &Request, &HeadnodeReply);
+  if (HeadnodeEvent.empty())
+    return EIO;
+  HeadnodeEvent.wait();
+  if (auto Error = HeadnodeEvent.getError())
+    return EIO;
+  if (HeadnodeReply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+    return EPROTO;
+  if (HeadnodeReply.Status != 0)
+    return HeadnodeReply.Errno != 0 ? HeadnodeReply.Errno : EIO;
+
+  if (SourceRank == DestRank)
+    return OFFLOAD_SUCCESS;
+
+  OmpFileProxyCopyTileReply Reply{};
+  EventTy Event = EventSystem.createEvent(
+      OriginEvents::ompfileProxyCopyTile, EventTypeTy::OMPFILE_PROXY_COPY_TILE,
+      /*DstDeviceID=*/DestRank, &Request, &Reply);
+  if (Event.empty())
+    return EIO;
+  Event.wait();
+  if (auto Error = Event.getError())
+    return EIO;
+  if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+    return EPROTO;
+  if (Reply.Status != 0)
+    return Reply.Errno != 0 ? Reply.Errno : EIO;
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_freshness_mark_fresh(uint64_t PathKey, int Rank,
+                                     uint64_t Version) {
+  using namespace llvm::omp::target::plugin;
+  if (PathKey == 0 || Rank < 0 || Version == 0)
+    return EINVAL;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return EHOSTDOWN;
+  if (auto Err = Plugin->init())
+    return EHOSTDOWN;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return EHOSTDOWN;
+
+  OmpFileFreshnessMarkFreshRequest Request{};
+  Request.PathKey = PathKey;
+  Request.Rank = Rank;
+  Request.Version = Version;
+  OmpFileFreshnessMarkFreshReply Reply{};
+
+  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
+  EventTy Event = EventSystem.createEvent(
+      OriginEvents::ompfileFreshnessMarkFresh,
+      EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH, /*DstDeviceID=*/0, &Request,
+      &Reply);
+  if (Event.empty())
+    return EIO;
+  Event.wait();
+  if (auto Error = Event.getError())
+    return EIO;
+  if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+    return EPROTO;
+  if (Reply.Status != 0)
+    return Reply.Errno != 0 ? Reply.Errno : EIO;
+  return OFFLOAD_SUCCESS;
+}
+
+int ompfile_mpp_flush_dirty_tile(uint64_t PathKey, int *SourceRank,
+                                 uint64_t *FlushedVersion) {
+  using namespace llvm::omp::target::plugin;
+  if (PathKey == 0 || !SourceRank || !FlushedVersion)
+    return EINVAL;
+  *SourceRank = -1;
+  *FlushedVersion = 0;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return EHOSTDOWN;
+  if (auto Err = Plugin->init())
+    return EHOSTDOWN;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return EHOSTDOWN;
+
+  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
+
+  OmpFileFlushDirtyTileRequest Request{};
+  Request.Action = 0;
+  Request.PathKey = PathKey;
+  OmpFileFlushDirtyTileReply Reply{};
+  EventTy Event = EventSystem.createEvent(
+      OriginEvents::ompfileFlushDirtyTile, EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE,
+      /*DstDeviceID=*/0, &Request, &Reply);
+  if (Event.empty())
+    return EIO;
+  Event.wait();
+  if (auto Error = Event.getError())
+    return EIO;
+  if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+    return EPROTO;
+  if (Reply.Status != 0)
+    return Reply.Errno != 0 ? Reply.Errno : EIO;
+
+  if (Reply.SourceRank >= 0) {
+    OmpFileFlushDirtyTileRequest WritebackRequest{};
+    WritebackRequest.Action = 2;
+    WritebackRequest.PathKey = PathKey;
+    WritebackRequest.SourceRank = Reply.SourceRank;
+    WritebackRequest.Version = Reply.FlushedVersion;
+    WritebackRequest.Success = 1;
+    OmpFileFlushDirtyTileReply WritebackReply{};
+    EventTy WritebackEvent = EventSystem.createEvent(
+        OriginEvents::ompfileFlushDirtyTile,
+        EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE,
+        /*DstDeviceID=*/Reply.SourceRank, &WritebackRequest, &WritebackReply);
+    if (WritebackEvent.empty())
+      return EIO;
+    WritebackEvent.wait();
+    if (auto Error = WritebackEvent.getError())
+      return EIO;
+    if (WritebackReply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+      return EPROTO;
+    if (WritebackReply.Status != 0)
+      return WritebackReply.Errno != 0 ? WritebackReply.Errno : EIO;
+
+    OmpFileFlushDirtyTileRequest CompleteRequest{};
+    CompleteRequest.Action = 1;
+    CompleteRequest.PathKey = PathKey;
+    CompleteRequest.SourceRank = Reply.SourceRank;
+    CompleteRequest.Version = Reply.FlushedVersion;
+    CompleteRequest.Success = 1;
+    OmpFileFlushDirtyTileReply CompleteReply{};
+    EventTy CompleteEvent = EventSystem.createEvent(
+        OriginEvents::ompfileFlushDirtyTile,
+        EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE, /*DstDeviceID=*/0,
+        &CompleteRequest, &CompleteReply);
+    if (CompleteEvent.empty())
+      return EIO;
+    CompleteEvent.wait();
+    if (auto Error = CompleteEvent.getError())
+      return EIO;
+    if (CompleteReply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+      return EPROTO;
+    if (CompleteReply.Status != 0)
+      return CompleteReply.Errno != 0 ? CompleteReply.Errno : EIO;
+  }
+
+  *SourceRank = Reply.SourceRank;
+  *FlushedVersion = Reply.FlushedVersion;
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_poll(uint64_t Token, int *Done) {
   using namespace llvm::omp::target::plugin;
   if (!Done)
