@@ -83,6 +83,31 @@ static std::unordered_map<int, OmpfileMppHandleEntry> &getOmpfileMppHandles() {
   return *Handles;
 }
 
+static bool ompfileDiagEnabled() {
+  static const bool Enabled = []() {
+    const char *Raw = std::getenv("OMPFILE_MPP_DEVICE_DIAG");
+    return Raw && Raw[0] && std::strcmp(Raw, "0") != 0;
+  }();
+  return Enabled;
+}
+
+// Extra fields are phase-specific:
+// - plugin_init_count: extra_a=world_size, extra_b=device_slots_before_publish
+// - plugin_init_publish: extra_a=world_size, extra_b=computed_device_count
+// - is_device_compatible: extra_a=compat_result_or_rc, extra_b=diag_reason
+//   diag_reason: 0=normal, 1=event_empty, 2=event_error
+// - is_device_initialized: extra_a=initialized(0|1), extra_b=device_ptr_is_null
+// - init_device: extra_a=init_result_or_rc, extra_b=device_ptr_is_null
+static void ompfileDiagLog(const char *Phase, int Rank, int DeviceCount,
+                           int DeviceId, int ExtraA, int ExtraB) {
+  if (!ompfileDiagEnabled())
+    return;
+  REPORT("[ompfile-mpi-diag] phase=%s rank=%d device_count=%d device_id=%d "
+         "extra_a=%d extra_b=%d\n",
+         Phase ? Phase : "unknown", Rank, DeviceCount, DeviceId, ExtraA,
+         ExtraB);
+}
+
 static int registerOmpfileMppHandle(int Rank, int RemoteHandle) {
   static std::atomic<int> NextHandle{1};
   auto &Handles = getOmpfileMppHandles();
@@ -482,11 +507,26 @@ struct MPIPluginTy : public GenericPluginTy {
 
   /// Initialize the plugin and return the number of devices.
   Expected<int32_t> initImpl() override {
-    if (!EventSystem.is_initialized())
-      EventSystem.initialize();
+    ompfileDiagLog("plugin_init_enter", -1, -1, -1, 0, 0);
+    if (!EventSystem.is_initialized() && !EventSystem.initialize()) {
+      DP("Failed to initialize EventSystem during plugin init\n");
+      ompfileDiagLog("plugin_init_eventsystem_fail", -1, -1, -1,
+                     OFFLOAD_FAIL, 0);
+      return Plugin::error("Failed to initialize EventSystem during plugin "
+                           "init");
+    }
+    int32_t NumWorkers = EventSystem.getNumWorkers();
+    int32_t DeviceSlotsBeforePublish = static_cast<int32_t>(RemoteDevices.size());
     int32_t NumRemoteDevices = getNumRemoteDevices();
+    ompfileDiagLog("plugin_init_count", -1, NumRemoteDevices, -1, NumWorkers,
+                   DeviceSlotsBeforePublish);
     assert(RemoteDevices.size() == 0 && "MPI Plugin already initialized");
     RemoteDevices.resize(NumRemoteDevices, nullptr);
+    RemoteDevicesInitialized.resize(NumRemoteDevices, false);
+    ompfileDiagLog("plugin_init_publish", -1,
+                   static_cast<int>(RemoteDevices.size()), -1, NumWorkers,
+                   NumRemoteDevices);
+
     return NumRemoteDevices;
   }
 
@@ -628,8 +668,13 @@ struct MPIPluginTy : public GenericPluginTy {
   }
 
   int32_t is_plugin_compatible(__tgt_device_image *Image) override {
-    if (!EventSystem.is_initialized())
-      EventSystem.initialize();
+    if (!EventSystem.is_initialized() && !EventSystem.initialize()) {
+      DP("Failed to initialize EventSystem in is_plugin_compatible\n");
+      ompfileDiagLog("is_plugin_compatible_eventsystem_fail", -1,
+                     static_cast<int>(RemoteDevices.size()), -1, OFFLOAD_FAIL,
+                     0);
+      return false;
+    }
 
     int NumRanks = EventSystem.getNumWorkers();
     llvm::SmallVector<bool> QueryResults{};
@@ -642,6 +687,8 @@ struct MPIPluginTy : public GenericPluginTy {
       if (Event.empty()) {
         DP("Failed to create isPluginCompatible on Rank %d\n", RemoteRank);
         QueryResults[RemoteRank] = false;
+        QueryResult = false;
+        continue;
       }
 
       Event.wait();
@@ -659,6 +706,10 @@ struct MPIPluginTy : public GenericPluginTy {
   int32_t is_device_compatible(int32_t DeviceId,
                                __tgt_device_image *Image) override {
     bool QueryResult = true;
+    int CompatDiagA = static_cast<int>(QueryResult);
+    int CompatDiagB = 0;
+    ompfileDiagLog("is_device_compatible_enter", -1,
+                   static_cast<int>(RemoteDevices.size()), DeviceId, 0, 0);
 
     EventTy Event = EventSystem.createEvent(OriginEvents::isDeviceCompatible,
                                             EventTypeTy::IS_DEVICE_COMPATIBLE,
@@ -666,22 +717,48 @@ struct MPIPluginTy : public GenericPluginTy {
 
     if (Event.empty()) {
       DP("Failed to create isDeviceCompatible on Device %d\n", DeviceId);
+      CompatDiagA = OFFLOAD_FAIL;
+      CompatDiagB = 1;
+      ompfileDiagLog("is_device_compatible", -1,
+                     static_cast<int>(RemoteDevices.size()), DeviceId,
+                     CompatDiagA, CompatDiagB);
+      return false;
     }
 
     Event.wait();
     if (auto Err = Event.getError()) {
       DP("Error querying the binary compability on Device %d\n", DeviceId);
+      CompatDiagA = OFFLOAD_FAIL;
+      CompatDiagB = 2;
+      ompfileDiagLog("is_device_compatible", -1,
+                     static_cast<int>(RemoteDevices.size()), DeviceId,
+                     CompatDiagA, CompatDiagB);
+      return false;
     }
+
+    CompatDiagA = static_cast<int>(QueryResult);
+    ompfileDiagLog("is_device_compatible", -1,
+                   static_cast<int>(RemoteDevices.size()), DeviceId, CompatDiagA,
+                   CompatDiagB);
 
     return QueryResult;
   }
 
   int32_t is_device_initialized(int32_t DeviceId) const override {
-    return isValidDeviceId(DeviceId) && RemoteDevices[DeviceId] != nullptr;
+    bool IsValid = isValidDeviceId(DeviceId);
+    void *DevicePtr = IsValid ? RemoteDevices[DeviceId] : nullptr;
+    int32_t IsInitialized =
+        IsValid ? static_cast<int32_t>(RemoteDevicesInitialized[DeviceId]) : 0;
+    ompfileDiagLog("is_device_initialized", -1,
+                   static_cast<int>(RemoteDevices.size()), DeviceId,
+                   IsInitialized, DevicePtr == nullptr ? 1 : 0);
+    return IsInitialized;
   }
 
   int32_t init_device(int32_t DeviceId) override {
     void *DevicePtr = nullptr;
+    ompfileDiagLog("init_device_enter", -1, static_cast<int>(RemoteDevices.size()),
+                   DeviceId, 0, 0);
 
     EventTy Event =
         EventSystem.createEvent(OriginEvents::initDevice,
@@ -689,6 +766,10 @@ struct MPIPluginTy : public GenericPluginTy {
 
     if (Event.empty()) {
       REPORT("Error to create InitDevice Event for device %d\n", DeviceId);
+      if (isValidDeviceId(DeviceId))
+        RemoteDevicesInitialized[DeviceId] = false;
+      ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                     DeviceId, OFFLOAD_FAIL, 1);
       return OFFLOAD_FAIL;
     }
 
@@ -697,10 +778,33 @@ struct MPIPluginTy : public GenericPluginTy {
     if (auto Error = Event.getError()) {
       REPORT("Failure to initialize device %d: %s\n", DeviceId,
              toString(std::move(Error)).data());
-      return 0;
+      if (isValidDeviceId(DeviceId))
+        RemoteDevicesInitialized[DeviceId] = false;
+      int DevicePtrIsNull = DevicePtr == nullptr ? 1 : 0;
+      ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                     DeviceId, OFFLOAD_FAIL, DevicePtrIsNull);
+      return OFFLOAD_FAIL;
+    }
+
+    if (!isValidDeviceId(DeviceId)) {
+      int DevicePtrIsNull = DevicePtr == nullptr ? 1 : 0;
+      ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                     DeviceId, OFFLOAD_FAIL, DevicePtrIsNull);
+      return OFFLOAD_FAIL;
+    }
+
+    if (DevicePtr == nullptr) {
+      RemoteDevicesInitialized[DeviceId] = false;
+      ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                     DeviceId, OFFLOAD_FAIL, 1);
+      return OFFLOAD_FAIL;
     }
 
     RemoteDevices[DeviceId] = DevicePtr;
+    RemoteDevicesInitialized[DeviceId] = true;
+    int DevicePtrIsNull = DevicePtr == nullptr ? 1 : 0;
+    ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                   DeviceId, OFFLOAD_SUCCESS, DevicePtrIsNull);
 
     return OFFLOAD_SUCCESS;
   }
@@ -1395,6 +1499,7 @@ private:
   std::mutex MPIQueueMutex;
   llvm::DenseMap<uintptr_t, int32_t> DeviceImgPtrToDeviceId;
   llvm::SmallVector<void *> RemoteDevices;
+  llvm::SmallVector<bool> RemoteDevicesInitialized;
   EventSystemTy EventSystem;
 };
 
@@ -1414,6 +1519,7 @@ static Error Plugin::check(int32_t ErrorCode, const char *ErrFmt,
 extern "C" {
 int ompfile_mpp_init() {
   using namespace llvm::omp::target::plugin;
+  ompfileDiagLog("ompfile_mpp_init_enter", -1, -1, -1, 0, 0);
   MPIPluginTy *Plugin = ActiveMPIPlugin.load();
   if (!Plugin) {
     DP("ompfile_mpp_init: ActiveMPIPlugin is null.\n");
