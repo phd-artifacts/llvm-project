@@ -9,6 +9,7 @@
 #include <cstddef> // for size_t
 #include <cstdint>
 #include <deque>
+#include <fcntl.h>
 #include <mpi.h>
 #include <mutex>
 #include <set>
@@ -80,6 +81,8 @@ private:
   bool allow_fallback = false;
   bool strict_mpp_required = false;
   bool strict_mpp_init_failed = false;
+  int open_flags = O_RDWR;
+  int mpi_open_mode = MPI_MODE_RDWR;
   mutable std::atomic<bool> strict_failure_logged{false};
   bool writable_read_rebalance_enabled = false;
   TwoPhasePolicy two_phase_policy = TwoPhasePolicy::Disabled;

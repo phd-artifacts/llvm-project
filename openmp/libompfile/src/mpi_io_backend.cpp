@@ -27,6 +27,23 @@ bool freshnessWriteThroughModeEnabled() {
   return true;
 }
 
+struct OpenModeConfig {
+  int PosixFlags = O_RDWR;
+  int MpiMode = MPI_MODE_RDWR;
+};
+
+OpenModeConfig parseOpenModeConfig() {
+  const char *mode = std::getenv("LIBOMPFILE_OPEN_MODE");
+  if (!mode || !mode[0] || std::strcmp(mode, "readwrite") == 0)
+    return {};
+  if (std::strcmp(mode, "readonly") == 0 ||
+      std::strcmp(mode, "read-only") == 0 || std::strcmp(mode, "read") == 0)
+    return {O_RDONLY, MPI_MODE_RDONLY};
+
+  io_log("Invalid LIBOMPFILE_OPEN_MODE='%s'; using readwrite mode.\n", mode);
+  return {};
+}
+
 } // namespace
 
 MPIIOBackend::MPIIOBackend() {
@@ -63,6 +80,11 @@ MPIIOBackend::MPIIOBackend() {
 
   mpp_requested = mpp_open_enabled || mpp_io_enabled;
   mpp_remote_only = mpp_open_enabled && mpp_io_enabled;
+  const OpenModeConfig open_mode = parseOpenModeConfig();
+  open_flags = open_mode.PosixFlags;
+  mpi_open_mode = open_mode.MpiMode;
+  if (open_flags == O_RDONLY)
+    io_log("LIBOMPFILE_OPEN_MODE=readonly: opening files read-only.\n");
   writable_read_rebalance_enabled =
       parseBoolEnv("LIBOMPFILE_OPT_WRITABLE_READ_REBALANCE", false);
   allow_fallback = parseBoolEnv("LIBOMPFILE_ALLOWFALLBACK", false);
@@ -270,7 +292,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
     owner_rank_out = -1;
     const std::lock_guard<std::mutex> lock(mpp_call_mutex);
     if (have_open_plan) {
-      open_ok = ompfile::mpp::openOnRank(filename, O_RDWR, 0666,
+      open_ok = ompfile::mpp::openOnRank(filename, open_flags, 0666,
                                          plan->AggregatorRank,
                                          remote_handle_out);
       if (open_ok)
@@ -282,7 +304,8 @@ int MPIIOBackend::openWithPlan(const char *filename,
       }
     }
     if (!open_ok) {
-      open_ok = ompfile::mpp::open(filename, O_RDWR, 0666, remote_handle_out);
+      open_ok = ompfile::mpp::open(filename, open_flags, 0666,
+                                   remote_handle_out);
       if (open_ok &&
           !ompfile::mpp::handleOwnerRank(remote_handle_out, owner_rank_out)) {
         io_log("MPP open owner-rank query failed for %s (handle=%d errno=%d)\n",
@@ -320,7 +343,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
   }
 
   MPI_File file_handle;
-  int ret = MPI_File_open(file_comm, filename, MPI_MODE_RDWR, MPI_INFO_NULL,
+  int ret = MPI_File_open(file_comm, filename, mpi_open_mode, MPI_INFO_NULL,
                           &file_handle);
   if (ret != MPI_SUCCESS) {
     char err_str[MPI_MAX_ERROR_STRING];
@@ -2604,8 +2627,8 @@ bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
   int opened_handle = -1;
   {
     const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-    if (!ompfile::mpp::openOnRank(path.c_str(), O_RDWR, 0666, target_rank,
-                                  opened_handle)) {
+    if (!ompfile::mpp::openOnRank(path.c_str(), open_flags, 0666,
+                                  target_rank, opened_handle)) {
       return false;
     }
   }
