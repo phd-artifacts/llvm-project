@@ -234,6 +234,26 @@ MPIIOBackend::MPIIOBackend() {
 MPIIOBackend::~MPIIOBackend() {
   reportPhase0Stats();
   {
+    std::vector<int> remote_handles;
+    {
+      const std::lock_guard<std::mutex> lock(handle_mutex);
+      remote_handles.reserve(remote_file_handle_map.size());
+      for (const auto &entry : remote_file_handle_map) {
+        if (entry.second >= 0)
+          remote_handles.push_back(entry.second);
+      }
+      remote_file_handle_map.clear();
+      remote_file_owner_rank_map.clear();
+    }
+    for (int remote_handle : remote_handles) {
+      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      if (!ompfile::mpp::close(remote_handle)) {
+        io_log("MPP close retry failed during backend teardown (handle=%d)\n",
+               remote_handle);
+      }
+    }
+  }
+  {
     std::vector<uint64_t> path_keys;
     {
       const std::lock_guard<std::mutex> lock(handle_mutex);
@@ -460,18 +480,8 @@ int MPIIOBackend::close(int file_id) {
   if (strict_mpp_init_failed)
     return failStrictMpp("close");
   io_log("Closing file %d\n", file_id);
-  invalidateTwoPhaseReadCacheForFile(file_id);
   std::vector<int> rebalanced_handles;
-  collectRemoteReadHandlesForClose(file_id, rebalanced_handles);
   uint64_t close_path_key = 0;
-  {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
-    auto it = file_path_key_map.find(file_id);
-    if (it != file_path_key_map.end())
-      close_path_key = it->second;
-  }
-  forgetFilePath(file_id);
-  forgetFilePathKey(file_id);
   const bool remote_only = mpp_remote_only;
   int remote_handle = -1;
   bool has_remote_handle = false;
@@ -488,14 +498,29 @@ int MPIIOBackend::close(int file_id) {
       return -1;
     }
 
+    auto path_key_it = file_path_key_map.find(file_id);
+    if (path_key_it != file_path_key_map.end())
+      close_path_key = path_key_it->second;
+
+    auto read_cache_it = remote_read_handle_cache.find(file_id);
+    if (read_cache_it != remote_read_handle_cache.end()) {
+      for (const auto &entry : read_cache_it->second)
+        rebalanced_handles.push_back(entry.second);
+      remote_read_handle_cache.erase(read_cache_it);
+    }
+
+    file_path_map.erase(file_id);
+    file_path_key_map.erase(file_id);
+    file_write_epoch_history.erase(file_id);
+
     if (mpp_open_enabled) {
       auto it = remote_file_handle_map.find(file_id);
       if (it != remote_file_handle_map.end()) {
         remote_handle = it->second;
         has_remote_handle = true;
-        remote_file_handle_map.erase(it);
+      } else {
+        remote_file_owner_rank_map.erase(file_id);
       }
-      remote_file_owner_rank_map.erase(file_id);
     }
 
     if (!remote_only) {
@@ -510,6 +535,8 @@ int MPIIOBackend::close(int file_id) {
     traceHandleStateLocked("close.after_local_erase", file_id, remote_handle);
   }
 
+  invalidateTwoPhaseReadCacheForFile(file_id);
+
   int mpp_ret = 0;
   if (has_remote_handle) {
     bool close_ok = false;
@@ -520,6 +547,12 @@ int MPIIOBackend::close(int file_id) {
     if (!close_ok) {
       io_log("MPP close failed for file %d\n", file_id);
       mpp_ret = -1;
+    } else {
+      const std::lock_guard<std::mutex> lock(handle_mutex);
+      auto it = remote_file_handle_map.find(file_id);
+      if (it != remote_file_handle_map.end() && it->second == remote_handle)
+        remote_file_handle_map.erase(it);
+      remote_file_owner_rank_map.erase(file_id);
     }
   }
 
@@ -2820,22 +2853,6 @@ MPIIOBackend::tileFreshnessEntry(uint64_t path_key) const {
   if (it == tile_freshness_table.end())
     return {};
   return it->second;
-}
-
-void MPIIOBackend::collectRemoteReadHandlesForClose(
-    int file_id, std::vector<int> &handles_out) {
-  handles_out.clear();
-  const std::lock_guard<std::mutex> lock(handle_mutex);
-  auto it = remote_read_handle_cache.find(file_id);
-  if (it == remote_read_handle_cache.end()) {
-    file_write_epoch_history.erase(file_id);
-    return;
-  }
-
-  for (const auto &entry : it->second)
-    handles_out.push_back(entry.second);
-  remote_read_handle_cache.erase(it);
-  file_write_epoch_history.erase(file_id);
 }
 
 uint64_t MPIIOBackend::resolveTwoPhaseKey(

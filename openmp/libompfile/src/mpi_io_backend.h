@@ -715,8 +715,6 @@ private:
     }
     return false;
   }
-  void collectRemoteReadHandlesForClose(int file_id,
-                                        std::vector<int> &handles_out);
   bool tryServeTwoPhaseReadCache(uint64_t key, long offset, void *data,
                                  size_t size);
   void updateTwoPhaseReadCache(uint64_t key, long start,
