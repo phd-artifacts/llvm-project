@@ -9,6 +9,7 @@ add_compile_definitions(OMP_IO_DEBUG)
 add_library(ompfile SHARED
     src/file_interface.cpp
     src/mpi_io_backend.cpp
+    src/mpi_io_backend_config.cpp
     src/mpi_io_backend_metrics.cpp
     src/mpp_shim.cpp
     src/posix_backend.cpp
