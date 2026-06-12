@@ -10,6 +10,7 @@ add_library(ompfile SHARED
     src/file_interface.cpp
     src/mpi_io_backend.cpp
     src/mpi_io_backend_config.cpp
+    src/mpi_io_backend_handles.cpp
     src/mpi_io_backend_metrics.cpp
     src/mpp_shim.cpp
     src/posix_backend.cpp
