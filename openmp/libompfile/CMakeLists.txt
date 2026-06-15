@@ -18,6 +18,7 @@ add_library(ompfile SHARED
     src/mpi_io_backend_two_phase_cache.cpp
     src/mpi_io_backend_two_phase_scheduler.cpp
     src/mpi_io_backend_write_batch_grouping.cpp
+    src/mpi_io_backend_write_path.cpp
     src/mpp_shim.cpp
     src/posix_backend.cpp
     src/io_uring_io_backend.cpp
