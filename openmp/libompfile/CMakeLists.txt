@@ -11,8 +11,10 @@ add_library(ompfile SHARED
     src/mpi_io_backend.cpp
     src/mpi_io_backend_config.cpp
     src/mpi_io_backend_coherence.cpp
+    src/mpi_io_backend_forecast_affinity.cpp
     src/mpi_io_backend_handles.cpp
     src/mpi_io_backend_metrics.cpp
+    src/mpi_io_backend_remote_read_handles.cpp
     src/mpi_io_backend_two_phase_cache.cpp
     src/mpi_io_backend_two_phase_scheduler.cpp
     src/mpi_io_backend_write_batch_grouping.cpp
