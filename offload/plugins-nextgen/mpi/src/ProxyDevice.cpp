@@ -746,6 +746,9 @@ struct ProxyDevice {
         OmpFileOptStats("LIBOMPFILE_OPT_STATS", false),
         OmpFileForceBlockingPwrite("LIBOMPFILE_MPP_FORCE_BLOCKING_PWRITE",
                                    false),
+        OmpFileOpenEioRetries("OMPTARGET_OMPFILE_OPEN_EIO_RETRIES", 16),
+        OmpFileOpenEioBackoffUs("OMPTARGET_OMPFILE_OPEN_EIO_BACKOFF_US",
+                                 200000),
         OmpFileMPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6),
         OmpFileHeadnodeScheduler(
             envStringOrDefault("LIBOMPFILE_SCHEDULER", "LOCAL") ==
@@ -2668,6 +2671,10 @@ struct ProxyDevice {
     uint64_t OpenSys = OmpFileStatsOpenSyscalls.load(std::memory_order_relaxed);
     uint64_t OpenHits =
         OmpFileStatsOpenCacheHits.load(std::memory_order_relaxed);
+    uint64_t OpenEioRetries =
+        OmpFileStatsOpenEioRetries.load(std::memory_order_relaxed);
+    uint64_t OpenEioFailures =
+        OmpFileStatsOpenEioFailures.load(std::memory_order_relaxed);
     uint64_t CloseReq =
         OmpFileStatsCloseRequests.load(std::memory_order_relaxed);
     uint64_t CloseSys =
@@ -2765,6 +2772,7 @@ struct ProxyDevice {
     fprintf(stderr,
             "MPIProxyDevice --> OMPFile stats [%s] rank=%d "
             "open_req=%llu open_sys=%llu open_hits=%llu "
+            "open_eio_retries=%llu open_eio_failures=%llu "
             "close_req=%llu close_sys=%llu close_deferred=%llu "
             "cache_entries=%zu pwrite_async_events=%llu "
             "pwrite_async_fragments=%llu pwrite_blocking_fallbacks=%llu "
@@ -2800,6 +2808,8 @@ struct ProxyDevice {
             static_cast<unsigned long long>(OpenReq),
             static_cast<unsigned long long>(OpenSys),
             static_cast<unsigned long long>(OpenHits),
+            static_cast<unsigned long long>(OpenEioRetries),
+            static_cast<unsigned long long>(OpenEioFailures),
             static_cast<unsigned long long>(CloseReq),
             static_cast<unsigned long long>(CloseSys),
             static_cast<unsigned long long>(CloseDeferred), CacheEntries,
@@ -2896,7 +2906,26 @@ struct ProxyDevice {
       Path.pop_back();
 
     int Errno = 0;
-    int Fd = openWithOptionalCache(Path.c_str(), Flags, Mode, Errno);
+    int Fd = -1;
+    const int MaxEioRetries = OmpFileOpenEioRetries.get();
+    const int EioBackoffUs = OmpFileOpenEioBackoffUs.get();
+    for (int Attempt = 0;; ++Attempt) {
+      Fd = openWithOptionalCache(Path.c_str(), Flags, Mode, Errno);
+      if (Fd >= 0)
+        break;
+      const bool IsTransient = (Errno == EIO || Errno == ENOENT ||
+                                Errno == ESTALE);
+      if (!IsTransient || Attempt >= MaxEioRetries) {
+        if (IsTransient)
+          OmpFileStatsOpenEioFailures.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+      OmpFileStatsOpenEioRetries.fetch_add(1, std::memory_order_relaxed);
+      traceOmpFile("ompfileOpen transient-retry path=%s attempt=%d "
+                   "errno=%d backoff_us=%d\n",
+                   Path.c_str(), Attempt + 1, Errno, EioBackoffUs);
+      std::this_thread::sleep_for(std::chrono::microseconds(EioBackoffUs));
+    }
     if (Fd >= 0) {
       trackOmpFileFd(Fd, Path, Flags, Mode);
       if (shouldInvalidateStageOnOpen(Flags))
@@ -4791,6 +4820,8 @@ private:
   IntEnvar NumDataEventHandlers;
   /// Polling rate period (us) used by event handlers.
   IntEnvar EventPollingRate;
+  IntEnvar OmpFileOpenEioRetries;
+  IntEnvar OmpFileOpenEioBackoffUs;
   BoolEnvar OmpFileOpenCacheEnable;
   BoolEnvar OmpFileOpenCacheKeepOpen;
   BoolEnvar OmpFileOptStats;
@@ -4834,6 +4865,8 @@ private:
   std::atomic<uint64_t> OmpFileStatsOpenRequests{0};
   std::atomic<uint64_t> OmpFileStatsOpenSyscalls{0};
   std::atomic<uint64_t> OmpFileStatsOpenCacheHits{0};
+  std::atomic<uint64_t> OmpFileStatsOpenEioRetries{0};
+  std::atomic<uint64_t> OmpFileStatsOpenEioFailures{0};
   std::atomic<uint64_t> OmpFileStatsCloseRequests{0};
   std::atomic<uint64_t> OmpFileStatsCloseSyscalls{0};
   std::atomic<uint64_t> OmpFileStatsCloseDeferred{0};

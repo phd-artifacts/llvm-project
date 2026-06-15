@@ -336,7 +336,8 @@ int MPIIOBackend::openWithPlan(const char *filename,
     const bool open_ok = openRemoteHandle(remote_handle, owner_rank);
     if (!open_ok) {
       io_log("MPP open failed for %s\n", filename);
-      errno = EIO;
+      if (errno == 0)
+        errno = EIO;
       return -1;
     }
     {
