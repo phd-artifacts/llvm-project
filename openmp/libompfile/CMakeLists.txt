@@ -11,6 +11,7 @@ add_library(ompfile SHARED
     src/mpi_io_backend.cpp
     src/mpi_io_backend_config.cpp
     src/mpi_io_backend_coherence.cpp
+    src/mpi_io_backend_file_ops.cpp
     src/mpi_io_backend_forecast_affinity.cpp
     src/mpi_io_backend_handles.cpp
     src/mpi_io_backend_key_utils.cpp
