@@ -15,6 +15,7 @@ add_library(ompfile SHARED
     src/mpi_io_backend_handles.cpp
     src/mpi_io_backend_key_utils.cpp
     src/mpi_io_backend_metrics.cpp
+    src/mpi_io_backend_read_path.cpp
     src/mpi_io_backend_remote_read_handles.cpp
     src/mpi_io_backend_two_phase_cache.cpp
     src/mpi_io_backend_two_phase_scheduler.cpp
