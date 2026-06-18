@@ -20,7 +20,10 @@ libompfile backend behavior and MPP shim usage.
 
 ## Relevant files
 
-- Backend logic: `src/mpi_io_backend.cpp`, `src/mpi_io_backend.h`
+- Backend interface/state: `src/mpi_io_backend.h`
+- Backend lifecycle: `src/mpi_io_backend_lifecycle.cpp`
+- Backend operations and policy helpers:
+  `src/mpi_io_backend_*.cpp`
 - Public interface glue: `src/file_interface.cpp`,
   `include/file_interface.h`
 - MPP shim: `src/mpp_shim.cpp`, `src/mpp_shim.h`

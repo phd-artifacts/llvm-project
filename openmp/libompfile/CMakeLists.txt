@@ -8,13 +8,13 @@ add_compile_definitions(OMP_IO_DEBUG)
 
 add_library(ompfile SHARED
     src/file_interface.cpp
-    src/mpi_io_backend.cpp
     src/mpi_io_backend_config.cpp
     src/mpi_io_backend_coherence.cpp
     src/mpi_io_backend_file_ops.cpp
     src/mpi_io_backend_forecast_affinity.cpp
     src/mpi_io_backend_handles.cpp
     src/mpi_io_backend_key_utils.cpp
+    src/mpi_io_backend_lifecycle.cpp
     src/mpi_io_backend_metrics.cpp
     src/mpi_io_backend_read_path.cpp
     src/mpi_io_backend_remote_read_handles.cpp
