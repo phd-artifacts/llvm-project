@@ -119,6 +119,29 @@ uint64_t envUint64OrDefault(const char *Name, uint64_t DefaultValue) {
   return static_cast<uint64_t>(Parsed);
 }
 
+double envDoubleOrDefault(const char *Name, double DefaultValue) {
+  const char *Value = std::getenv(Name);
+  if (!Value || Value[0] == '\0')
+    return DefaultValue;
+  char *End = nullptr;
+  errno = 0;
+  double Parsed = std::strtod(Value, &End);
+  if (errno != 0 || End == Value || (End && *End != '\0'))
+    return DefaultValue;
+  return Parsed;
+}
+
+// Normalize the stage write policy to one of: "write-through",
+// "write-back", or "off". Unknown values fall back to "write-through"
+// so a misspelled knob never silently disables staging correctness.
+std::string normalizeStageWriteMode(const std::string &Raw) {
+  if (Raw == "write-back" || Raw == "writeback")
+    return "write-back";
+  if (Raw == "off" || Raw == "disabled")
+    return "off";
+  return "write-through";
+}
+
 std::string defaultStageRunStem() {
   const char *JobId = std::getenv("SLURM_JOB_ID");
   if (JobId && JobId[0] != '\0')
@@ -754,8 +777,8 @@ struct ProxyDevice {
             envStringOrDefault("LIBOMPFILE_SCHEDULER", "LOCAL") ==
             "HEADNODE"),
         OmpFileStageMode(envStringOrDefault("LIBOMPFILE_STAGE_MODE", "off")),
-        OmpFileStageWriteMode(
-            envStringOrDefault("LIBOMPFILE_STAGE_WRITE_MODE", "write-through")),
+        OmpFileStageWriteMode(normalizeStageWriteMode(
+            envStringOrDefault("LIBOMPFILE_STAGE_WRITE_MODE", "write-through"))),
         OmpFileStageSyncPolicy(
             envStringOrDefault("LIBOMPFILE_STAGE_SYNC_POLICY", "cache")),
         OmpFileStagePopulateMode(
@@ -773,6 +796,10 @@ struct ProxyDevice {
             envUint64OrDefault("LIBOMPFILE_STAGE_MIN_FREE_BYTES", 0)),
         OmpFileStageWindowBytes(
             envUint64OrDefault("LIBOMPFILE_STAGE_WINDOW_BYTES", 4ULL << 20)),
+        OmpFileStageWindowScale(envDoubleOrDefault(
+            "LIBOMPFILE_STAGE_WINDOW_SCALE", 1.0)),
+        OmpFileStageDirtyWatermarkBytes(envUint64OrDefault(
+            "LIBOMPFILE_STAGE_DIRTY_WATERMARK_BYTES", 0)),
         OmpFileStageLocalHost(getLocalShortHostname()) {
 #ifdef OMPT_SUPPORT
     // Initialize OMPT first
@@ -803,6 +830,16 @@ struct ProxyDevice {
     OmpFileStageDecisionReason = TopologyConfig.StageDecisionReason;
     OmpFileTopologyEntries = TopologyConfig.EntryCount;
     OmpFileTopologyLoadError = TopologyConfig.Error;
+    // Apply the adaptive stage-window scale. The base window is the floor;
+    // scale multiplies it and is clamped to >= 1.0 so a stray value can
+    // never shrink the window below the configured base. Effective window
+    // is what every stage-populate/eviction decision must consult.
+    double Scale = OmpFileStageWindowScale;
+    if (!(Scale >= 1.0))
+      Scale = 1.0;
+    OmpFileStageEffectiveWindowBytes =
+        static_cast<uint64_t>(static_cast<double>(OmpFileStageWindowBytes) *
+                              Scale);
     if (OmpFileOptStats || OmpFileOpenCacheEnable) {
       fprintf(stderr,
               "MPIProxyDevice --> OMPFile cache config rank=%d enabled=%d "
@@ -821,7 +858,10 @@ struct ProxyDevice {
               "stage_root=%s stage_class=%s shared_storage_path=%s "
               "shared_storage_class=%s storage_environment=%s "
               "stage_sync_policy=%s stage_write_mode=%s stage_populate_mode=%s "
-              "stage_window_bytes=%llu stage_min_free_bytes=%llu "
+              "stage_window_bytes=%llu stage_window_scale=%.3f "
+              "stage_effective_window_bytes=%llu "
+              "stage_dirty_watermark_bytes=%llu "
+              "stage_min_free_bytes=%llu "
               "local_host=%s stage_decision=%s load_error=%s\n",
               EventSystem.LocalRank, OmpFileStageMode.c_str(),
               OmpFileStageRootPolicy.c_str(),
@@ -845,6 +885,9 @@ struct ProxyDevice {
                OmpFileStageWriteMode.c_str(),
                OmpFileStagePopulateMode.c_str(),
                static_cast<unsigned long long>(OmpFileStageWindowBytes),
+               OmpFileStageWindowScale,
+               static_cast<unsigned long long>(OmpFileStageEffectiveWindowBytes),
+               static_cast<unsigned long long>(OmpFileStageDirtyWatermarkBytes),
                static_cast<unsigned long long>(OmpFileStageMinFreeBytes),
                OmpFileStageLocalHost.c_str(),
                OmpFileStageDecisionReason.empty()
@@ -1599,6 +1642,24 @@ struct ProxyDevice {
 
   bool isWritethroughStageEnabled() const {
     return isStageEnabled() && OmpFileStageWriteMode == "write-through";
+  }
+
+  // Write-back mode: writes land in the per-proxy stage file first and are
+  // flushed to the source filesystem on close or at the dirty watermark.
+  // The headnode freshness layer already records Dirty=true for write-back
+  // commits; the proxy-side capture and flush wiring arrive in later tasks.
+  bool isWritebackStageEnabled() const {
+    return isStageEnabled() && OmpFileStageWriteMode == "write-back";
+  }
+
+  // Effective window every stage decision should consult. Centralizing this
+  // here keeps the adaptive-scale policy in one place as later tasks switch
+  // populate/eviction paths from OmpFileStageWindowBytes to the effective
+  // value.
+  uint64_t effectiveStageWindowBytes() const {
+    return OmpFileStageEffectiveWindowBytes > 0
+               ? OmpFileStageEffectiveWindowBytes
+               : OmpFileStageWindowBytes;
   }
 
   bool shouldSyncStagePopulate() const {
@@ -4839,6 +4900,9 @@ private:
   std::string OmpFileStorageEnvironment;
   uint64_t OmpFileStageMinFreeBytes = 0;
   uint64_t OmpFileStageWindowBytes = 0;
+  double OmpFileStageWindowScale = 1.0;
+  uint64_t OmpFileStageEffectiveWindowBytes = 0;
+  uint64_t OmpFileStageDirtyWatermarkBytes = 0;
   bool OmpFileTopologyLoaded = false;
   uint64_t OmpFileTopologyEntries = 0;
   std::string OmpFileStageRoot;
