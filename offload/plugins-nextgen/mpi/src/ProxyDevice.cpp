@@ -1,6 +1,7 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <condition_variable>
 #include <cstddef>
@@ -670,6 +671,16 @@ struct ProxyDevice {
     bool Invalidated = false;
     uint64_t SourceSize = 0;
     bool SourceSizeKnown = false;
+    // Write-back dirty-region tracking. DirtyExtents are byte ranges in the
+    // stage file that have been written but not yet flushed to the source
+    // filesystem. DirtyBytes is the sum of (End - Begin) over DirtyExtents.
+    // DirtyEpoch is the last write-back freshness epoch committed to the
+    // headnode for this entry; it advances on each write-back capture and is
+    // checked on flush completion. These fields are only mutated while the
+    // caller holds Entry->Mutex.
+    std::vector<OmpFileStageExtent> DirtyExtents;
+    uint64_t DirtyBytes = 0;
+    uint64_t DirtyEpoch = 0;
 
     ~OmpFileStageEntry() {
       if (StageFd >= 0)
@@ -1759,6 +1770,77 @@ struct ProxyDevice {
     return RemovedBytes;
   }
 
+  // --- Write-back dirty-region helpers (Task 2: data structures only) ---
+  // All mark/clear helpers require the caller to hold Entry->Mutex; the
+  // "Locked" suffix mirrors invalidateStageEntryLocked. They are not yet
+  // called from the write path; Task 3 wires markDirtyRangeLocked into
+  // pwriteWithOptionalStage and Task 4 wires flushDirtyRangesToSource into
+  // the close path. flushDirtyRangesToSource is currently a stub that
+  // reports success without touching the source fd so the data structures
+  // can land and be smoke-validated in isolation.
+
+  // Record [Begin, End) as dirty in Entry, merging into DirtyExtents and
+  // advancing DirtyBytes. Returns the new total dirty byte count.
+  uint64_t markDirtyRangeLocked(OmpFileStageEntry &Entry,
+                                uint64_t Begin, uint64_t End) {
+    if (End <= Begin)
+      return Entry.DirtyBytes;
+    const uint64_t Before = Entry.DirtyBytes;
+    addCoveredExtent(Entry.DirtyExtents, Begin, End);
+    // addCoveredExtent merges overlaps, so recompute the total from the
+    // merged vector rather than adding (End - Begin) to avoid double
+    // counting overlapping writes.
+    uint64_t Total = 0;
+    for (const OmpFileStageExtent &Extent : Entry.DirtyExtents)
+      Total += (Extent.End - Extent.Begin);
+    Entry.DirtyBytes = Total;
+    assert(Entry.DirtyBytes >= Before && "dirty bytes shrank on mark");
+    return Entry.DirtyBytes;
+  }
+
+  // Remove [Begin, End) from DirtyExtents (e.g. after a successful flush
+  // of that range). Returns the number of dirty bytes removed.
+  uint64_t clearDirtyRangeLocked(OmpFileStageEntry &Entry,
+                                 uint64_t Begin, uint64_t End) {
+    if (End <= Begin || Entry.DirtyExtents.empty())
+      return 0;
+    const uint64_t Removed = removeCoveredRange(Entry.DirtyExtents, Begin, End);
+    assert(Entry.DirtyBytes >= Removed && "dirty bytes underflow on clear");
+    Entry.DirtyBytes -= Removed;
+    return Removed;
+  }
+
+  // Drop all dirty extents. Used when a full stage invalidation discards
+  // unflushed writes (only safe when the source copy is known current).
+  void clearDirtyRangesLocked(OmpFileStageEntry &Entry) {
+    Entry.DirtyExtents.clear();
+    Entry.DirtyBytes = 0;
+  }
+
+  // Total dirty bytes currently held in Entry. Caller must hold Mutex.
+  uint64_t dirtyBytesLocked(const OmpFileStageEntry &Entry) const {
+    return Entry.DirtyBytes;
+  }
+
+  // Flush all dirty ranges of Entry from the stage fd to the source fd and
+  // clear them on success. Returns true on success (including the trivial
+  // no-dirty case). Task 2 ships this as a no-op stub that reports success
+  // so the dirty-state data structures can be built and smoke-validated
+  // in isolation; Task 4 implements the real pread-from-stage / pwrite-to-
+  // source / fdatasync / headnode-completeDirtyFlush sequence.
+  bool flushDirtyRangesToSource(OmpFileStageEntry &Entry, int /*SourceFd*/) {
+    std::lock_guard<std::mutex> EntryLock(Entry.Mutex);
+    if (Entry.DirtyExtents.empty()) {
+      assert(Entry.DirtyBytes == 0 && "dirty bytes nonzero with no extents");
+      return true;
+    }
+    // Stub: Task 4 will copy each dirty extent from Entry.StageFd to
+    // SourceFd, fdatasync, clearDirtyRangesLocked, and complete the
+    // headnode dirty-flush protocol. Until then report success without
+    // touching the source fd so write-through behavior is unchanged.
+    return true;
+  }
+
   bool shouldInvalidateStageOnOpen(int Flags) const {
     if (Flags & (O_CREAT | O_EXCL | O_TRUNC))
       return true;
@@ -2815,6 +2897,18 @@ struct ProxyDevice {
         OmpFileStatsStageWriteFailures.load(std::memory_order_relaxed);
     uint64_t StageWriteUs =
         OmpFileStatsStageWriteUs.load(std::memory_order_relaxed);
+    uint64_t StageWritebackCaptures =
+        OmpFileStatsStageWritebackCaptures.load(std::memory_order_relaxed);
+    uint64_t StageWritebackCaptureBytes =
+        OmpFileStatsStageWritebackCaptureBytes.load(std::memory_order_relaxed);
+    uint64_t StageDirtyBytes =
+        OmpFileStatsStageDirtyBytes.load(std::memory_order_relaxed);
+    uint64_t StageDirtyFlushes =
+        OmpFileStatsStageDirtyFlushes.load(std::memory_order_relaxed);
+    uint64_t StageDirtyFlushBytes =
+        OmpFileStatsStageDirtyFlushBytes.load(std::memory_order_relaxed);
+    uint64_t StageDirtyFlushFailures =
+        OmpFileStatsStageDirtyFlushFailures.load(std::memory_order_relaxed);
     uint64_t StagingEvictions =
         OmpFileStatsStagingEvictions.load(std::memory_order_relaxed);
     uint64_t CoherentReadRefreshes =
@@ -2861,7 +2955,11 @@ struct ProxyDevice {
             "staging_full_invalidations=%llu "
             "staging_invalidated_bytes=%llu "
             "staging_write_bypass_count=%llu stage_write_failures=%llu "
-            "stage_write_us_total=%llu coherent_read_refreshes=%llu "
+            "stage_write_us_total=%llu "
+            "stage_writeback_captures=%llu stage_writeback_capture_bytes=%llu "
+            "stage_dirty_bytes=%llu stage_dirty_flushes=%llu "
+            "stage_dirty_flush_bytes=%llu stage_dirty_flush_failures=%llu "
+            "coherent_read_refreshes=%llu "
             "coherent_read_refresh_failures=%llu "
             "coherent_read_refresh_us_total=%llu "
             "staging_evictions=%llu\n",
@@ -2927,6 +3025,12 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StagingWriteBypass),
             static_cast<unsigned long long>(StageWriteFailures),
             static_cast<unsigned long long>(StageWriteUs),
+            static_cast<unsigned long long>(StageWritebackCaptures),
+            static_cast<unsigned long long>(StageWritebackCaptureBytes),
+            static_cast<unsigned long long>(StageDirtyBytes),
+            static_cast<unsigned long long>(StageDirtyFlushes),
+            static_cast<unsigned long long>(StageDirtyFlushBytes),
+            static_cast<unsigned long long>(StageDirtyFlushFailures),
             static_cast<unsigned long long>(CoherentReadRefreshes),
             static_cast<unsigned long long>(CoherentReadRefreshFailures),
             static_cast<unsigned long long>(CoherentReadRefreshUs),
@@ -4969,6 +5073,15 @@ private:
   std::atomic<uint64_t> OmpFileStatsStagingWriteBypassCount{0};
   std::atomic<uint64_t> OmpFileStatsStageWriteFailures{0};
   std::atomic<uint64_t> OmpFileStatsStageWriteUs{0};
+  // Write-back staging counters. DirtyBytes is a gauge snapshot at stats
+  // print time; the rest are monotonic. Flush counters track write-back
+  // flush-to-source events (Task 4 wires the real flush).
+  std::atomic<uint64_t> OmpFileStatsStageWritebackCaptures{0};
+  std::atomic<uint64_t> OmpFileStatsStageWritebackCaptureBytes{0};
+  std::atomic<uint64_t> OmpFileStatsStageDirtyBytes{0};
+  std::atomic<uint64_t> OmpFileStatsStageDirtyFlushes{0};
+  std::atomic<uint64_t> OmpFileStatsStageDirtyFlushBytes{0};
+  std::atomic<uint64_t> OmpFileStatsStageDirtyFlushFailures{0};
   std::atomic<uint64_t> OmpFileStatsStagingEvictions{0};
   std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshes{0};
   std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshFailures{0};
