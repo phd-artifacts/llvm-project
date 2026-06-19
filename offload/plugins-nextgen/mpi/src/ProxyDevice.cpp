@@ -699,6 +699,11 @@ struct ProxyDevice {
     uint64_t PopulateUs = 0;
   };
 
+  struct OmpFilePendingWritebackCommit {
+    uint64_t Count = 0;
+    uint64_t LastVersion = 0;
+  };
+
   [[noreturn]] void fatalStageConfig(const char *Reason) {
     fprintf(stderr,
             "MPIProxyDevice --> fatal stage config rank=%d reason=%s "
@@ -1662,6 +1667,31 @@ struct ProxyDevice {
   // commits; the proxy-side capture and flush wiring arrive in later tasks.
   bool isWritebackStageEnabled() const {
     return isStageEnabled() && OmpFileStageWriteMode == "write-back";
+  }
+
+  void rememberWritebackFreshnessCommit(uint64_t PathKey, uint64_t Version) {
+    if (PathKey == 0 || Version == 0)
+      return;
+    std::lock_guard<std::mutex> Lock(OmpFileWritebackCommitMutex);
+    auto &Pending = OmpFilePendingWritebackCommits[PathKey];
+    ++Pending.Count;
+    Pending.LastVersion = Version;
+  }
+
+  bool consumeDuplicateWriteThroughFreshnessCommit(uint64_t PathKey,
+                                                   uint64_t &VersionOut) {
+    VersionOut = 0;
+    if (PathKey == 0)
+      return false;
+    std::lock_guard<std::mutex> Lock(OmpFileWritebackCommitMutex);
+    auto It = OmpFilePendingWritebackCommits.find(PathKey);
+    if (It == OmpFilePendingWritebackCommits.end() || It->second.Count == 0)
+      return false;
+    VersionOut = It->second.LastVersion;
+    --It->second.Count;
+    if (It->second.Count == 0)
+      OmpFilePendingWritebackCommits.erase(It);
+    return VersionOut != 0;
   }
 
   // Effective window every stage decision should consult. Centralizing this
@@ -2799,6 +2829,8 @@ struct ProxyDevice {
         return writeSourceAuthoritative(/*CountBypassOnFailure=*/false,
                                         /*InvalidateOnFailure=*/false);
       }
+
+      rememberWritebackFreshnessCommit(PathKey, CommittedVersion);
 
       uint64_t DirtyBytes = 0;
       {
@@ -4680,6 +4712,11 @@ struct ProxyDevice {
       return EINVAL;
     *CommittedVersion = 0;
     uint64_t Committed = 0;
+    if (WriteThroughMode != 0 && isWritebackStageEnabled() &&
+        consumeDuplicateWriteThroughFreshnessCommit(PathKey, Committed)) {
+      *CommittedVersion = Committed;
+      return OFFLOAD_SUCCESS;
+    }
     if (!freshnessWriteCommitOnHeadnode(PathKey, WriterRank, TileId,
                                         WriteThroughMode != 0, Committed)) {
       return errno != 0 ? errno : EIO;
@@ -5320,6 +5357,9 @@ private:
   std::mutex OmpFileStageMutex;
   std::unordered_map<std::string, std::shared_ptr<OmpFileStageEntry>>
       OmpFileStageEntries;
+  std::mutex OmpFileWritebackCommitMutex;
+  std::unordered_map<uint64_t, OmpFilePendingWritebackCommit>
+      OmpFilePendingWritebackCommits;
   std::atomic<uint64_t> OmpFileStatsOpenRequests{0};
   std::atomic<uint64_t> OmpFileStatsOpenSyscalls{0};
   std::atomic<uint64_t> OmpFileStatsOpenCacheHits{0};
