@@ -69,6 +69,13 @@ public:
 
   static OmpFileHeadnodeManager &instance();
 
+  // Public path-key hash for callers outside the manager (e.g. the proxy
+  // computing a path key for a dirty-flush completion). Mirrors the private
+  // computePathKey so the canonical FNV-1a hashing stays in one place.
+  static uint64_t computePathKeyForPath(std::string_view Path) {
+    return computePathKey(Path);
+  }
+
   static uint64_t computePathKeyForTesting(std::string_view Path) {
     return computePathKey(Path);
   }

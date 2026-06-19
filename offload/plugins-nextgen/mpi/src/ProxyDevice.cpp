@@ -1770,14 +1770,14 @@ struct ProxyDevice {
     return RemovedBytes;
   }
 
-  // --- Write-back dirty-region helpers (Task 2: data structures only) ---
+  // --- Write-back dirty-region helpers ---
   // All mark/clear helpers require the caller to hold Entry->Mutex; the
-  // "Locked" suffix mirrors invalidateStageEntryLocked. They are not yet
-  // called from the write path; Task 3 wires markDirtyRangeLocked into
-  // pwriteWithOptionalStage and Task 4 wires flushDirtyRangesToSource into
-  // the close path. flushDirtyRangesToSource is currently a stub that
-  // reports success without touching the source fd so the data structures
-  // can land and be smoke-validated in isolation.
+  // "Locked" suffix mirrors invalidateStageEntryLocked. markDirtyRangeLocked
+  // is not yet called from the write path (that wiring lands with the
+  // write-back capture task). flushDirtyRangesToSource is the real
+  // stage->source flush and is wired into closeWithOptionalCache; it is a
+  // no-op unless DirtyExtents is nonempty, so the write-through default and
+  // the no-capture-yet state are behavior-neutral.
 
   // Record [Begin, End) as dirty in Entry, merging into DirtyExtents and
   // advancing DirtyBytes. Returns the new total dirty byte count.
@@ -1824,20 +1824,124 @@ struct ProxyDevice {
 
   // Flush all dirty ranges of Entry from the stage fd to the source fd and
   // clear them on success. Returns true on success (including the trivial
-  // no-dirty case). Task 2 ships this as a no-op stub that reports success
-  // so the dirty-state data structures can be built and smoke-validated
-  // in isolation; Task 4 implements the real pread-from-stage / pwrite-to-
-  // source / fdatasync / headnode-completeDirtyFlush sequence.
-  bool flushDirtyRangesToSource(OmpFileStageEntry &Entry, int /*SourceFd*/) {
-    std::lock_guard<std::mutex> EntryLock(Entry.Mutex);
-    if (Entry.DirtyExtents.empty()) {
-      assert(Entry.DirtyBytes == 0 && "dirty bytes nonzero with no extents");
-      return true;
+  // no-dirty case). On any I/O failure the stage entry is invalidated (the
+  // source filesystem is the authority of last resort) and false is returned
+  // so the caller can fail the close / fall back to PFS. SourcePath is used
+  // to compute the headnode path key for the dirty-flush completion that
+  // advances PfsVersion; if Entry.DirtyEpoch is zero (no write-back commit
+  // recorded yet) the headnode completion is skipped.
+  bool flushDirtyRangesToSource(OmpFileStageEntry &Entry, int SourceFd,
+                                const std::string &SourcePath) {
+    // Snapshot dirty extents under the lock, then release it for the I/O so
+    // a long flush does not block concurrent stage reads on the same entry.
+    std::vector<OmpFileStageExtent> Extents;
+    uint64_t Epoch = 0;
+    {
+      std::lock_guard<std::mutex> EntryLock(Entry.Mutex);
+      if (Entry.DirtyExtents.empty()) {
+        assert(Entry.DirtyBytes == 0 &&
+               "dirty bytes nonzero with no extents");
+        return true;
+      }
+      Extents = Entry.DirtyExtents;
+      Epoch = Entry.DirtyEpoch;
     }
-    // Stub: Task 4 will copy each dirty extent from Entry.StageFd to
-    // SourceFd, fdatasync, clearDirtyRangesLocked, and complete the
-    // headnode dirty-flush protocol. Until then report success without
-    // touching the source fd so write-through behavior is unchanged.
+    if (Entry.StageFd < 0 || SourceFd < 0) {
+      OmpFileStatsStageDirtyFlushFailures.fetch_add(1,
+                                                      std::memory_order_relaxed);
+      invalidateStageForPath(SourcePath);
+      return false;
+    }
+
+    const auto FlushStart = std::chrono::steady_clock::now();
+    uint64_t FlushedBytes = 0;
+    std::vector<char> Buffer;
+    for (const OmpFileStageExtent &Extent : Extents) {
+      assert(Extent.End > Extent.Begin && "empty dirty extent in vector");
+      const uint64_t Len = Extent.End - Extent.Begin;
+      if (Buffer.size() < Len)
+        Buffer.resize(Len);
+      // Drain the stage read fully.
+      uint64_t ReadTotal = 0;
+      while (ReadTotal < Len) {
+        const ssize_t N = ::pread(Entry.StageFd, Buffer.data() + ReadTotal,
+                                  static_cast<size_t>(Len - ReadTotal),
+                                  static_cast<off_t>(Extent.Begin + ReadTotal));
+        if (N < 0) {
+          OmpFileStatsStageDirtyFlushFailures.fetch_add(
+              1, std::memory_order_relaxed);
+          invalidateStageForPath(SourcePath);
+          return false;
+        }
+        if (N == 0) {
+          OmpFileStatsStageDirtyFlushFailures.fetch_add(
+              1, std::memory_order_relaxed);
+          invalidateStageForPath(SourcePath);
+          return false;
+        }
+        ReadTotal += static_cast<uint64_t>(N);
+      }
+      // Write the drained bytes to the source filesystem.
+      uint64_t WriteTotal = 0;
+      while (WriteTotal < Len) {
+        const ssize_t N = ::pwrite(
+            SourceFd, Buffer.data() + WriteTotal,
+            static_cast<size_t>(Len - WriteTotal),
+            static_cast<off_t>(Extent.Begin + WriteTotal));
+        if (N < 0) {
+          OmpFileStatsStageDirtyFlushFailures.fetch_add(
+              1, std::memory_order_relaxed);
+          invalidateStageForPath(SourcePath);
+          return false;
+        }
+        if (N == 0) {
+          OmpFileStatsStageDirtyFlushFailures.fetch_add(
+              1, std::memory_order_relaxed);
+          invalidateStageForPath(SourcePath);
+          return false;
+        }
+        WriteTotal += static_cast<uint64_t>(N);
+      }
+      FlushedBytes += Len;
+    }
+
+    if (::fdatasync(SourceFd) != 0) {
+      OmpFileStatsStageDirtyFlushFailures.fetch_add(1,
+                                                      std::memory_order_relaxed);
+      invalidateStageForPath(SourcePath);
+      return false;
+    }
+
+    // Clear the flushed ranges and account the flush. Re-lock to mutate.
+    {
+      std::lock_guard<std::mutex> EntryLock(Entry.Mutex);
+      // Only the extents we snapshotted are guaranteed flushed; clear all
+      // of them since we hold the authoritative post-fdatasync copy on the
+      // source. New dirty ranges added concurrently during the I/O would
+      // have been appended after our snapshot and are preserved by
+      // clearDirtyRangeLocked per-range, but the simplest correct behavior
+      // is to clear exactly the snapshot and recompute.
+      for (const OmpFileStageExtent &Extent : Extents)
+        clearDirtyRangeLocked(Entry, Extent.Begin, Extent.End);
+    }
+    OmpFileStatsStageDirtyFlushes.fetch_add(1, std::memory_order_relaxed);
+    OmpFileStatsStageDirtyFlushBytes.fetch_add(FlushedBytes,
+                                                std::memory_order_relaxed);
+    OmpFileStatsStageWriteUs.fetch_add(
+        elapsedMicros(FlushStart, std::chrono::steady_clock::now()),
+        std::memory_order_relaxed);
+
+    // Notify the headnode that this tile is now PFS-current. DirtyEpoch is
+    // set by the write-back capture path (later task); when it is zero no
+    // freshness epoch was committed, so there is nothing to complete.
+    if (Epoch > 0 && !SourcePath.empty()) {
+      const uint64_t PathKey =
+          OmpFileHeadnodeManager::computePathKeyForPath(SourcePath);
+      if (PathKey != 0) {
+        (void)completeDirtyFlushOnHeadnode(PathKey, EventSystem.LocalRank,
+                                            Epoch, /*Success=*/true);
+      }
+    }
     return true;
   }
 
@@ -2713,6 +2817,32 @@ struct ProxyDevice {
   int closeWithOptionalCache(int Fd, int &ErrnoOut) {
     ErrnoOut = 0;
     OmpFileStatsCloseRequests.fetch_add(1, std::memory_order_relaxed);
+
+    // Write-back flush-on-close: before the source fd is released, drain any
+    // dirty stage ranges for this path to the source filesystem so the
+    // durable copy is current. This is a no-op unless write-back staging is
+    // enabled AND the stage entry has dirty extents (which only the
+    // write-back capture path can create). In the write-through default and
+    // in the Task-4-only state (no capture yet), DirtyExtents is empty and
+    // this returns true without touching the source fd.
+    if (isWritebackStageEnabled() && Fd >= 0) {
+      std::string SourcePath;
+      if (getTrackedOmpFileFdPath(Fd, SourcePath)) {
+        std::shared_ptr<OmpFileStageEntry> StageEntry;
+        if (getStageEntryForPath(SourcePath, StageEntry) && StageEntry) {
+          if (!flushDirtyRangesToSource(*StageEntry, Fd, SourcePath)) {
+            // Flush failed: the stage entry has already been invalidated by
+            // the flush helper (PFS is the authority). Surface the failure so
+            // the caller does not silently drop writes.
+            ErrnoOut = EIO;
+            traceOmpFile("closeWithOptionalCache write-back flush failed "
+                         "fd=%d path=%s\n",
+                         Fd, SourcePath.c_str());
+            return -1;
+          }
+        }
+      }
+    }
 
     if (!OmpFileOpenCacheEnable) {
       OmpFileStatsCloseSyscalls.fetch_add(1, std::memory_order_relaxed);
