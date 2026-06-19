@@ -262,9 +262,10 @@ bool fsTypeIsShared(const std::string &FsType, const std::string &Source) {
   if (FsType.rfind("nfs", 0) == 0)
     return true;
   return FsType == "lustre" || FsType == "gpfs" || FsType == "wekafs" ||
-         FsType == "beegfs" || FsType == "ceph" || FsType == "cephfs" ||
-         FsType == "glusterfs" || FsType == "orangefs" ||
-         FsType == "pvfs2" || FsType == "panfs" || Source.rfind("//", 0) == 0;
+         FsType == "virtiofs" || FsType == "beegfs" || FsType == "ceph" ||
+         FsType == "cephfs" || FsType == "glusterfs" ||
+         FsType == "orangefs" || FsType == "pvfs2" || FsType == "panfs" ||
+         Source.rfind("//", 0) == 0;
 }
 
 bool sourceLooksLocalBlockDevice(const std::string &Source) {
@@ -1795,6 +1796,11 @@ struct ProxyDevice {
       Total += (Extent.End - Extent.Begin);
     Entry.DirtyBytes = Total;
     assert(Entry.DirtyBytes >= Before && "dirty bytes shrank on mark");
+    const uint64_t Delta = Entry.DirtyBytes - Before;
+    if (Delta > 0) {
+      OmpFileStatsStageDirtyBytes.fetch_add(Delta,
+                                            std::memory_order_relaxed);
+    }
     return Entry.DirtyBytes;
   }
 
@@ -1807,14 +1813,25 @@ struct ProxyDevice {
     const uint64_t Removed = removeCoveredRange(Entry.DirtyExtents, Begin, End);
     assert(Entry.DirtyBytes >= Removed && "dirty bytes underflow on clear");
     Entry.DirtyBytes -= Removed;
+    if (Removed > 0) {
+      OmpFileStatsStageDirtyBytes.fetch_sub(Removed,
+                                            std::memory_order_relaxed);
+    }
+    if (Entry.DirtyExtents.empty())
+      Entry.DirtyEpoch = 0;
     return Removed;
   }
 
   // Drop all dirty extents. Used when a full stage invalidation discards
   // unflushed writes (only safe when the source copy is known current).
   void clearDirtyRangesLocked(OmpFileStageEntry &Entry) {
+    if (Entry.DirtyBytes > 0) {
+      OmpFileStatsStageDirtyBytes.fetch_sub(Entry.DirtyBytes,
+                                            std::memory_order_relaxed);
+    }
     Entry.DirtyExtents.clear();
     Entry.DirtyBytes = 0;
+    Entry.DirtyEpoch = 0;
   }
 
   // Total dirty bytes currently held in Entry. Caller must hold Mutex.
@@ -1906,8 +1923,8 @@ struct ProxyDevice {
     }
 
     if (::fdatasync(SourceFd) != 0) {
-      OmpFileStatsStageDirtyFlushFailures.fetch_add(1,
-                                                      std::memory_order_relaxed);
+      OmpFileStatsStageDirtyFlushFailures.fetch_add(
+          1, std::memory_order_relaxed);
       invalidateStageForPath(SourcePath);
       return false;
     }
@@ -1937,9 +1954,12 @@ struct ProxyDevice {
     if (Epoch > 0 && !SourcePath.empty()) {
       const uint64_t PathKey =
           OmpFileHeadnodeManager::computePathKeyForPath(SourcePath);
-      if (PathKey != 0) {
-        (void)completeDirtyFlushOnHeadnode(PathKey, EventSystem.LocalRank,
-                                            Epoch, /*Success=*/true);
+      if (PathKey != 0 &&
+          !completeDirtyFlushOnHeadnode(PathKey, EventSystem.LocalRank,
+                                        Epoch, /*Success=*/true)) {
+        OmpFileStatsStageDirtyFlushFailures.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
       }
     }
     return true;
@@ -2227,6 +2247,13 @@ struct ProxyDevice {
             InvalidatedBytes += (Extent.End - Extent.Begin);
         }
       }
+      if (Entry->DirtyBytes > 0) {
+        OmpFileStatsStageDirtyBytes.fetch_sub(Entry->DirtyBytes,
+                                              std::memory_order_relaxed);
+        Entry->DirtyBytes = 0;
+      }
+      Entry->DirtyExtents.clear();
+      Entry->DirtyEpoch = 0;
       Entry->Invalidated = true;
       Entry->FullyPopulated = false;
       Entry->PopulateInProgress = false;
@@ -2316,6 +2343,13 @@ struct ProxyDevice {
       return;
 
     Entry->Invalidated = true;
+    if (Entry->DirtyBytes > 0) {
+      OmpFileStatsStageDirtyBytes.fetch_sub(Entry->DirtyBytes,
+                                            std::memory_order_relaxed);
+      Entry->DirtyBytes = 0;
+    }
+    Entry->DirtyExtents.clear();
+    Entry->DirtyEpoch = 0;
     Entry->FullyPopulated = false;
     Entry->PopulateInProgress = false;
     Entry->Cond.notify_all();
@@ -2660,25 +2694,150 @@ struct ProxyDevice {
     std::string SourcePath;
     const bool HasTrackedSource = Size > 0 && Offset >= 0 &&
                                   getTrackedOmpFileFdPath(Fd, SourcePath);
-    uint64_t SourceBytesWritten = 0;
-    uint64_t SourceWriteUs = 0;
-    if (!pwriteFully(Fd, Offset, Buffer, Size, &SourceBytesWritten,
-                     &SourceWriteUs, ErrnoOut)) {
-      if (HasTrackedSource && OmpFileStageMode != "off") {
-        OmpFileStatsStagingWriteBypassCount.fetch_add(1,
-                                                      std::memory_order_relaxed);
-        invalidateStageForPath(SourcePath);
+
+    auto writeSourceAuthoritative =
+        [&](bool CountBypassOnFailure, bool InvalidateOnFailure) -> bool {
+      uint64_t SourceBytesWritten = 0;
+      uint64_t SourceWriteUs = 0;
+      if (!pwriteFully(Fd, Offset, Buffer, Size, &SourceBytesWritten,
+                       &SourceWriteUs, ErrnoOut)) {
+        if (HasTrackedSource && OmpFileStageMode != "off") {
+          if (CountBypassOnFailure) {
+            OmpFileStatsStagingWriteBypassCount.fetch_add(
+                1, std::memory_order_relaxed);
+          }
+          if (InvalidateOnFailure)
+            invalidateStageForPath(SourcePath);
+        }
+        return false;
       }
-      return false;
-    }
-    if (Size > 0 && ::fdatasync(Fd) != 0) {
-      ErrnoOut = errno;
-      return false;
-    }
-    if (BytesWrittenOut)
-      *BytesWrittenOut = SourceBytesWritten;
-    if (Size == 0 || OmpFileStageMode == "off" || !HasTrackedSource)
+      if (Size > 0 && ::fdatasync(Fd) != 0) {
+        ErrnoOut = errno;
+        return false;
+      }
+      if (BytesWrittenOut)
+        *BytesWrittenOut = SourceBytesWritten;
       return true;
+    };
+
+    if (Size == 0 || OmpFileStageMode == "off" || !HasTrackedSource)
+      return writeSourceAuthoritative(/*CountBypassOnFailure=*/true,
+                                      /*InvalidateOnFailure=*/true);
+
+    // Write-back capture path: stage first, defer the source pwrite until the
+    // close flush or the dirty watermark. This branch is correct only because
+    // flush-on-close is already wired; before Task 4 it would have been a
+    // data-loss intermediate.
+    if (isWritebackStageEnabled()) {
+      int StageFd = -1;
+      int StageErrno = 0;
+      std::shared_ptr<OmpFileStageEntry> HeldStageEntry;
+      if (!ensureStageEntryForPath(SourcePath, 0, 0, &HeldStageEntry, StageFd,
+                                   StageErrno) ||
+          StageFd < 0 || !HeldStageEntry) {
+        OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
+        OmpFileStatsStagingWriteBypassCount.fetch_add(
+            1, std::memory_order_relaxed);
+        invalidateStageForPath(SourcePath);
+        return writeSourceAuthoritative(/*CountBypassOnFailure=*/false,
+                                        /*InvalidateOnFailure=*/false);
+      }
+
+      uint64_t StageBytesWritten = 0;
+      uint64_t StageWriteUs = 0;
+      if (!pwriteFully(StageFd, Offset, Buffer, Size, &StageBytesWritten,
+                       &StageWriteUs, StageErrno) ||
+          StageBytesWritten < Size) {
+        OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
+        OmpFileStatsStagingWriteBypassCount.fetch_add(
+            1, std::memory_order_relaxed);
+        invalidateStageForPath(SourcePath);
+        return writeSourceAuthoritative(/*CountBypassOnFailure=*/false,
+                                        /*InvalidateOnFailure=*/false);
+      }
+
+      if (shouldSyncStagePopulate()) {
+        const auto FsyncStart = std::chrono::steady_clock::now();
+        if (::fdatasync(StageFd) != 0) {
+          OmpFileStatsStageWriteFailures.fetch_add(
+              1, std::memory_order_relaxed);
+          OmpFileStatsStagingWriteBypassCount.fetch_add(
+              1, std::memory_order_relaxed);
+          OmpFileStatsStageWriteUs.fetch_add(
+              StageWriteUs +
+                  elapsedMicros(FsyncStart, std::chrono::steady_clock::now()),
+              std::memory_order_relaxed);
+          invalidateStageForPath(SourcePath);
+          return writeSourceAuthoritative(/*CountBypassOnFailure=*/false,
+                                          /*InvalidateOnFailure=*/false);
+        }
+        StageWriteUs +=
+            elapsedMicros(FsyncStart, std::chrono::steady_clock::now());
+      }
+
+      uint64_t SourceSize = 0;
+      bool SourceSizeKnown = false;
+      struct stat SourceStat {};
+      if (::fstat(Fd, &SourceStat) == 0) {
+        SourceSize = static_cast<uint64_t>(SourceStat.st_size);
+        SourceSizeKnown = true;
+      }
+
+      const uint64_t PathKey =
+          OmpFileHeadnodeManager::computePathKeyForPath(SourcePath);
+      uint64_t CommittedVersion = 0;
+      if (PathKey == 0 ||
+          !freshnessWriteCommitOnHeadnode(PathKey, EventSystem.LocalRank,
+                                          /*TileId=*/PathKey,
+                                          /*WriteThroughMode=*/false,
+                                          CommittedVersion) ||
+          CommittedVersion == 0) {
+        OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
+        OmpFileStatsStagingWriteBypassCount.fetch_add(
+            1, std::memory_order_relaxed);
+        invalidateStageForPath(SourcePath);
+        return writeSourceAuthoritative(/*CountBypassOnFailure=*/false,
+                                        /*InvalidateOnFailure=*/false);
+      }
+
+      uint64_t DirtyBytes = 0;
+      {
+        const uint64_t Begin = static_cast<uint64_t>(Offset);
+        const uint64_t End = saturatingAdd(Begin, Size);
+        std::lock_guard<std::mutex> EntryLock(HeldStageEntry->Mutex);
+        DirtyBytes = markDirtyRangeLocked(*HeldStageEntry, Begin, End);
+        HeldStageEntry->DirtyEpoch = CommittedVersion;
+      }
+      updateStageCoverageForWrite(HeldStageEntry, static_cast<uint64_t>(Offset),
+                                  Size, SourceSize, SourceSizeKnown);
+      OmpFileStatsStageWritebackCaptures.fetch_add(
+          1, std::memory_order_relaxed);
+      OmpFileStatsStageWritebackCaptureBytes.fetch_add(
+          Size, std::memory_order_relaxed);
+      OmpFileStatsStagedWriteUpdates.fetch_add(1,
+                                               std::memory_order_relaxed);
+      OmpFileStatsStagedWriteBytes.fetch_add(Size,
+                                             std::memory_order_relaxed);
+      OmpFileStatsStageWriteUs.fetch_add(StageWriteUs,
+                                         std::memory_order_relaxed);
+      if (BytesWrittenOut)
+        *BytesWrittenOut = StageBytesWritten;
+
+      if (OmpFileStageDirtyWatermarkBytes > 0 &&
+          DirtyBytes >= OmpFileStageDirtyWatermarkBytes) {
+        if (!flushDirtyRangesToSource(*HeldStageEntry, Fd, SourcePath)) {
+          ErrnoOut = EIO;
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // Existing write-through / non-writeback path: source is authoritative,
+    // stage mirrors or is invalidated.
+    if (!writeSourceAuthoritative(/*CountBypassOnFailure=*/true,
+                                  /*InvalidateOnFailure=*/true))
+      return false;
 
     if (!isWritethroughStageEnabled()) {
       OmpFileStatsStagingWriteBypassCount.fetch_add(1,
@@ -2720,7 +2879,8 @@ struct ProxyDevice {
         OmpFileStatsStagingWriteBypassCount.fetch_add(
             1, std::memory_order_relaxed);
         OmpFileStatsStageWriteUs.fetch_add(
-            StageWriteUs + elapsedMicros(FsyncStart, std::chrono::steady_clock::now()),
+            StageWriteUs +
+                elapsedMicros(FsyncStart, std::chrono::steady_clock::now()),
             std::memory_order_relaxed);
         invalidateStageForPath(SourcePath);
         return true;
@@ -2745,8 +2905,8 @@ struct ProxyDevice {
       return true;
     }
 
-    updateStageCoverageForWrite(HeldStageEntry, static_cast<uint64_t>(Offset), Size,
-                                SourceSize, SourceSizeKnown);
+    updateStageCoverageForWrite(HeldStageEntry, static_cast<uint64_t>(Offset),
+                                Size, SourceSize, SourceSizeKnown);
     OmpFileStatsStagedWriteUpdates.fetch_add(1, std::memory_order_relaxed);
     OmpFileStatsStagedWriteBytes.fetch_add(Size, std::memory_order_relaxed);
     OmpFileStatsStageWriteUs.fetch_add(StageWriteUs,
@@ -3071,6 +3231,11 @@ struct ProxyDevice {
             "staged_read_hits=%llu staged_read_bytes=%llu "
             "staging_bypass_reads=%llu staging_bypass_bytes=%llu "
             "staged_write_updates=%llu staged_write_bytes=%llu "
+            "stage_writeback_captures=%llu stage_writeback_capture_bytes=%llu "
+            "stage_dirty_bytes=%llu stage_dirty_flushes=%llu "
+            "stage_dirty_flush_bytes=%llu stage_dirty_flush_failures=%llu "
+            "staging_write_bypass_count=%llu stage_write_failures=%llu "
+            "stage_write_us_total=%llu "
             "stage_lookup_hits=%llu stage_lookup_misses=%llu "
             "stage_populate_count=%llu stage_populate_failures=%llu "
             "stage_populate_bytes=%llu stage_populate_us_total=%llu "
@@ -3084,11 +3249,6 @@ struct ProxyDevice {
             "staging_invalidations=%llu staging_range_invalidations=%llu "
             "staging_full_invalidations=%llu "
             "staging_invalidated_bytes=%llu "
-            "staging_write_bypass_count=%llu stage_write_failures=%llu "
-            "stage_write_us_total=%llu "
-            "stage_writeback_captures=%llu stage_writeback_capture_bytes=%llu "
-            "stage_dirty_bytes=%llu stage_dirty_flushes=%llu "
-            "stage_dirty_flush_bytes=%llu stage_dirty_flush_failures=%llu "
             "coherent_read_refreshes=%llu "
             "coherent_read_refresh_failures=%llu "
             "coherent_read_refresh_us_total=%llu "
@@ -3131,6 +3291,15 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StageBypassBytes),
             static_cast<unsigned long long>(StagedWriteUpdates),
             static_cast<unsigned long long>(StagedWriteBytes),
+            static_cast<unsigned long long>(StageWritebackCaptures),
+            static_cast<unsigned long long>(StageWritebackCaptureBytes),
+            static_cast<unsigned long long>(StageDirtyBytes),
+            static_cast<unsigned long long>(StageDirtyFlushes),
+            static_cast<unsigned long long>(StageDirtyFlushBytes),
+            static_cast<unsigned long long>(StageDirtyFlushFailures),
+            static_cast<unsigned long long>(StagingWriteBypass),
+            static_cast<unsigned long long>(StageWriteFailures),
+            static_cast<unsigned long long>(StageWriteUs),
             static_cast<unsigned long long>(StageLookupHits),
             static_cast<unsigned long long>(StageLookupMisses),
             static_cast<unsigned long long>(StagePopulateCount),
@@ -3152,15 +3321,6 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StagingRangeInvalidations),
             static_cast<unsigned long long>(StagingFullInvalidations),
             static_cast<unsigned long long>(StagingInvalidatedBytes),
-            static_cast<unsigned long long>(StagingWriteBypass),
-            static_cast<unsigned long long>(StageWriteFailures),
-            static_cast<unsigned long long>(StageWriteUs),
-            static_cast<unsigned long long>(StageWritebackCaptures),
-            static_cast<unsigned long long>(StageWritebackCaptureBytes),
-            static_cast<unsigned long long>(StageDirtyBytes),
-            static_cast<unsigned long long>(StageDirtyFlushes),
-            static_cast<unsigned long long>(StageDirtyFlushBytes),
-            static_cast<unsigned long long>(StageDirtyFlushFailures),
             static_cast<unsigned long long>(CoherentReadRefreshes),
             static_cast<unsigned long long>(CoherentReadRefreshFailures),
             static_cast<unsigned long long>(CoherentReadRefreshUs),
