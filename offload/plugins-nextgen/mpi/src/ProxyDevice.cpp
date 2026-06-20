@@ -3357,6 +3357,26 @@ struct ProxyDevice {
             static_cast<unsigned long long>(CoherentReadRefreshFailures),
             static_cast<unsigned long long>(CoherentReadRefreshUs),
             static_cast<unsigned long long>(StagingEvictions));
+
+    fprintf(stderr,
+            "MPIProxyDevice --> OMPFile writeback stats [%s] rank=%d "
+            "stage_write_mode=%s captures=%llu capture_bytes=%llu "
+            "dirty_bytes=%llu dirty_flushes=%llu dirty_flush_bytes=%llu "
+            "dirty_flush_failures=%llu staged_write_updates=%llu "
+            "staged_write_bytes=%llu write_bypass_count=%llu "
+            "write_failures=%llu\n",
+            Scope ? Scope : "unknown", EventSystem.LocalRank,
+            OmpFileStageWriteMode.c_str(),
+            static_cast<unsigned long long>(StageWritebackCaptures),
+            static_cast<unsigned long long>(StageWritebackCaptureBytes),
+            static_cast<unsigned long long>(StageDirtyBytes),
+            static_cast<unsigned long long>(StageDirtyFlushes),
+            static_cast<unsigned long long>(StageDirtyFlushBytes),
+            static_cast<unsigned long long>(StageDirtyFlushFailures),
+            static_cast<unsigned long long>(StagedWriteUpdates),
+            static_cast<unsigned long long>(StagedWriteBytes),
+            static_cast<unsigned long long>(StagingWriteBypass),
+            static_cast<unsigned long long>(StageWriteFailures));
   }
 
   uint64_t computePwriteFragmentCount(uint64_t Size) const {
