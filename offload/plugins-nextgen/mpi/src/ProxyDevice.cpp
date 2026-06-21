@@ -2955,6 +2955,43 @@ struct ProxyDevice {
     return Key;
   }
 
+  void reportOmpFileOpenFailureDiagnostics(const char *Path, int Flags,
+                                           int Mode, int OpenErrno) {
+    const char *SafePath = Path ? Path : "(null)";
+    struct stat PathStat {};
+    const int PathStatRc = Path ? ::stat(Path, &PathStat) : -1;
+    const int PathStatErrno = PathStatRc == 0 ? 0 : errno;
+    const int AccessRc = Path ? ::access(Path, R_OK) : -1;
+    const int AccessErrno = AccessRc == 0 ? 0 : errno;
+
+    std::string Parent = ".";
+    if (Path) {
+      std::string PathString(Path);
+      size_t Slash = PathString.find_last_of('/');
+      if (Slash == std::string::npos)
+        Parent = ".";
+      else if (Slash == 0)
+        Parent = "/";
+      else
+        Parent = PathString.substr(0, Slash);
+    }
+
+    struct stat ParentStat {};
+    const int ParentStatRc = ::stat(Parent.c_str(), &ParentStat);
+    const int ParentStatErrno = ParentStatRc == 0 ? 0 : errno;
+    const int ParentAccessRc = ::access(Parent.c_str(), R_OK | X_OK);
+    const int ParentAccessErrno = ParentAccessRc == 0 ? 0 : errno;
+
+    REPORT("OMPFile proxy open failure diag: rank=%d host=%s path=%s flags=0x%x "
+           "mode=%o open_errno=%d stat_rc=%d stat_errno=%d access_rc=%d "
+           "access_errno=%d parent=%s parent_stat_rc=%d parent_stat_errno=%d "
+           "parent_access_rc=%d parent_access_errno=%d\n",
+           EventSystem.LocalRank, OmpFileStageLocalHost.c_str(), SafePath, Flags,
+           Mode, OpenErrno, PathStatRc, PathStatErrno, AccessRc, AccessErrno,
+           Parent.c_str(), ParentStatRc, ParentStatErrno, ParentAccessRc,
+           ParentAccessErrno);
+  }
+
   int openWithOptionalCache(const char *Path, int Flags, int Mode, int &ErrnoOut) {
     ErrnoOut = 0;
     OmpFileStatsOpenRequests.fetch_add(1, std::memory_order_relaxed);
@@ -2967,8 +3004,10 @@ struct ProxyDevice {
     if (!canUseOmpFileOpenCache(Flags)) {
       OmpFileStatsOpenSyscalls.fetch_add(1, std::memory_order_relaxed);
       int Fd = ::open(Path, Flags, static_cast<mode_t>(Mode));
-      if (Fd < 0)
+      if (Fd < 0) {
         ErrnoOut = errno;
+        reportOmpFileOpenFailureDiagnostics(Path, Flags, Mode, ErrnoOut);
+      }
       traceOmpFile("openWithOptionalCache nocache path=%s flags=0x%x mode=%o "
                    "fd=%d errno=%d\n",
                    Path, Flags, Mode, Fd, ErrnoOut);
@@ -2992,6 +3031,7 @@ struct ProxyDevice {
     int Fd = ::open(Path, Flags, static_cast<mode_t>(Mode));
     if (Fd < 0) {
       ErrnoOut = errno;
+      reportOmpFileOpenFailureDiagnostics(Path, Flags, Mode, ErrnoOut);
       traceOmpFile("openWithOptionalCache miss-fail path=%s flags=0x%x mode=%o "
                    "errno=%d\n",
                    Path, Flags, Mode, ErrnoOut);
