@@ -2957,6 +2957,10 @@ struct ProxyDevice {
 
   void reportOmpFileOpenFailureDiagnostics(const char *Path, int Flags,
                                            int Mode, int OpenErrno) {
+    const char *DiagEnv = std::getenv("LIBOMPFILE_OPEN_FAILURE_DIAG");
+    if (DiagEnv && std::strcmp(DiagEnv, "0") == 0)
+      return;
+
     const char *SafePath = Path ? Path : "(null)";
     struct stat PathStat {};
     const int PathStatRc = Path ? ::stat(Path, &PathStat) : -1;
