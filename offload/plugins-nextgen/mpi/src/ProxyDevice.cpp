@@ -132,6 +132,17 @@ double envDoubleOrDefault(const char *Name, double DefaultValue) {
   return Parsed;
 }
 
+bool envBoolOrDefault(const char *Name, bool DefaultValue) {
+  const char *Value = std::getenv(Name);
+  if (!Value || Value[0] == '\0')
+    return DefaultValue;
+  if (Value[0] == '0' && Value[1] == '\0')
+    return false;
+  if (Value[0] == '1' && Value[1] == '\0')
+    return true;
+  return DefaultValue;
+}
+
 // Normalize the stage write policy to one of: "write-through",
 // "write-back", or "off". Unknown values fall back to "write-through"
 // so a misspelled knob never silently disables staging correctness.
@@ -817,6 +828,8 @@ struct ProxyDevice {
             "LIBOMPFILE_STAGE_WINDOW_SCALE", 1.0)),
         OmpFileStageDirtyWatermarkBytes(envUint64OrDefault(
             "LIBOMPFILE_STAGE_DIRTY_WATERMARK_BYTES", 0)),
+        OmpFileStageFreshnessGuard(envBoolOrDefault(
+            "LIBOMPFILE_STAGE_FRESHNESS_GUARD", true)),
         OmpFileStageLocalHost(getLocalShortHostname()) {
 #ifdef OMPT_SUPPORT
     // Initialize OMPT first
@@ -874,7 +887,8 @@ struct ProxyDevice {
               "topology_file=%s topology_loaded=%d topology_entries=%llu "
               "stage_root=%s stage_class=%s shared_storage_path=%s "
               "shared_storage_class=%s storage_environment=%s "
-              "stage_sync_policy=%s stage_write_mode=%s stage_populate_mode=%s "
+              "stage_sync_policy=%s stage_write_mode=%s "
+              "stage_freshness_guard=%d stage_populate_mode=%s "
               "stage_window_bytes=%llu stage_window_scale=%.3f "
               "stage_effective_window_bytes=%llu "
               "stage_dirty_watermark_bytes=%llu "
@@ -891,15 +905,16 @@ struct ProxyDevice {
               OmpFileSelectedStageClass.empty()
                   ? "(unset)"
                   : OmpFileSelectedStageClass.c_str(),
-              OmpFileSharedStoragePath.empty()
-                  ? "(unset)"
-                  : OmpFileSharedStoragePath.c_str(),
-              OmpFileSharedStorageClass.empty()
-                  ? "(unset)"
-                  : OmpFileSharedStorageClass.c_str(),
+               OmpFileSharedStoragePath.empty()
+                   ? "(unset)"
+                   : OmpFileSharedStoragePath.c_str(),
+               OmpFileSharedStorageClass.empty()
+                   ? "(unset)"
+                   : OmpFileSharedStorageClass.c_str(),
                OmpFileStorageEnvironment.c_str(),
                OmpFileStageSyncPolicy.c_str(),
                OmpFileStageWriteMode.c_str(),
+               static_cast<int>(OmpFileStageFreshnessGuard),
                OmpFileStagePopulateMode.c_str(),
                static_cast<unsigned long long>(OmpFileStageWindowBytes),
                OmpFileStageWindowScale,
@@ -1676,6 +1691,7 @@ struct ProxyDevice {
     auto &Pending = OmpFilePendingWritebackCommits[PathKey];
     ++Pending.Count;
     Pending.LastVersion = Version;
+    OmpFileLocalFreshnessVersionByPath[PathKey] = Version;
   }
 
   bool consumeDuplicateWriteThroughFreshnessCommit(uint64_t PathKey,
@@ -1692,6 +1708,115 @@ struct ProxyDevice {
     if (It->second.Count == 0)
       OmpFilePendingWritebackCommits.erase(It);
     return VersionOut != 0;
+  }
+
+  // Return the last freshness version this proxy is known to hold for
+  // the given PathKey, or 0 when no local freshness epoch was observed.
+  uint64_t lastLocalFreshnessVersionForPathKey(uint64_t PathKey) {
+    if (PathKey == 0)
+      return 0;
+    std::lock_guard<std::mutex> Lock(OmpFileWritebackCommitMutex);
+    auto It = OmpFileLocalFreshnessVersionByPath.find(PathKey);
+    if (It == OmpFileLocalFreshnessVersionByPath.end())
+      return 0;
+    return It->second;
+  }
+
+  // Consult the headnode freshness table before serving a staged read from
+  // a local stage.  Returns true when it is safe to serve from the local
+  // stage (USE_LOCAL: this proxy holds the latest version, including its own
+  // dirty write-back data).  Returns false when the caller must bypass the
+  // stage and read from the source fd instead (READ_PFS, COPY_FROM_RANK, or
+  // WAIT_OR_FAIL: another proxy may hold dirty data, or PFS currency cannot
+  // be confirmed for this proxy's stage).
+  bool stageFreshnessGuardPermitsLocal(
+      const std::string &SourcePath,
+      const std::shared_ptr<OmpFileStageEntry> &StageEntry) {
+    if (!isWritebackStageEnabled() || !OmpFileStageFreshnessGuard)
+      return true;
+    if (SourcePath.empty())
+      return true;
+    const uint64_t PathKey =
+        OmpFileHeadnodeManager::computePathKeyForPath(SourcePath);
+    if (PathKey == 0)
+      return true;
+
+    OmpFileFreshnessQueryRequest Request{};
+    Request.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+    Request.PathKey = PathKey;
+    Request.LocalVersion = lastLocalFreshnessVersionForPathKey(PathKey);
+    Request.RequesterRank = EventSystem.LocalRank;
+
+    OmpFileFreshnessQueryReply Reply{};
+    if (!freshnessQueryOnHeadnode(Request, Reply)) {
+      // If the freshness query itself fails, conservatively bypass the
+      // stage rather than risk serving stale data.
+      OmpFileStatsStageFreshnessGuardBypasses.fetch_add(
+          1, std::memory_order_relaxed);
+      traceOmpFile("stage freshness guard query failed path=%s path_key=%llu "
+                   "errno=%d; bypassing stage\n",
+                   SourcePath.c_str(),
+                   static_cast<unsigned long long>(PathKey), errno);
+      return false;
+    }
+
+    if (Reply.Status != 0) {
+      OmpFileStatsStageFreshnessGuardBypasses.fetch_add(
+          1, std::memory_order_relaxed);
+      traceOmpFile("stage freshness guard query error path=%s path_key=%llu "
+                   "status=%d errno=%d; bypassing stage\n",
+                   SourcePath.c_str(),
+                   static_cast<unsigned long long>(PathKey), Reply.Status,
+                   Reply.Errno);
+      return false;
+    }
+
+    const auto Decision =
+        static_cast<OmpFileFreshnessDecision>(Reply.Decision);
+    if (Decision == OmpFileFreshnessDecision::USE_LOCAL) {
+      traceOmpFile("stage freshness guard USE_LOCAL path=%s path_key=%llu "
+                   "local_version=%llu selected_version=%llu\n",
+                   SourcePath.c_str(),
+                   static_cast<unsigned long long>(PathKey),
+                   static_cast<unsigned long long>(Request.LocalVersion),
+                   static_cast<unsigned long long>(Reply.SelectedVersion));
+      return true;
+    }
+
+    if (Decision == OmpFileFreshnessDecision::COPY_FROM_RANK &&
+        Reply.SourceRank == EventSystem.LocalRank) {
+      traceOmpFile("stage freshness guard COPY_FROM_RANK(self) path=%s "
+                   "path_key=%llu local_version=%llu selected_version=%llu\n",
+                   SourcePath.c_str(),
+                   static_cast<unsigned long long>(PathKey),
+                   static_cast<unsigned long long>(Request.LocalVersion),
+                   static_cast<unsigned long long>(Reply.SelectedVersion));
+      return true;
+    }
+
+    if (Decision == OmpFileFreshnessDecision::READ_PFS && StageEntry) {
+      std::lock_guard<std::mutex> EntryLock(StageEntry->Mutex);
+      if (StageEntry->DirtyBytes > 0 || !StageEntry->DirtyExtents.empty()) {
+        traceOmpFile("stage freshness guard READ_PFS override path=%s "
+                     "path_key=%llu dirty_bytes=%llu extents=%zu\n",
+                     SourcePath.c_str(),
+                     static_cast<unsigned long long>(PathKey),
+                     static_cast<unsigned long long>(StageEntry->DirtyBytes),
+                     StageEntry->DirtyExtents.size());
+        return true;
+      }
+    }
+
+    OmpFileStatsStageFreshnessGuardBypasses.fetch_add(
+        1, std::memory_order_relaxed);
+    traceOmpFile("stage freshness guard bypass path=%s path_key=%llu "
+                 "decision=%u source_rank=%d selected_version=%llu; "
+                 "reading from source\n",
+                 SourcePath.c_str(),
+                 static_cast<unsigned long long>(PathKey),
+                 Reply.Decision, Reply.SourceRank,
+                 static_cast<unsigned long long>(Reply.SelectedVersion));
+    return false;
   }
 
   // Effective window every stage decision should consult. Centralizing this
@@ -2602,6 +2727,15 @@ struct ProxyDevice {
       }
     }
 
+    // Freshness guard: before serving from a local stage, consult the headnode
+    // freshness table.  If another proxy holds dirty write-back data for this
+    // file, the local stage may be stale; bypass to the source fd instead.
+    if (ReadFd != Fd && isWritebackStageEnabled() &&
+        !stageFreshnessGuardPermitsLocal(SourcePath, HeldStageEntry)) {
+      HeldStageEntry.reset();
+      ReadFd = Fd;
+    }
+
     const auto PreadStart = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> StageReadLock;
     if (ReadFd != Fd && HeldStageEntry) {
@@ -3283,6 +3417,8 @@ struct ProxyDevice {
         OmpFileStatsCoherentReadRefreshFailures.load(std::memory_order_relaxed);
     uint64_t CoherentReadRefreshUs =
         OmpFileStatsCoherentReadRefreshUs.load(std::memory_order_relaxed);
+    uint64_t StageFreshnessGuardBypasses =
+        OmpFileStatsStageFreshnessGuardBypasses.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
 
     {
@@ -3328,7 +3464,8 @@ struct ProxyDevice {
             "coherent_read_refreshes=%llu "
             "coherent_read_refresh_failures=%llu "
             "coherent_read_refresh_us_total=%llu "
-            "staging_evictions=%llu\n",
+            "staging_evictions=%llu "
+            "stage_freshness_guard_bypasses=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
             static_cast<unsigned long long>(OpenSys),
@@ -3400,7 +3537,8 @@ struct ProxyDevice {
             static_cast<unsigned long long>(CoherentReadRefreshes),
             static_cast<unsigned long long>(CoherentReadRefreshFailures),
             static_cast<unsigned long long>(CoherentReadRefreshUs),
-            static_cast<unsigned long long>(StagingEvictions));
+            static_cast<unsigned long long>(StagingEvictions),
+            static_cast<unsigned long long>(StageFreshnessGuardBypasses));
 
     fprintf(stderr,
             "MPIProxyDevice --> OMPFile writeback stats [%s] rank=%d "
@@ -4799,6 +4937,14 @@ struct ProxyDevice {
   int mppFreshnessMarkFresh(uint64_t PathKey, int Rank, uint64_t Version) {
     if (!freshnessMarkFreshOnHeadnode(PathKey, Rank, Version))
       return errno != 0 ? errno : EIO;
+    if (PathKey != 0 && Version != 0 && Rank == EventSystem.LocalRank) {
+      std::lock_guard<std::mutex> Lock(OmpFileWritebackCommitMutex);
+      auto It = OmpFileLocalFreshnessVersionByPath.find(PathKey);
+      if (It == OmpFileLocalFreshnessVersionByPath.end() ||
+          Version > It->second) {
+        OmpFileLocalFreshnessVersionByPath[PathKey] = Version;
+      }
+    }
     return OFFLOAD_SUCCESS;
   }
 
@@ -5398,6 +5544,7 @@ private:
   double OmpFileStageWindowScale = 1.0;
   uint64_t OmpFileStageEffectiveWindowBytes = 0;
   uint64_t OmpFileStageDirtyWatermarkBytes = 0;
+  bool OmpFileStageFreshnessGuard = true;
   bool OmpFileTopologyLoaded = false;
   uint64_t OmpFileTopologyEntries = 0;
   std::string OmpFileStageRoot;
@@ -5424,6 +5571,7 @@ private:
   std::mutex OmpFileWritebackCommitMutex;
   std::unordered_map<uint64_t, OmpFilePendingWritebackCommit>
       OmpFilePendingWritebackCommits;
+  std::unordered_map<uint64_t, uint64_t> OmpFileLocalFreshnessVersionByPath;
   std::atomic<uint64_t> OmpFileStatsOpenRequests{0};
   std::atomic<uint64_t> OmpFileStatsOpenSyscalls{0};
   std::atomic<uint64_t> OmpFileStatsOpenCacheHits{0};
@@ -5477,6 +5625,7 @@ private:
   std::atomic<uint64_t> OmpFileStatsStageDirtyFlushBytes{0};
   std::atomic<uint64_t> OmpFileStatsStageDirtyFlushFailures{0};
   std::atomic<uint64_t> OmpFileStatsStagingEvictions{0};
+  std::atomic<uint64_t> OmpFileStatsStageFreshnessGuardBypasses{0};
   std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshes{0};
   std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshFailures{0};
   std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshUs{0};
