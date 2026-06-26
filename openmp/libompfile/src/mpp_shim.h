@@ -23,6 +23,9 @@ bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
              size_t &bytes_read);
 bool preadNoStageEx(int handle, int64_t offset, void *buffer, size_t size,
                     size_t &bytes_read);
+bool dirtyOwnerPreadEx(int handle, int source_rank, uint64_t expected_version,
+                       int64_t offset, void *buffer, size_t size,
+                       size_t &bytes_read);
 bool pread(int handle, int64_t offset, void *buffer, size_t size);
 bool pwriteEx(int handle, int64_t offset, const void *buffer, size_t size,
               size_t &bytes_written);

@@ -85,6 +85,7 @@ private:
   int mpi_open_mode = MPI_MODE_RDWR;
   mutable std::atomic<bool> strict_failure_logged{false};
   bool writable_read_rebalance_enabled = false;
+  bool dirty_owner_forwarding_enabled = false;
   bool stage_global_invalidation_enabled = false;
   TwoPhasePolicy two_phase_policy = TwoPhasePolicy::Disabled;
   bool two_phase_enabled = false;
@@ -136,6 +137,10 @@ private:
   std::atomic<uint64_t> writable_read_rebalance_blocked_unsafe_overlap_count{0};
   std::atomic<uint64_t>
       writable_read_rebalance_blocked_invalid_destination_count{0};
+  std::atomic<uint64_t> dirty_owner_forward_attempt_count{0};
+  std::atomic<uint64_t> dirty_owner_forward_success_count{0};
+  std::atomic<uint64_t> dirty_owner_forward_failure_count{0};
+  std::atomic<uint64_t> dirty_owner_forward_bytes_total{0};
   std::atomic<uint64_t> stage_global_invalidations_requested{0};
   std::atomic<uint64_t> stage_global_invalidations_completed{0};
   std::atomic<uint64_t> stage_global_invalidations_failed{0};

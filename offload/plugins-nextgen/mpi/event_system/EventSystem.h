@@ -136,6 +136,7 @@ enum class EventTypeTy : unsigned int {
   OMPFILE_FRESHNESS_MARK_FRESH = 40, // Mark destination rank fresh for version.
   OMPFILE_FRESHNESS_WRITE_COMMIT = 41, // Report a successful tile write.
   OMPFILE_FLUSH_DIRTY_TILE = 42, // Flush dirty tile metadata on headnode.
+  OMPFILE_DIRTY_OWNER_PREAD = 43, // Read dirty staged bytes from owner proxy.
 
   // Internal event system commands.
   EXIT = 35 // Stops the event system execution at the remote process.
@@ -164,6 +165,8 @@ static_assert(
     41);
 static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE) ==
               42);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD) ==
+              43);
 
 using OmpFileFreshnessDecision = ompfile::OmpFileFreshnessDecision;
 using OmpFileFreshnessQueryRequest = ompfile::OmpFileFreshnessQueryRequest;
@@ -706,6 +709,11 @@ EventTy ompfileClose(MPIRequestManagerTy RequestManager, int RemoteHandle,
 EventTy ompfilePread(MPIRequestManagerTy RequestManager, int RemoteHandle,
                      int64_t Offset, void *Buffer, uint64_t Size,
                      int *IoRet, int *RemoteErrno, uint64_t *Bytes);
+EventTy ompfileDirtyOwnerPread(MPIRequestManagerTy RequestManager,
+                               int RemoteHandle, int64_t Offset,
+                               void *Buffer, uint64_t Size,
+                               uint64_t ExpectedVersion, int *IoRet,
+                               int *RemoteErrno, uint64_t *Bytes);
 EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
                       int64_t Offset, const void *Buffer, uint64_t Size,
                       int *IoRet, int *RemoteErrno, uint64_t *Bytes);

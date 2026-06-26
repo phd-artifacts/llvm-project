@@ -31,6 +31,8 @@ using MppCloseFn = int (*)(int);
 using MppPreadFn = int (*)(int, int64_t, void *, uint64_t);
 using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppPreadNoStageExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
+using MppDirtyOwnerPreadExFn = int (*)(int, int, uint64_t, int64_t, void *,
+                                       uint64_t, uint64_t *);
 using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
 using MppPwriteExFn = int (*)(int, int64_t, const void *, uint64_t, uint64_t *);
 using MppStageInvalidatePathKeyFn = int (*)(uint64_t, uint64_t, const char *);
@@ -60,6 +62,7 @@ struct MppApi {
   MppPreadFn pread = nullptr;
   MppPreadExFn pread_ex = nullptr;
   MppPreadNoStageExFn pread_no_stage_ex = nullptr;
+  MppDirtyOwnerPreadExFn dirty_owner_pread_ex = nullptr;
   MppPwriteFn pwrite = nullptr;
   MppPwriteExFn pwrite_ex = nullptr;
   MppStageInvalidatePathKeyFn stage_invalidate_path_key = nullptr;
@@ -94,6 +97,8 @@ MppApi loadMppApi() {
       dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_ex"));
   loaded.pread_no_stage_ex = reinterpret_cast<MppPreadNoStageExFn>(
       dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_no_stage_ex"));
+  loaded.dirty_owner_pread_ex = reinterpret_cast<MppDirtyOwnerPreadExFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_dirty_owner_pread_ex"));
   loaded.pwrite = reinterpret_cast<MppPwriteFn>(dlsym(RTLD_DEFAULT,
                                                         "ompfile_mpp_pwrite"));
   loaded.pwrite_ex = reinterpret_cast<MppPwriteExFn>(
@@ -165,6 +170,8 @@ bool init() {
                         reinterpret_cast<void *>(api.pread));
   io_trace_symbol_owner("ompfile_mpp_pread_ex",
                         reinterpret_cast<void *>(api.pread_ex));
+  io_trace_symbol_owner("ompfile_mpp_dirty_owner_pread_ex",
+                        reinterpret_cast<void *>(api.dirty_owner_pread_ex));
   io_trace_symbol_owner("ompfile_mpp_pwrite",
                         reinterpret_cast<void *>(api.pwrite));
   io_trace_symbol_owner("ompfile_mpp_pwrite_ex",
@@ -412,6 +419,41 @@ bool preadNoStageEx(int handle, int64_t offset, void *buffer, size_t size,
   if (remote_bytes_read >
       static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
     return false;
+  bytes_read = static_cast<size_t>(remote_bytes_read);
+  return true;
+}
+
+bool dirtyOwnerPreadEx(int handle, int source_rank, uint64_t expected_version,
+                       int64_t offset, void *buffer, size_t size,
+                       size_t &bytes_read) {
+  bytes_read = 0;
+  if ((!buffer && size > 0) || source_rank < 0) {
+    errno = EINVAL;
+    return false;
+  }
+  if (!init())
+    return false;
+  auto &api = getMppApi();
+  if (!api.dirty_owner_pread_ex)
+    api = loadMppApi();
+  if (!api.dirty_owner_pread_ex) {
+    errno = ENOSYS;
+    return false;
+  }
+  uint64_t remote_bytes_read = 0;
+  const int rc = api.dirty_owner_pread_ex(handle, source_rank, expected_version,
+                                          offset, buffer, size,
+                                          &remote_bytes_read);
+  if (rc != 0) {
+    if (errno == 0)
+      errno = rc < 0 ? EIO : rc;
+    return false;
+  }
+  if (remote_bytes_read >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    errno = EOVERFLOW;
+    return false;
+  }
   bytes_read = static_cast<size_t>(remote_bytes_read);
   return true;
 }

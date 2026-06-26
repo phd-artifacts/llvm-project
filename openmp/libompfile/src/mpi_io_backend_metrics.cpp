@@ -79,6 +79,14 @@ void MPIIOBackend::reportPhase0Stats() const {
   const uint64_t writable_read_blocked_invalid_destination =
       writable_read_rebalance_blocked_invalid_destination_count.load(
           std::memory_order_relaxed);
+  const uint64_t dirty_owner_forward_attempts =
+      dirty_owner_forward_attempt_count.load(std::memory_order_relaxed);
+  const uint64_t dirty_owner_forward_successes =
+      dirty_owner_forward_success_count.load(std::memory_order_relaxed);
+  const uint64_t dirty_owner_forward_failures =
+      dirty_owner_forward_failure_count.load(std::memory_order_relaxed);
+  const uint64_t dirty_owner_forward_bytes =
+      dirty_owner_forward_bytes_total.load(std::memory_order_relaxed);
   const uint64_t stage_invalidations_requested =
       stage_global_invalidations_requested.load(std::memory_order_relaxed);
   const uint64_t stage_invalidations_completed =
@@ -209,6 +217,10 @@ void MPIIOBackend::reportPhase0Stats() const {
          "writable_read_rebalance_blocked_stale_metadata=%llu "
          "writable_read_rebalance_blocked_unsafe_overlap=%llu "
          "writable_read_rebalance_blocked_invalid_destination=%llu "
+         "dirty_owner_forward_attempts=%llu "
+         "dirty_owner_forward_successes=%llu "
+         "dirty_owner_forward_failures=%llu "
+         "dirty_owner_forward_bytes=%llu "
          "stage_global_invalidations_requested=%llu "
          "stage_global_invalidations_completed=%llu "
          "stage_global_invalidations_failed=%llu "
@@ -279,6 +291,10 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(writable_read_blocked_unsafe_overlap),
          static_cast<unsigned long long>(
              writable_read_blocked_invalid_destination),
+         static_cast<unsigned long long>(dirty_owner_forward_attempts),
+         static_cast<unsigned long long>(dirty_owner_forward_successes),
+         static_cast<unsigned long long>(dirty_owner_forward_failures),
+         static_cast<unsigned long long>(dirty_owner_forward_bytes),
          static_cast<unsigned long long>(stage_invalidations_requested),
          static_cast<unsigned long long>(stage_invalidations_completed),
          static_cast<unsigned long long>(stage_invalidations_failed),

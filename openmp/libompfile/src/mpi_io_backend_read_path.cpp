@@ -22,9 +22,19 @@ bool scalarPlannedReadRebalanceEnabledForStage() {
          !envEquals("LIBOMPFILE_STAGE_FRESHNESS_GUARD", "0");
 }
 
-bool freshnessPermitsRebalancedRead(uint64_t path_key, int target_rank) {
+struct FreshnessRouteDecision {
+  ompfile::OmpFileFreshnessDecision Decision =
+      ompfile::OmpFileFreshnessDecision::WAIT_OR_FAIL;
+  int SourceRank = -1;
+  uint64_t SelectedVersion = 0;
+  bool Valid = false;
+};
+
+FreshnessRouteDecision queryFreshnessForRank(uint64_t path_key,
+                                             int target_rank) {
+  FreshnessRouteDecision Result{};
   if (path_key == 0 || target_rank < 0)
-    return false;
+    return Result;
 
   uint32_t decision = static_cast<uint32_t>(
       ompfile::OmpFileFreshnessDecision::WAIT_OR_FAIL);
@@ -33,17 +43,27 @@ bool freshnessPermitsRebalancedRead(uint64_t path_key, int target_rank) {
   if (!ompfile::mpp::freshnessQuery(path_key, /*local_version=*/0,
                                     target_rank, decision, source_rank,
                                     selected_version))
-    return false;
+    return Result;
 
-  const auto freshness_decision =
-      static_cast<ompfile::OmpFileFreshnessDecision>(decision);
-  switch (freshness_decision) {
+  Result.Decision = static_cast<ompfile::OmpFileFreshnessDecision>(decision);
+  Result.SourceRank = source_rank;
+  Result.SelectedVersion = selected_version;
+  Result.Valid = true;
+  return Result;
+}
+
+bool freshnessPermitsRebalancedRead(uint64_t path_key, int target_rank) {
+  const FreshnessRouteDecision Route = queryFreshnessForRank(path_key,
+                                                            target_rank);
+  if (!Route.Valid)
+    return false;
+  switch (Route.Decision) {
   case ompfile::OmpFileFreshnessDecision::READ_PFS:
     return true;
   case ompfile::OmpFileFreshnessDecision::USE_LOCAL:
     return true;
   case ompfile::OmpFileFreshnessDecision::COPY_FROM_RANK:
-    return source_rank == target_rank;
+    return Route.SourceRank == target_rank;
   case ompfile::OmpFileFreshnessDecision::WAIT_OR_FAIL:
     return false;
   }
@@ -123,10 +143,12 @@ int MPIIOBackend::readAtWithContext(
         scalarPlannedReadRebalanceEnabledForStage()) {
       const char *rebalance_reason = "none";
       int rebalance_errno = 0;
-      if (canApplyRebalancedRead(context.Hint, file_id, offset, size,
+      const bool rebalanced_safe =
+          canApplyRebalancedRead(context.Hint, file_id, offset, size,
                                  rebalance_reason, rebalance_errno) &&
           freshnessPermitsRebalancedRead(context.PathKey,
-                                         context.Plan.AggregatorRank)) {
+                                         context.Plan.AggregatorRank);
+      if (rebalanced_safe) {
         size_t bytes_read = 0;
         if (readAtRemoteRankWithBytes(file_id, context.Plan.AggregatorRank,
                                       offset, data, size, bytes_read)) {
@@ -143,6 +165,63 @@ int MPIIOBackend::readAtWithContext(
                "handle.\n",
                static_cast<unsigned long long>(context.RequestId), file_id,
                context.Plan.AggregatorRank, errno);
+      } else if (dirty_owner_forwarding_enabled &&
+                 std::strcmp(rebalance_reason, "unsafe-write-history") == 0) {
+        const FreshnessRouteDecision Route =
+            queryFreshnessForRank(context.PathKey, context.Plan.AggregatorRank);
+        if (Route.Valid &&
+            Route.Decision == ompfile::OmpFileFreshnessDecision::COPY_FROM_RANK &&
+            Route.SourceRank >= 0 &&
+            Route.SourceRank != context.Plan.AggregatorRank) {
+          int remote_handle = -1;
+          {
+            const std::lock_guard<std::mutex> lock(handle_mutex);
+            auto it = remote_file_handle_map.find(file_id);
+            if (it != remote_file_handle_map.end())
+              remote_handle = it->second;
+          }
+          if (remote_handle >= 0) {
+            dirty_owner_forward_attempt_count.fetch_add(
+                1, std::memory_order_relaxed);
+            size_t bytes_read = 0;
+            bool forward_ok = false;
+            {
+              const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+              forward_ok = ompfile::mpp::dirtyOwnerPreadEx(
+                  remote_handle, Route.SourceRank, Route.SelectedVersion,
+                  offset, data, size, bytes_read);
+            }
+            if (forward_ok) {
+              dirty_owner_forward_success_count.fetch_add(
+                  1, std::memory_order_relaxed);
+              dirty_owner_forward_bytes_total.fetch_add(
+                  bytes_read, std::memory_order_relaxed);
+              remote_pread_event_count.fetch_add(1,
+                                                 std::memory_order_relaxed);
+              remote_pread_bytes_total.fetch_add(size,
+                                                 std::memory_order_relaxed);
+              noteAppliedRebalancedReadForFile(file_id);
+              io_log("Phase 1 dirty-owner forward read: request_id=%llu "
+                     "file=%d path_key=%llu aggregator_rank=%d source_rank=%d "
+                     "version=%llu bytes=%zu\n",
+                     static_cast<unsigned long long>(context.RequestId),
+                     file_id, static_cast<unsigned long long>(context.PathKey),
+                     context.Plan.AggregatorRank, Route.SourceRank,
+                     static_cast<unsigned long long>(Route.SelectedVersion),
+                     bytes_read);
+              return 0;
+            }
+            dirty_owner_forward_failure_count.fetch_add(
+                1, std::memory_order_relaxed);
+            io_log("Phase 1 dirty-owner forward failed: request_id=%llu "
+                   "file=%d aggregator_rank=%d source_rank=%d version=%llu "
+                   "errno=%d; falling back to owner handle.\n",
+                   static_cast<unsigned long long>(context.RequestId), file_id,
+                   context.Plan.AggregatorRank, Route.SourceRank,
+                   static_cast<unsigned long long>(Route.SelectedVersion),
+                   errno);
+          }
+        }
       } else {
         io_log("Phase 1 planned read rebalanced route blocked: request_id=%llu "
                "file=%d aggregator_rank=%d reason=%s errno=%d; falling back "

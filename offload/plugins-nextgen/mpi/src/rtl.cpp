@@ -1918,6 +1918,65 @@ int ompfile_mpp_pread_no_stage_ex(int Handle, int64_t Offset, void *Buffer,
   return OFFLOAD_SUCCESS;
 }
 
+
+int ompfile_mpp_dirty_owner_pread_ex(int Handle, int SourceRank,
+                                     uint64_t ExpectedVersion, int64_t Offset,
+                                     void *Buffer, uint64_t Size,
+                                     uint64_t *BytesRead) {
+  using namespace llvm::omp::target::plugin;
+  if ((!Buffer && Size > 0) || !BytesRead || SourceRank < 0)
+    return OFFLOAD_FAIL;
+  *BytesRead = 0;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  OmpfileMppHandleEntry Entry{};
+  {
+    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+    if (!findOmpfileMppHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+  }
+
+  if (Entry.Rank != SourceRank) {
+    errno = EINVAL;
+    return OFFLOAD_FAIL;
+  }
+
+  int IoRet = -1;
+  int RemoteErrno = 0;
+  uint64_t Bytes = 0;
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfileDirtyOwnerPread,
+      EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD,
+      /*DstDeviceID=*/SourceRank, Entry.RemoteHandle, Offset, Buffer, Size,
+      ExpectedVersion, &IoRet, &RemoteErrno, &Bytes);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+
+  Event.wait();
+  if (auto Error = Event.getError())
+    return OFFLOAD_FAIL;
+  if (IoRet != 0) {
+    errno = RemoteErrno;
+    return OFFLOAD_FAIL;
+  }
+  if (Bytes > Size) {
+    errno = EPROTO;
+    return OFFLOAD_FAIL;
+  }
+  if (Bytes < Size)
+    std::memset(static_cast<char *>(Buffer) + Bytes, 0,
+                static_cast<size_t>(Size - Bytes));
+  *BytesRead = Bytes;
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
                           uint64_t Size, uint64_t *BytesWritten) {
   using namespace llvm::omp::target::plugin;

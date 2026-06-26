@@ -2783,6 +2783,83 @@ struct ProxyDevice {
     return true;
   }
 
+  bool preadDirtyOwnerStageOnly(int Fd, int64_t Offset, void *Buffer,
+                                  uint64_t Size, uint64_t ExpectedVersion,
+                                  uint64_t *BytesReadOut, int &ErrnoOut) {
+    ErrnoOut = 0;
+    if (BytesReadOut)
+      *BytesReadOut = 0;
+    if (Offset < 0 || (!Buffer && Size > 0)) {
+      ErrnoOut = EINVAL;
+      return false;
+    }
+    if (Size == 0)
+      return true;
+    if (!isWritebackStageEnabled() || !isReadthroughStageEnabled()) {
+      ErrnoOut = ENODATA;
+      return false;
+    }
+
+    std::string SourcePath;
+    if (!getTrackedOmpFileFdPath(Fd, SourcePath)) {
+      ErrnoOut = EBADF;
+      return false;
+    }
+
+    std::shared_ptr<OmpFileStageEntry> Entry;
+    {
+      const std::lock_guard<std::mutex> StageLock(OmpFileStageMutex);
+      auto It = OmpFileStageEntries.find(SourcePath);
+      if (It == OmpFileStageEntries.end() || !It->second) {
+        ErrnoOut = ENODATA;
+        return false;
+      }
+      Entry = It->second;
+    }
+
+    const uint64_t Begin = static_cast<uint64_t>(Offset);
+    const uint64_t End = saturatingAdd(Begin, Size);
+    std::unique_lock<std::mutex> EntryLock(Entry->Mutex);
+    if (Entry->Invalidated) {
+      ErrnoOut = ESTALE;
+      return false;
+    }
+    if (ExpectedVersion != 0 && Entry->DirtyEpoch != ExpectedVersion) {
+      ErrnoOut = ESTALE;
+      return false;
+    }
+    if (Entry->DirtyBytes == 0 || Entry->DirtyExtents.empty()) {
+      ErrnoOut = ENODATA;
+      return false;
+    }
+    const bool Covered = Entry->FullyPopulated ||
+                         isCoveredByExtents(Entry->CoveredExtents, Begin, End);
+    if (!Covered) {
+      ErrnoOut = ENODATA;
+      return false;
+    }
+    const int StageFd = Entry->StageFd;
+    const ssize_t BytesRead =
+        ::pread(StageFd, Buffer, static_cast<size_t>(Size),
+                static_cast<off_t>(Offset));
+    if (BytesRead < 0) {
+      ErrnoOut = errno;
+      return false;
+    }
+    const uint64_t Bytes = static_cast<uint64_t>(BytesRead);
+    if (BytesReadOut)
+      *BytesReadOut = Bytes;
+    if (Bytes > 0) {
+      OmpFileStatsDirtyOwnerForwardReads.fetch_add(1,
+                                                   std::memory_order_relaxed);
+      OmpFileStatsDirtyOwnerForwardBytes.fetch_add(Bytes,
+                                                   std::memory_order_relaxed);
+      OmpFileStatsStagedReadHits.fetch_add(1, std::memory_order_relaxed);
+      OmpFileStatsStagedReadBytes.fetch_add(Bytes, std::memory_order_relaxed);
+    }
+    return true;
+  }
+
   bool pwriteFully(int Fd, int64_t Offset, const void *Buffer, uint64_t Size,
                    uint64_t *BytesWrittenOut, uint64_t *ElapsedUsOut,
                    int &ErrnoOut) {
@@ -3419,6 +3496,12 @@ struct ProxyDevice {
         OmpFileStatsCoherentReadRefreshUs.load(std::memory_order_relaxed);
     uint64_t StageFreshnessGuardBypasses =
         OmpFileStatsStageFreshnessGuardBypasses.load(std::memory_order_relaxed);
+    uint64_t DirtyOwnerForwardReads =
+        OmpFileStatsDirtyOwnerForwardReads.load(std::memory_order_relaxed);
+    uint64_t DirtyOwnerForwardBytes =
+        OmpFileStatsDirtyOwnerForwardBytes.load(std::memory_order_relaxed);
+    uint64_t DirtyOwnerForwardFailures =
+        OmpFileStatsDirtyOwnerForwardFailures.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
 
     {
@@ -3465,7 +3548,7 @@ struct ProxyDevice {
             "coherent_read_refresh_failures=%llu "
             "coherent_read_refresh_us_total=%llu "
             "staging_evictions=%llu "
-            "stage_freshness_guard_bypasses=%llu\n",
+            "stage_freshness_guard_bypasses=%llu dirty_owner_forward_reads=%llu dirty_owner_forward_bytes=%llu dirty_owner_forward_failures=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
             static_cast<unsigned long long>(OpenSys),
@@ -3538,7 +3621,10 @@ struct ProxyDevice {
             static_cast<unsigned long long>(CoherentReadRefreshFailures),
             static_cast<unsigned long long>(CoherentReadRefreshUs),
             static_cast<unsigned long long>(StagingEvictions),
-            static_cast<unsigned long long>(StageFreshnessGuardBypasses));
+            static_cast<unsigned long long>(StageFreshnessGuardBypasses),
+            static_cast<unsigned long long>(DirtyOwnerForwardReads),
+            static_cast<unsigned long long>(DirtyOwnerForwardBytes),
+            static_cast<unsigned long long>(DirtyOwnerForwardFailures));
 
     fprintf(stderr,
             "MPIProxyDevice --> OMPFile writeback stats [%s] rank=%d "
@@ -3678,6 +3764,51 @@ struct ProxyDevice {
                   static_cast<void *>(Buffer.data()), Ret, Errno,
                   static_cast<unsigned long long>(PayloadSize),
                   static_cast<int>(AllowStage));
+
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfileDirtyOwnerPread(MPIRequestManagerTy RequestManager) {
+    int Fd = -1;
+    int64_t Offset = 0;
+    uint64_t Size = 0;
+    uint64_t ExpectedVersion = 0;
+
+    RequestManager.receive(&Fd, 1, MPI_INT);
+    RequestManager.receive(&Offset, 1, MPI_INT64_T);
+    RequestManager.receive(&Size, 1, MPI_UINT64_T);
+    RequestManager.receive(&ExpectedVersion, 1, MPI_UINT64_T);
+
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    std::vector<char> Buffer;
+    if (Size > 0)
+      Buffer.resize(Size);
+
+    int Errno = 0;
+    uint64_t PayloadSize = 0;
+    const bool Ok = Size == 0 ||
+                    preadDirtyOwnerStageOnly(Fd, Offset, Buffer.data(), Size,
+                                             ExpectedVersion, &PayloadSize,
+                                             Errno);
+    if (!Ok)
+      OmpFileStatsDirtyOwnerForwardFailures.fetch_add(
+          1, std::memory_order_relaxed);
+    int Ret = Ok ? 0 : -1;
+
+    RequestManager.send(&Ret, 1, MPI_INT);
+    RequestManager.send(&Errno, 1, MPI_INT);
+    RequestManager.send(&PayloadSize, 1, MPI_UINT64_T);
+    if (PayloadSize > 0)
+      RequestManager.sendInBatchs(Buffer.data(), PayloadSize);
+    traceOmpFile("event ompfileDirtyOwnerPread fd=%d offset=%lld size=%llu "
+                 "ret=%d errno=%d bytes=%llu expected_version=%llu\n",
+                 Fd, static_cast<long long>(Offset),
+                 static_cast<unsigned long long>(Size), Ret, Errno,
+                 static_cast<unsigned long long>(PayloadSize),
+                 static_cast<unsigned long long>(ExpectedVersion));
 
     RequestManager.send(nullptr, 0, MPI_BYTE);
     co_return (co_await RequestManager);
@@ -4808,6 +4939,46 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
+
+  int mppDirtyOwnerPreadEx(int Handle, int SourceRank,
+                           uint64_t ExpectedVersion, int64_t Offset,
+                           void *Buffer, uint64_t Size, uint64_t *BytesRead) {
+    if (!BytesRead || SourceRank < 0)
+      return OFFLOAD_FAIL;
+    *BytesRead = 0;
+    OmpFileHandleEntry Entry{};
+    if (!findRemoteHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+    if (Entry.Rank != SourceRank) {
+      errno = EINVAL;
+      return OFFLOAD_FAIL;
+    }
+
+    int IoRet = -1;
+    int RemoteErrno = 0;
+    uint64_t Bytes = 0;
+    EventTy Event = createRankEvent(
+        OriginEvents::ompfileDirtyOwnerPread,
+        EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD, SourceRank,
+        /*TargetDeviceId=*/0, Entry.RemoteHandle, Offset, Buffer, Size,
+        ExpectedVersion, &IoRet, &RemoteErrno, &Bytes);
+    if (!waitForEvent(Event, "dirty_owner_pread"))
+      return OFFLOAD_FAIL;
+    if (IoRet != 0) {
+      errno = RemoteErrno;
+      return OFFLOAD_FAIL;
+    }
+    if (Bytes > Size) {
+      errno = EPROTO;
+      return OFFLOAD_FAIL;
+    }
+    if (Bytes < Size)
+      std::memset(static_cast<char *>(Buffer) + Bytes, 0,
+                  static_cast<size_t>(Size - Bytes));
+    *BytesRead = Bytes;
+    return OFFLOAD_SUCCESS;
+  }
+
   int mppPwriteEx(int Handle, int64_t Offset, const void *Buffer, uint64_t Size,
                   uint64_t *BytesWritten) {
     if (!BytesWritten)
@@ -5441,6 +5612,9 @@ struct ProxyDevice {
         NewEvent = ompfilePread(std::move(RequestManager),
                                 /*AllowStage=*/false);
         break;
+      case OMPFILE_DIRTY_OWNER_PREAD:
+        NewEvent = ompfileDirtyOwnerPread(std::move(RequestManager));
+        break;
       case OMPFILE_PWRITE:
         NewEvent = ompfilePwrite(std::move(RequestManager));
         break;
@@ -5626,6 +5800,9 @@ private:
   std::atomic<uint64_t> OmpFileStatsStageDirtyFlushFailures{0};
   std::atomic<uint64_t> OmpFileStatsStagingEvictions{0};
   std::atomic<uint64_t> OmpFileStatsStageFreshnessGuardBypasses{0};
+  std::atomic<uint64_t> OmpFileStatsDirtyOwnerForwardReads{0};
+  std::atomic<uint64_t> OmpFileStatsDirtyOwnerForwardBytes{0};
+  std::atomic<uint64_t> OmpFileStatsDirtyOwnerForwardFailures{0};
   std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshes{0};
   std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshFailures{0};
   std::atomic<uint64_t> OmpFileStatsCoherentReadRefreshUs{0};
@@ -5732,6 +5909,18 @@ int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppPwrite(Handle, Offset, Buffer, Size);
+}
+
+
+int ompfile_mpp_dirty_owner_pread_ex(int Handle, int SourceRank,
+                                     uint64_t ExpectedVersion, int64_t Offset,
+                                     void *Buffer, uint64_t Size,
+                                     uint64_t *BytesRead) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppDirtyOwnerPreadEx(Handle, SourceRank, ExpectedVersion, Offset,
+                                  Buffer, Size, BytesRead);
 }
 
 int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
