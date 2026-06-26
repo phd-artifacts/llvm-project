@@ -3,10 +3,22 @@
 
 #include <cassert>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <string>
+
+namespace {
+
+bool isWritebackStageModeEnv() {
+  const char *StageMode = std::getenv("LIBOMPFILE_STAGE_MODE");
+  const char *WriteMode = std::getenv("LIBOMPFILE_STAGE_WRITE_MODE");
+  return StageMode && std::strcmp(StageMode, "readthrough") == 0 &&
+         WriteMode && std::strcmp(WriteMode, "write-back") == 0;
+}
+
+} // namespace
 
 bool MPIIOBackend::rangesOverlap(long a_start, long a_end, long b_start,
                                  long b_end) const {
@@ -132,7 +144,7 @@ void MPIIOBackend::completeStageInvalidationForFile(int file_id,
 
 void MPIIOBackend::triggerStageInvalidationAfterSuccessfulRemoteWrite(
     int file_id) {
-  if (writable_read_rebalance_enabled && mpp_remote_only)
+  if (stage_global_invalidation_enabled && mpp_remote_only)
     (void)globallyInvalidateStageForFile(file_id);
 }
 
@@ -249,6 +261,15 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
     return true;
   }
 
+  if (has_remote_only_writable_context && has_local_write_history &&
+      isWritebackStageModeEnv()) {
+    reason_out = "unsafe-write-history";
+    reason_errno_out = EAGAIN;
+    if (record_stats)
+      noteWritableReadRebalanceBlocked(reason_out);
+    return false;
+  }
+
   const long end = start + static_cast<long>(size);
   const bool read_has_epoch =
       (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_EPOCH) != 0;
@@ -277,8 +298,11 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
   for (const WriteEpochEntry &entry : it->second) {
     if (!rangesOverlap(start, end, entry.Start, entry.End))
       continue;
-    if (read_has_tile && entry.HasTile && hint.TileId != entry.TileId)
-      continue;
+    // Byte-range overlap is authoritative for writable remote-read rebalance.
+    // Tile IDs describe the solver's logical matrix block, but the packed file
+    // can still expose stale bytes through the source fd when another proxy
+    // owns dirty write-back data. Do not let mismatched tile metadata make an
+    // overlapping byte range eligible for rebalanced reads.
     saw_overlap = true;
     if (!entry.HasEpoch) {
       saw_missing_write_epoch = true;

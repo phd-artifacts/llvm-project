@@ -72,6 +72,8 @@ MPIIOBackend::MPIIOBackend() {
     io_log("LIBOMPFILE_OPEN_MODE=readonly: opening files read-only.\n");
   writable_read_rebalance_enabled =
       parseBoolEnv("LIBOMPFILE_OPT_WRITABLE_READ_REBALANCE", false);
+  stage_global_invalidation_enabled =
+      parseBoolEnv("LIBOMPFILE_OPT_STAGE_GLOBAL_INVALIDATION", false);
   allow_fallback = parseBoolEnv("LIBOMPFILE_ALLOWFALLBACK", false);
   strict_mpp_required = mpp_requested && !allow_fallback;
 
@@ -155,8 +157,8 @@ MPIIOBackend::MPIIOBackend() {
          "max_batch_bytes=%llu sieve_bytes=%llu write_batch_policy=%s "
          "write_batch_enabled=%d write_batch_window_us=%llu "
          "write_batch_max_batch_bytes=%llu scheduler=%s remote_only=%d "
-         "writable_read_rebalance=%d forecast_mode=%s "
-         "stage_affinity_mode=%s\n",
+         "writable_read_rebalance=%d stage_global_invalidation=%d "
+         "forecast_mode=%s stage_affinity_mode=%s\n",
          twoPhasePolicyToString(two_phase_policy),
          static_cast<int>(two_phase_enabled),
          static_cast<unsigned long long>(two_phase_window_us),
@@ -169,6 +171,7 @@ MPIIOBackend::MPIIOBackend() {
          scheduler_env ? scheduler_env : "(unset)",
          static_cast<int>(mpp_remote_only),
          static_cast<int>(writable_read_rebalance_enabled),
+         static_cast<int>(stage_global_invalidation_enabled),
          forecastModeToString(forecast_mode),
          stageAffinityModeToString(stage_affinity_mode));
 

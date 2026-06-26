@@ -4,9 +4,53 @@
 
 #include <cassert>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+
+namespace {
+
+bool envEquals(const char *Name, const char *Expected) {
+  const char *Value = std::getenv(Name);
+  return Value && std::strcmp(Value, Expected) == 0;
+}
+
+bool scalarPlannedReadRebalanceEnabledForStage() {
+  return envEquals("LIBOMPFILE_STAGE_MODE", "readthrough") &&
+         envEquals("LIBOMPFILE_STAGE_WRITE_MODE", "write-back") &&
+         !envEquals("LIBOMPFILE_STAGE_FRESHNESS_GUARD", "0");
+}
+
+bool freshnessPermitsRebalancedRead(uint64_t path_key, int target_rank) {
+  if (path_key == 0 || target_rank < 0)
+    return false;
+
+  uint32_t decision = static_cast<uint32_t>(
+      ompfile::OmpFileFreshnessDecision::WAIT_OR_FAIL);
+  int source_rank = -1;
+  uint64_t selected_version = 0;
+  if (!ompfile::mpp::freshnessQuery(path_key, /*local_version=*/0,
+                                    target_rank, decision, source_rank,
+                                    selected_version))
+    return false;
+
+  const auto freshness_decision =
+      static_cast<ompfile::OmpFileFreshnessDecision>(decision);
+  switch (freshness_decision) {
+  case ompfile::OmpFileFreshnessDecision::READ_PFS:
+    return true;
+  case ompfile::OmpFileFreshnessDecision::USE_LOCAL:
+    return true;
+  case ompfile::OmpFileFreshnessDecision::COPY_FROM_RANK:
+    return source_rank == target_rank;
+  case ompfile::OmpFileFreshnessDecision::WAIT_OR_FAIL:
+    return false;
+  }
+  return false;
+}
+
+} // namespace
 
 int MPIIOBackend::readAt(int file_id, long offset, void *data, size_t size) {
   ompfile::OmpFileReadRequestContext context{};
@@ -75,6 +119,39 @@ int MPIIOBackend::readAtWithContext(
     return readAtTwoPhase(context, data, size);
 
   if (hasUsablePlannedRead(context)) {
+    if (context.Plan.AggregatorRank >= 0 && mpp_remote_only &&
+        scalarPlannedReadRebalanceEnabledForStage()) {
+      const char *rebalance_reason = "none";
+      int rebalance_errno = 0;
+      if (canApplyRebalancedRead(context.Hint, file_id, offset, size,
+                                 rebalance_reason, rebalance_errno) &&
+          freshnessPermitsRebalancedRead(context.PathKey,
+                                         context.Plan.AggregatorRank)) {
+        size_t bytes_read = 0;
+        if (readAtRemoteRankWithBytes(file_id, context.Plan.AggregatorRank,
+                                      offset, data, size, bytes_read)) {
+          noteAppliedRebalancedReadForFile(file_id);
+          io_log("Phase 1 planned read rebalanced: request_id=%llu file=%d "
+                 "path_key=%llu aggregator_rank=%d bytes=%zu\n",
+                 static_cast<unsigned long long>(context.RequestId), file_id,
+                 static_cast<unsigned long long>(context.PathKey),
+                 context.Plan.AggregatorRank, bytes_read);
+          return 0;
+        }
+        io_log("Phase 1 planned read rebalanced route failed: request_id=%llu "
+               "file=%d aggregator_rank=%d errno=%d; falling back to owner "
+               "handle.\n",
+               static_cast<unsigned long long>(context.RequestId), file_id,
+               context.Plan.AggregatorRank, errno);
+      } else {
+        io_log("Phase 1 planned read rebalanced route blocked: request_id=%llu "
+               "file=%d aggregator_rank=%d reason=%s errno=%d; falling back "
+               "to owner handle.\n",
+               static_cast<unsigned long long>(context.RequestId), file_id,
+               context.Plan.AggregatorRank, rebalance_reason, rebalance_errno);
+      }
+    }
+
     int remote_handle = -1;
     {
       const std::lock_guard<std::mutex> lock(handle_mutex);

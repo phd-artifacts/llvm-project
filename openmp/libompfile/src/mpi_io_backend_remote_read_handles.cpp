@@ -3,6 +3,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <mutex>
 #include <string>
 
@@ -43,7 +44,8 @@ bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
   int opened_handle = -1;
   {
     const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-    if (!ompfile::mpp::openOnRank(path.c_str(), open_flags, 0666, target_rank,
+    const int read_flags = O_RDONLY;
+    if (!ompfile::mpp::openOnRank(path.c_str(), read_flags, 0666, target_rank,
                                   opened_handle)) {
       return false;
     }
