@@ -606,10 +606,10 @@ bool OmpFileHeadnodeManager::completeDirtyFlushUnlocked(uint64_t PathKey,
   }
 
   TileFreshnessEntry &Entry = It->second;
-  if (Entry.LatestVersion != Version) {
+  if (Version > Entry.LatestVersion) {
     emitFreshnessTrace("flush_fail", PathKeyStr, SourceRank, SourceRank,
                        SourceRank, Version, Entry.LatestVersion, "", "fail",
-                       "version-mismatch", "na");
+                       "future-version", "na");
     errno = ESTALE;
     return false;
   }
@@ -632,7 +632,8 @@ bool OmpFileHeadnodeManager::completeDirtyFlushUnlocked(uint64_t PathKey,
   Entry.Dirty = false;
   emitFreshnessTrace("flush_done", PathKeyStr, SourceRank, SourceRank,
                      SourceRank, Version, Entry.LatestVersion, "", "ok",
-                     "", "na");
+                     Version == Entry.LatestVersion ? "" : "accepted-stale-owner",
+                     "na");
   return true;
 }
 

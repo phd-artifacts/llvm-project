@@ -1876,6 +1876,20 @@ struct ProxyDevice {
     return Cursor >= End;
   }
 
+  bool overlapsAnyExtent(const std::vector<OmpFileStageExtent> &Extents,
+                         uint64_t Begin, uint64_t End) const {
+    if (End <= Begin)
+      return false;
+    for (const OmpFileStageExtent &Extent : Extents) {
+      if (Extent.End <= Begin)
+        continue;
+      if (Extent.Begin >= End)
+        return false;
+      return true;
+    }
+    return false;
+  }
+
   void addCoveredExtent(std::vector<OmpFileStageExtent> &Extents,
                         uint64_t Begin, uint64_t End) {
     if (End <= Begin)
@@ -2004,120 +2018,165 @@ struct ProxyDevice {
   // recorded yet) the headnode completion is skipped.
   bool flushDirtyRangesToSource(OmpFileStageEntry &Entry, int SourceFd,
                                 const std::string &SourcePath) {
-    // Snapshot dirty extents under the lock, then release it for the I/O so
-    // a long flush does not block concurrent stage reads on the same entry.
-    std::vector<OmpFileStageExtent> Extents;
-    uint64_t Epoch = 0;
-    {
-      std::lock_guard<std::mutex> EntryLock(Entry.Mutex);
-      if (Entry.DirtyExtents.empty()) {
-        assert(Entry.DirtyBytes == 0 &&
-               "dirty bytes nonzero with no extents");
-        return true;
-      }
-      Extents = Entry.DirtyExtents;
-      Epoch = Entry.DirtyEpoch;
-    }
-    if (Entry.StageFd < 0 || SourceFd < 0) {
+    auto failDirtyFlush = [&](const char *Reason, int ErrnoValue,
+                              uint64_t Begin = 0, uint64_t End = 0,
+                              uint64_t Epoch = 0) -> bool {
       OmpFileStatsStageDirtyFlushFailures.fetch_add(1,
-                                                      std::memory_order_relaxed);
-      invalidateStageForPath(SourcePath);
+                                                    std::memory_order_relaxed);
+      REPORT("MPIProxyDevice --> OMPFile dirty flush failed rank=%d "
+             "reason=%s errno=%d path=%s begin=%llu end=%llu epoch=%llu "
+             "source_fd=%d stage_fd=%d\n",
+             EventSystem.LocalRank, Reason ? Reason : "unknown", ErrnoValue,
+             SourcePath.c_str(), static_cast<unsigned long long>(Begin),
+             static_cast<unsigned long long>(End),
+             static_cast<unsigned long long>(Epoch), SourceFd, Entry.StageFd);
       return false;
-    }
+    };
 
-    const auto FlushStart = std::chrono::steady_clock::now();
-    uint64_t FlushedBytes = 0;
-    std::vector<char> Buffer;
-    for (const OmpFileStageExtent &Extent : Extents) {
-      assert(Extent.End > Extent.Begin && "empty dirty extent in vector");
-      const uint64_t Len = Extent.End - Extent.Begin;
-      if (Buffer.size() < Len)
-        Buffer.resize(Len);
-      // Drain the stage read fully.
-      uint64_t ReadTotal = 0;
-      while (ReadTotal < Len) {
-        const ssize_t N = ::pread(Entry.StageFd, Buffer.data() + ReadTotal,
-                                  static_cast<size_t>(Len - ReadTotal),
-                                  static_cast<off_t>(Extent.Begin + ReadTotal));
-        if (N < 0) {
-          OmpFileStatsStageDirtyFlushFailures.fetch_add(
-              1, std::memory_order_relaxed);
-          invalidateStageForPath(SourcePath);
-          return false;
-        }
-        if (N == 0) {
-          OmpFileStatsStageDirtyFlushFailures.fetch_add(
-              1, std::memory_order_relaxed);
-          invalidateStageForPath(SourcePath);
-          return false;
-        }
-        ReadTotal += static_cast<uint64_t>(N);
-      }
-      // Write the drained bytes to the source filesystem.
-      uint64_t WriteTotal = 0;
-      while (WriteTotal < Len) {
-        const ssize_t N = ::pwrite(
-            SourceFd, Buffer.data() + WriteTotal,
-            static_cast<size_t>(Len - WriteTotal),
-            static_cast<off_t>(Extent.Begin + WriteTotal));
-        if (N < 0) {
-          OmpFileStatsStageDirtyFlushFailures.fetch_add(
-              1, std::memory_order_relaxed);
-          invalidateStageForPath(SourcePath);
-          return false;
-        }
-        if (N == 0) {
-          OmpFileStatsStageDirtyFlushFailures.fetch_add(
-              1, std::memory_order_relaxed);
-          invalidateStageForPath(SourcePath);
-          return false;
-        }
-        WriteTotal += static_cast<uint64_t>(N);
-      }
-      FlushedBytes += Len;
-    }
-
-    if (::fdatasync(SourceFd) != 0) {
-      OmpFileStatsStageDirtyFlushFailures.fetch_add(
-          1, std::memory_order_relaxed);
+    if (Entry.StageFd < 0) {
       invalidateStageForPath(SourcePath);
-      return false;
+      return failDirtyFlush("bad-stage-fd", EBADF);
+    }
+    if (SourceFd < 0 && SourcePath.empty()) {
+      invalidateStageForPath(SourcePath);
+      return failDirtyFlush("bad-source-fd", EBADF);
     }
 
-    // Clear the flushed ranges and account the flush. Re-lock to mutate.
-    {
-      std::lock_guard<std::mutex> EntryLock(Entry.Mutex);
-      // Only the extents we snapshotted are guaranteed flushed; clear all
-      // of them since we hold the authoritative post-fdatasync copy on the
-      // source. New dirty ranges added concurrently during the I/O would
-      // have been appended after our snapshot and are preserved by
-      // clearDirtyRangeLocked per-range, but the simplest correct behavior
-      // is to clear exactly the snapshot and recompute.
-      for (const OmpFileStageExtent &Extent : Extents)
-        clearDirtyRangeLocked(Entry, Extent.Begin, Extent.End);
-    }
-    OmpFileStatsStageDirtyFlushes.fetch_add(1, std::memory_order_relaxed);
-    OmpFileStatsStageDirtyFlushBytes.fetch_add(FlushedBytes,
-                                                std::memory_order_relaxed);
-    OmpFileStatsStageWriteUs.fetch_add(
-        elapsedMicros(FlushStart, std::chrono::steady_clock::now()),
-        std::memory_order_relaxed);
-
-    // Notify the headnode that this tile is now PFS-current. DirtyEpoch is
-    // set by the write-back capture path (later task); when it is zero no
-    // freshness epoch was committed, so there is nothing to complete.
-    if (Epoch > 0 && !SourcePath.empty()) {
-      const uint64_t PathKey =
-          OmpFileHeadnodeManager::computePathKeyForPath(SourcePath);
-      if (PathKey != 0 &&
-          !completeDirtyFlushOnHeadnode(PathKey, EventSystem.LocalRank,
-                                        Epoch, /*Success=*/true)) {
-        OmpFileStatsStageDirtyFlushFailures.fetch_add(
-            1, std::memory_order_relaxed);
-        return false;
+    int FlushSourceFd = SourceFd;
+    bool CloseFlushSourceFd = false;
+    if (!SourcePath.empty()) {
+      FlushSourceFd = ::open(SourcePath.c_str(), O_RDWR);
+      if (FlushSourceFd < 0) {
+        const int OpenErrno = errno;
+        invalidateStageForPath(SourcePath);
+        return failDirtyFlush("open-source-rdwr", OpenErrno);
       }
+      CloseFlushSourceFd = true;
     }
-    return true;
+
+    auto closeFlushFd = [&]() {
+      if (CloseFlushSourceFd && FlushSourceFd >= 0) {
+        (void)::close(FlushSourceFd);
+        FlushSourceFd = -1;
+      }
+    };
+
+    const uint64_t PathKey =
+        OmpFileHeadnodeManager::computePathKeyForPath(SourcePath);
+    constexpr unsigned MaxStaleCompletionRetries = 16;
+
+    for (unsigned Attempt = 0; Attempt <= MaxStaleCompletionRetries; ++Attempt) {
+      // Snapshot dirty extents under the lock, then release it for I/O so a
+      // long flush does not block normal stage reads. The headnode completion
+      // below is the authority for whether the snapshot epoch was still current.
+      // If another write-back capture commits a newer epoch while this flush is
+      // draining bytes, completion returns ESTALE. In that case do not clear any
+      // dirty extents: retry after yielding so the concurrent writer can record
+      // its dirty range/epoch and the next pass flushes a current snapshot.
+      std::vector<OmpFileStageExtent> Extents;
+      uint64_t Epoch = 0;
+      {
+        std::lock_guard<std::mutex> EntryLock(Entry.Mutex);
+        if (Entry.DirtyExtents.empty()) {
+          assert(Entry.DirtyBytes == 0 &&
+                 "dirty bytes nonzero with no extents");
+          closeFlushFd();
+          return true;
+        }
+        Extents = Entry.DirtyExtents;
+        Epoch = std::max(Entry.DirtyEpoch,
+                         lastLocalFreshnessVersionForPathKey(PathKey));
+      }
+
+      const auto FlushStart = std::chrono::steady_clock::now();
+      uint64_t FlushedBytes = 0;
+      std::vector<char> Buffer;
+      for (const OmpFileStageExtent &Extent : Extents) {
+        assert(Extent.End > Extent.Begin && "empty dirty extent in vector");
+        const uint64_t Len = Extent.End - Extent.Begin;
+        if (Buffer.size() < Len)
+          Buffer.resize(Len);
+        uint64_t ReadTotal = 0;
+        while (ReadTotal < Len) {
+          const ssize_t N = ::pread(Entry.StageFd, Buffer.data() + ReadTotal,
+                                    static_cast<size_t>(Len - ReadTotal),
+                                    static_cast<off_t>(Extent.Begin + ReadTotal));
+          if (N <= 0) {
+            const int ReadErrno = N < 0 ? errno : EIO;
+            closeFlushFd();
+            invalidateStageForPath(SourcePath);
+            return failDirtyFlush("pread-stage", ReadErrno, Extent.Begin,
+                                  Extent.End, Epoch);
+          }
+          ReadTotal += static_cast<uint64_t>(N);
+        }
+        uint64_t WriteTotal = 0;
+        while (WriteTotal < Len) {
+          const ssize_t N = ::pwrite(
+              FlushSourceFd, Buffer.data() + WriteTotal,
+              static_cast<size_t>(Len - WriteTotal),
+              static_cast<off_t>(Extent.Begin + WriteTotal));
+          if (N <= 0) {
+            const int WriteErrno = N < 0 ? errno : EIO;
+            closeFlushFd();
+            invalidateStageForPath(SourcePath);
+            return failDirtyFlush("pwrite-source", WriteErrno, Extent.Begin,
+                                  Extent.End, Epoch);
+          }
+          WriteTotal += static_cast<uint64_t>(N);
+        }
+        FlushedBytes += Len;
+      }
+
+      if (::fdatasync(FlushSourceFd) != 0) {
+        const int SyncErrno = errno;
+        closeFlushFd();
+        invalidateStageForPath(SourcePath);
+        return failDirtyFlush("fdatasync-source", SyncErrno, 0, 0, Epoch);
+      }
+
+      if (Epoch > 0 && !SourcePath.empty()) {
+        errno = 0;
+        if (PathKey == 0 ||
+            !completeDirtyFlushOnHeadnode(PathKey, EventSystem.LocalRank,
+                                          Epoch, /*Success=*/true)) {
+          const int CompletionErrno = errno != 0 ? errno : EIO;
+          if (CompletionErrno == ESTALE && Attempt < MaxStaleCompletionRetries) {
+            // A concurrent write-back commit advanced the file epoch while the
+            // close flush was in flight. Keep dirty state intact and retry with
+            // a fresh snapshot; clearing here could otherwise drop the newer
+            // overlapping dirty range.
+            REPORT("MPIProxyDevice --> OMPFile dirty flush retry rank=%d "
+                   "reason=headnode-complete-stale errno=%d path=%s epoch=%llu "
+                   "attempt=%u\n",
+                   EventSystem.LocalRank, CompletionErrno, SourcePath.c_str(),
+                   static_cast<unsigned long long>(Epoch), Attempt);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+          }
+          closeFlushFd();
+          return failDirtyFlush("headnode-complete", CompletionErrno, 0, 0,
+                                Epoch);
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> EntryLock(Entry.Mutex);
+        for (const OmpFileStageExtent &Extent : Extents)
+          clearDirtyRangeLocked(Entry, Extent.Begin, Extent.End);
+      }
+      OmpFileStatsStageDirtyFlushes.fetch_add(1, std::memory_order_relaxed);
+      OmpFileStatsStageDirtyFlushBytes.fetch_add(FlushedBytes,
+                                                  std::memory_order_relaxed);
+      OmpFileStatsStageWriteUs.fetch_add(
+          elapsedMicros(FlushStart, std::chrono::steady_clock::now()),
+          std::memory_order_relaxed);
+      closeFlushFd();
+      return true;
+    }
+
+    closeFlushFd();
+    return failDirtyFlush("stale-retry-exhausted", ESTALE);
   }
 
   bool shouldInvalidateStageOnOpen(int Flags) const {
@@ -2306,7 +2365,17 @@ struct ProxyDevice {
     if (Fd < 0 || Path.empty())
       return;
     const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
+    auto Existing = OmpFileTrackedFds.find(Fd);
+    if (Existing != OmpFileTrackedFds.end()) {
+      auto CountIt = OmpFileTrackedFdPathRefCounts.find(Existing->second.Path);
+      if (CountIt != OmpFileTrackedFdPathRefCounts.end() && CountIt->second > 0) {
+        --CountIt->second;
+        if (CountIt->second == 0)
+          OmpFileTrackedFdPathRefCounts.erase(CountIt);
+      }
+    }
     OmpFileTrackedFds[Fd] = OmpFileTrackedFdEntry{Path, Flags, Mode};
+    ++OmpFileTrackedFdPathRefCounts[Path];
   }
 
   bool getTrackedOmpFileFdPath(int Fd, std::string &Path) const {
@@ -2318,9 +2387,38 @@ struct ProxyDevice {
     return true;
   }
 
+  bool getTrackedOmpFileFdEntry(int Fd, OmpFileTrackedFdEntry &Entry) const {
+    const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
+    auto It = OmpFileTrackedFds.find(Fd);
+    if (It == OmpFileTrackedFds.end())
+      return false;
+    Entry = It->second;
+    return true;
+  }
+
+  bool isLastTrackedFdForPath(int Fd, std::string *PathOut = nullptr) const {
+    const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
+    auto It = OmpFileTrackedFds.find(Fd);
+    if (It == OmpFileTrackedFds.end())
+      return true;
+    if (PathOut)
+      *PathOut = It->second.Path;
+    auto CountIt = OmpFileTrackedFdPathRefCounts.find(It->second.Path);
+    return CountIt == OmpFileTrackedFdPathRefCounts.end() || CountIt->second <= 1;
+  }
+
   void eraseTrackedOmpFileFd(int Fd) {
     const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
-    OmpFileTrackedFds.erase(Fd);
+    auto It = OmpFileTrackedFds.find(Fd);
+    if (It != OmpFileTrackedFds.end()) {
+      auto CountIt = OmpFileTrackedFdPathRefCounts.find(It->second.Path);
+      if (CountIt != OmpFileTrackedFdPathRefCounts.end() && CountIt->second > 0) {
+        --CountIt->second;
+        if (CountIt->second == 0)
+          OmpFileTrackedFdPathRefCounts.erase(CountIt);
+      }
+      OmpFileTrackedFds.erase(It);
+    }
   }
 
   bool shouldRefreshTrackedOmpFileFdForRead(
@@ -2832,10 +2930,25 @@ struct ProxyDevice {
       ErrnoOut = ENODATA;
       return false;
     }
+    const bool DirtyOverlap = overlapsAnyExtent(Entry->DirtyExtents, Begin, End);
+    if (!DirtyOverlap) {
+      // The headnode freshness table is file/version scoped. This proxy may own
+      // dirty bytes for the file while the requested byte range is clean. Tell
+      // the caller it may use the normal source/PFS route for this range.
+      ErrnoOut = ENODATA;
+      return false;
+    }
+    const bool DirtyCovered = isCoveredByExtents(Entry->DirtyExtents, Begin, End);
+    if (!DirtyCovered) {
+      // Partial dirty overlap would require merging staged dirty bytes with
+      // source bytes. Keep the fail-closed behavior until that path exists.
+      ErrnoOut = ESTALE;
+      return false;
+    }
     const bool Covered = Entry->FullyPopulated ||
                          isCoveredByExtents(Entry->CoveredExtents, Begin, End);
     if (!Covered) {
-      ErrnoOut = ENODATA;
+      ErrnoOut = ESTALE;
       return false;
     }
     const int StageFd = Entry->StageFd;
@@ -3273,8 +3386,10 @@ struct ProxyDevice {
     // in the Task-4-only state (no capture yet), DirtyExtents is empty and
     // this returns true without touching the source fd.
     if (isWritebackStageEnabled() && Fd >= 0) {
-      std::string SourcePath;
-      if (getTrackedOmpFileFdPath(Fd, SourcePath)) {
+      OmpFileTrackedFdEntry TrackedEntry;
+      if (getTrackedOmpFileFdEntry(Fd, TrackedEntry) &&
+          (TrackedEntry.Flags & O_ACCMODE) != O_RDONLY) {
+        const std::string &SourcePath = TrackedEntry.Path;
         std::shared_ptr<OmpFileStageEntry> StageEntry;
         if (getStageEntryForPath(SourcePath, StageEntry) && StageEntry) {
           if (!flushDirtyRangesToSource(*StageEntry, Fd, SourcePath)) {
@@ -5736,6 +5851,7 @@ private:
   std::atomic<int> NextOmpFileHandle{1};
   mutable std::mutex OmpFileTrackedFdMutex;
   std::unordered_map<int, OmpFileTrackedFdEntry> OmpFileTrackedFds;
+  std::unordered_map<std::string, uint64_t> OmpFileTrackedFdPathRefCounts;
   std::mutex OmpFileOpenCacheMutex;
   std::unordered_map<std::string, OmpFileOpenCacheEntry> OmpFileOpenCacheByKey;
   std::unordered_map<int, std::string> OmpFileOpenCacheFdToKey;
