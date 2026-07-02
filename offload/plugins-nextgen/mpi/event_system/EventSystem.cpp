@@ -100,6 +100,8 @@ std::string EventTypeToString(EventTypeTy eventType) {
       return "OMPFILE_FLUSH_DIRTY_TILE";
     case EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD:
       return "OMPFILE_DIRTY_OWNER_PREAD";
+    case EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY:
+      return "OMPFILE_DIRTY_OWNER_QUERY";
     case EventTypeTy::EXIT: return "EXIT";
     default: return "UNKNOWN_EVENT_TYPE";
   }
@@ -865,6 +867,23 @@ EventTy ompfileDirtyOwnerPread(MPIRequestManagerTy RequestManager,
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
   }
+
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileDirtyOwnerQuery(MPIRequestManagerTy RequestManager,
+                               int RemoteHandle, int64_t Offset,
+                               uint64_t Size, uint64_t ExpectedVersion,
+                               int *IoRet, int *RemoteErrno, int *State) {
+  RequestManager.send(&RemoteHandle, 1, MPI_INT);
+  RequestManager.send(&Offset, 1, MPI_INT64_T);
+  RequestManager.send(&Size, 1, MPI_UINT64_T);
+  RequestManager.send(&ExpectedVersion, 1, MPI_UINT64_T);
+
+  RequestManager.receive(IoRet, 1, MPI_INT);
+  RequestManager.receive(RemoteErrno, 1, MPI_INT);
+  RequestManager.receive(State, 1, MPI_INT);
 
   RequestManager.receive(nullptr, 0, MPI_BYTE);
   co_return (co_await RequestManager);

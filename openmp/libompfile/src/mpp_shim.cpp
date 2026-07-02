@@ -33,6 +33,8 @@ using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppPreadNoStageExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppDirtyOwnerPreadExFn = int (*)(int, int, uint64_t, int64_t, void *,
                                        uint64_t, uint64_t *);
+using MppDirtyOwnerQueryExFn = int (*)(int, int, uint64_t, int64_t, uint64_t,
+                                       int *);
 using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
 using MppPwriteExFn = int (*)(int, int64_t, const void *, uint64_t, uint64_t *);
 using MppStageInvalidatePathKeyFn = int (*)(uint64_t, uint64_t, const char *);
@@ -63,6 +65,7 @@ struct MppApi {
   MppPreadExFn pread_ex = nullptr;
   MppPreadNoStageExFn pread_no_stage_ex = nullptr;
   MppDirtyOwnerPreadExFn dirty_owner_pread_ex = nullptr;
+  MppDirtyOwnerQueryExFn dirty_owner_query_ex = nullptr;
   MppPwriteFn pwrite = nullptr;
   MppPwriteExFn pwrite_ex = nullptr;
   MppStageInvalidatePathKeyFn stage_invalidate_path_key = nullptr;
@@ -99,6 +102,8 @@ MppApi loadMppApi() {
       dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_no_stage_ex"));
   loaded.dirty_owner_pread_ex = reinterpret_cast<MppDirtyOwnerPreadExFn>(
       dlsym(RTLD_DEFAULT, "ompfile_mpp_dirty_owner_pread_ex"));
+  loaded.dirty_owner_query_ex = reinterpret_cast<MppDirtyOwnerQueryExFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_dirty_owner_query_ex"));
   loaded.pwrite = reinterpret_cast<MppPwriteFn>(dlsym(RTLD_DEFAULT,
                                                         "ompfile_mpp_pwrite"));
   loaded.pwrite_ex = reinterpret_cast<MppPwriteExFn>(
@@ -455,6 +460,34 @@ bool dirtyOwnerPreadEx(int handle, int source_rank, uint64_t expected_version,
     return false;
   }
   bytes_read = static_cast<size_t>(remote_bytes_read);
+  return true;
+}
+
+bool dirtyOwnerQueryEx(int handle, int source_rank, uint64_t expected_version,
+                       int64_t offset, size_t size, int &state_out) {
+  state_out = -1;
+  if (source_rank < 0) {
+    errno = EINVAL;
+    return false;
+  }
+  if (!init())
+    return false;
+  auto &api = getMppApi();
+  if (!api.dirty_owner_query_ex)
+    api = loadMppApi();
+  if (!api.dirty_owner_query_ex) {
+    errno = ENOSYS;
+    return false;
+  }
+  int remote_state = -1;
+  const int rc = api.dirty_owner_query_ex(handle, source_rank, expected_version,
+                                          offset, size, &remote_state);
+  if (rc != 0) {
+    if (errno == 0)
+      errno = rc < 0 ? EIO : rc;
+    return false;
+  }
+  state_out = remote_state;
   return true;
 }
 

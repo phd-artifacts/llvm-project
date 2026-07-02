@@ -74,6 +74,10 @@ MPIIOBackend::MPIIOBackend() {
       parseBoolEnv("LIBOMPFILE_OPT_WRITABLE_READ_REBALANCE", false);
   dirty_owner_forwarding_enabled =
       parseBoolEnv("LIBOMPFILE_OPT_DIRTY_OWNER_FORWARDING", false);
+  dirty_clean_pfs_rebalance_enabled =
+      parseBoolEnv("LIBOMPFILE_OPT_DIRTY_CLEAN_PFS_REBALANCE", false);
+  dirty_clean_pfs_allow_clean_pfs_enabled = parseBoolEnv(
+      "LIBOMPFILE_OPT_DIRTY_CLEAN_PFS_REBALANCE_ALLOW_CLEAN_PFS", false);
   stage_global_invalidation_enabled =
       parseBoolEnv("LIBOMPFILE_OPT_STAGE_GLOBAL_INVALIDATION", false);
   allow_fallback = parseBoolEnv("LIBOMPFILE_ALLOWFALLBACK", false);
@@ -159,8 +163,9 @@ MPIIOBackend::MPIIOBackend() {
          "max_batch_bytes=%llu sieve_bytes=%llu write_batch_policy=%s "
          "write_batch_enabled=%d write_batch_window_us=%llu "
          "write_batch_max_batch_bytes=%llu scheduler=%s remote_only=%d "
-         "writable_read_rebalance=%d dirty_owner_forwarding=%d stage_global_invalidation=%d "
-         "forecast_mode=%s stage_affinity_mode=%s\n",
+         "writable_read_rebalance=%d dirty_owner_forwarding=%d "
+         "dirty_clean_pfs_rebalance=%d dirty_clean_pfs_allow_clean_pfs=%d "
+         "stage_global_invalidation=%d forecast_mode=%s stage_affinity_mode=%s\n",
          twoPhasePolicyToString(two_phase_policy),
          static_cast<int>(two_phase_enabled),
          static_cast<unsigned long long>(two_phase_window_us),
@@ -174,6 +179,8 @@ MPIIOBackend::MPIIOBackend() {
          static_cast<int>(mpp_remote_only),
          static_cast<int>(writable_read_rebalance_enabled),
          static_cast<int>(dirty_owner_forwarding_enabled),
+         static_cast<int>(dirty_clean_pfs_rebalance_enabled),
+         static_cast<int>(dirty_clean_pfs_allow_clean_pfs_enabled),
          static_cast<int>(stage_global_invalidation_enabled),
          forecastModeToString(forecast_mode),
          stageAffinityModeToString(stage_affinity_mode));

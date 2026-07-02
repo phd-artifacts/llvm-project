@@ -17,7 +17,70 @@ bool freshnessWriteThroughModeEnabled() {
   const char *mode = std::getenv("LIBOMPFILE_TILE_FRESHNESS_WRITE_MODE");
   if (mode && std::strcmp(mode, "write-back") == 0)
     return false;
+  if (mode && std::strcmp(mode, "write-through") == 0)
+    return true;
+  const char *stage_write_mode = std::getenv("LIBOMPFILE_STAGE_WRITE_MODE");
+  if (stage_write_mode && std::strcmp(stage_write_mode, "write-back") == 0)
+    return false;
   return true;
+}
+
+bool writebackDistributeWritesEnabled() {
+  const char *env = std::getenv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES");
+  return env && env[0] == '1' && env[1] == '\0';
+}
+
+unsigned parsePositiveEnv(const char *name) {
+  const char *env = std::getenv(name);
+  if (!env || env[0] == '\0')
+    return 0;
+  char *end = nullptr;
+  errno = 0;
+  const unsigned long parsed = std::strtoul(env, &end, 10);
+  if (errno != 0 || end == env || (end && *end != '\0') || parsed == 0 ||
+      parsed > static_cast<unsigned long>(std::numeric_limits<unsigned>::max()))
+    return 0;
+  return static_cast<unsigned>(parsed);
+}
+
+unsigned writebackDistributeRankCount() {
+  if (const unsigned explicit_count =
+          parsePositiveEnv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS"))
+    return explicit_count;
+  if (const unsigned worker_nodes = parsePositiveEnv("OMPFILE_CHOLESKY_WORKER_NODES"))
+    return worker_nodes;
+  if (const unsigned target_regions = parsePositiveEnv("OMPFILE_CHOLESKY_TARGET_REGIONS"))
+    return target_regions;
+  return 0;
+}
+
+int chooseDistributedWriteRank(const ompfile::OmpFileWriteRequestContext &context,
+                               size_t size) {
+  if (!writebackDistributeWritesEnabled())
+    return -1;
+  const unsigned ranks = writebackDistributeRankCount();
+  if (ranks <= 1)
+    return -1;
+  uint64_t key = 0;
+  if ((context.Hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0)
+    key = context.Hint.TileId;
+  else if (context.Offset >= 0 && size > 0)
+    key = static_cast<uint64_t>(context.Offset / static_cast<int64_t>(size));
+  else if (context.Offset >= 0)
+    key = static_cast<uint64_t>(context.Offset);
+  else
+    return -1;
+  return static_cast<int>(key % ranks);
+}
+
+uint64_t tileFreshnessKey(uint64_t path_key,
+                          const ompfile::OmpFileIOHint &hint) {
+  if (path_key == 0 ||
+      (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) == 0)
+    return path_key;
+  uint64_t x = path_key ^ 0x9e3779b97f4a7c15ULL;
+  x ^= hint.TileId + 0x9e3779b97f4a7c15ULL + (x << 6) + (x >> 2);
+  return x != 0 ? x : path_key;
 }
 
 } // namespace
@@ -126,7 +189,7 @@ int MPIIOBackend::writeAtWithContext(
   recordForecastWrite(context.Hint, size);
   invalidateTwoPhaseReadCacheForFile(file_id);
 
-  const auto report_freshness_write_commit = [&]() {
+  const auto report_freshness_write_commit = [&](int writer_rank_override) {
     if ((context.Hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) == 0)
       return true;
 
@@ -139,8 +202,8 @@ int MPIIOBackend::writeAtWithContext(
     if (path_key == 0)
       return true;
 
-    int writer_rank = -1;
-    {
+    int writer_rank = writer_rank_override;
+    if (writer_rank < 0) {
       const std::lock_guard<std::mutex> lock(handle_mutex);
       auto owner_it = remote_file_owner_rank_map.find(file_id);
       if (owner_it != remote_file_owner_rank_map.end())
@@ -155,21 +218,24 @@ int MPIIOBackend::writeAtWithContext(
     }
 
     const bool write_through_mode = freshnessWriteThroughModeEnabled();
+    const uint64_t freshness_key = tileFreshnessKey(path_key, context.Hint);
     uint64_t committed_version = 0;
     if (!ompfile::mpp::freshnessWriteCommit(
-            path_key, writer_rank, context.Hint.TileId, write_through_mode,
+            freshness_key, writer_rank, context.Hint.TileId, write_through_mode,
             committed_version)) {
-      io_log("Freshness write-commit failed path_key=%llu writer=%d tile=%llu "
+      io_log("Freshness write-commit failed path_key=%llu freshness_key=%llu writer=%d tile=%llu "
              "mode=%s errno=%d\n",
-             static_cast<unsigned long long>(path_key), writer_rank,
+             static_cast<unsigned long long>(path_key),
+             static_cast<unsigned long long>(freshness_key), writer_rank,
              static_cast<unsigned long long>(context.Hint.TileId),
              write_through_mode ? "write-through" : "write-back", errno);
       return false;
     }
 
     io_trace("MPIIOBackend::writeAtWithContext freshness write-commit "
-             "path_key=%llu writer=%d tile=%llu mode=%s version=%llu\n",
-             static_cast<unsigned long long>(path_key), writer_rank,
+             "path_key=%llu freshness_key=%llu writer=%d tile=%llu mode=%s version=%llu\n",
+             static_cast<unsigned long long>(path_key),
+             static_cast<unsigned long long>(freshness_key), writer_rank,
              static_cast<unsigned long long>(context.Hint.TileId),
              write_through_mode ? "write-through" : "write-back",
              static_cast<unsigned long long>(committed_version));
@@ -185,7 +251,7 @@ int MPIIOBackend::writeAtWithContext(
     if (batched_rc == 0) {
       recordWriteEpochForContext(file_id, offset, size, context.Hint);
       triggerStageInvalidationAfterSuccessfulRemoteWrite(file_id);
-      if (!report_freshness_write_commit()) {
+      if (!report_freshness_write_commit(/*writer_rank_override=*/-1)) {
         if (errno == 0)
           errno = EIO;
         return -1;
@@ -195,6 +261,32 @@ int MPIIOBackend::writeAtWithContext(
   }
 
   if (remote_only) {
+    const int distributed_write_rank = chooseDistributedWriteRank(context, size);
+    if (distributed_write_rank >= 0) {
+      size_t distributed_bytes_written = 0;
+      if (writeAtRemoteRankWithBytes(file_id, distributed_write_rank, offset,
+                                     data, size,
+                                     distributed_bytes_written)) {
+        assert(distributed_bytes_written == size &&
+               "Distributed remote pwrite must complete full request");
+        recordWriteEpochForContext(file_id, offset, size, context.Hint);
+        triggerStageInvalidationAfterSuccessfulRemoteWrite(file_id);
+        if (!report_freshness_write_commit(distributed_write_rank)) {
+          if (errno == 0)
+            errno = EIO;
+          return -1;
+        }
+        io_log("MPP distributed write at offset completed: file=%d rank=%d "
+               "bytes=%zu.\n",
+               file_id, distributed_write_rank, distributed_bytes_written);
+        return 0;
+      }
+      io_log("MPP distributed pwrite failed for file %d rank=%d offset=%lld "
+             "size=%zu errno=%d; falling back to owner handle.\n",
+             file_id, distributed_write_rank, static_cast<long long>(offset),
+             size, errno);
+    }
+
     int remote_handle = -1;
     {
       const std::lock_guard<std::mutex> lock(handle_mutex);
@@ -220,7 +312,7 @@ int MPIIOBackend::writeAtWithContext(
 
     recordWriteEpochForContext(file_id, offset, size, context.Hint);
     triggerStageInvalidationAfterSuccessfulRemoteWrite(file_id);
-    if (!report_freshness_write_commit()) {
+    if (!report_freshness_write_commit(/*writer_rank_override=*/-1)) {
       if (errno == 0)
         errno = EIO;
       return -1;
@@ -255,7 +347,7 @@ int MPIIOBackend::writeAtWithContext(
     assert(bytes_written == size && "Remote pwrite must complete full request");
 
     recordWriteEpochForContext(file_id, offset, size, context.Hint);
-    if (!report_freshness_write_commit()) {
+    if (!report_freshness_write_commit(/*writer_rank_override=*/-1)) {
       if (errno == 0)
         errno = EIO;
       return -1;

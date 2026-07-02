@@ -44,7 +44,7 @@ bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
   int opened_handle = -1;
   {
     const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-    const int read_flags = O_RDONLY;
+    const int read_flags = open_flags == O_RDONLY ? O_RDONLY : O_RDWR;
     if (!ompfile::mpp::openOnRank(path.c_str(), read_flags, 0666, target_rank,
                                   opened_handle)) {
       return false;
@@ -77,6 +77,111 @@ bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
   }
 
   remote_handle_out = opened_handle;
+  return true;
+}
+
+bool MPIIOBackend::writeAtRemoteRankWithBytes(
+    int file_id, int target_rank, long offset, const void *data, size_t size,
+    size_t &bytes_written) {
+  bytes_written = 0;
+  if (!mpp_remote_only) {
+    errno = ENOTSUP;
+    return false;
+  }
+  if (target_rank < 0 || offset < 0 || (!data && size > 0)) {
+    errno = EINVAL;
+    return false;
+  }
+  int last_errno = 0;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (attempt > 0) {
+      const std::lock_guard<std::mutex> lock(handle_mutex);
+      auto cache_it = remote_read_handle_cache.find(file_id);
+      if (cache_it != remote_read_handle_cache.end())
+        cache_it->second.erase(target_rank);
+    }
+
+    int remote_handle = -1;
+    if (!getOrCreateRemoteReadHandleForRank(file_id, target_rank,
+                                            remote_handle)) {
+      last_errno = errno;
+      continue;
+    }
+
+    bytes_written = 0;
+    if (writeAtRemoteHandle(remote_handle, offset, data, size,
+                            bytes_written) == 0)
+      return true;
+
+    last_errno = errno;
+    if (last_errno != 0 && last_errno != EBADF)
+      break;
+  }
+
+  errno = last_errno != 0 ? last_errno : EIO;
+  return false;
+}
+
+bool MPIIOBackend::readAtRemoteRankNoStageWithBytes(
+    int file_id, int target_rank, long offset, void *data, size_t size,
+    size_t &bytes_read) {
+  bytes_read = 0;
+  if (!mpp_remote_only) {
+    errno = ENOTSUP;
+    return false;
+  }
+  if (target_rank < 0) {
+    errno = EINVAL;
+    return false;
+  }
+  int last_errno = 0;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (attempt > 0) {
+      const std::lock_guard<std::mutex> lock(handle_mutex);
+      auto cache_it = remote_read_handle_cache.find(file_id);
+      if (cache_it != remote_read_handle_cache.end())
+        cache_it->second.erase(target_rank);
+    }
+
+    int remote_handle = -1;
+    if (!getOrCreateRemoteReadHandleForRank(file_id, target_rank,
+                                            remote_handle)) {
+      last_errno = errno;
+      continue;
+    }
+
+    remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
+    remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
+
+    bytes_read = 0;
+    bool ok = false;
+    {
+      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      ok = ompfile::mpp::preadNoStageEx(remote_handle, offset, data, size,
+                                        bytes_read);
+    }
+    if (ok)
+      goto pread_ok;
+
+    last_errno = errno;
+    if (last_errno != 0 && last_errno != EBADF)
+      break;
+  }
+
+  errno = last_errno != 0 ? last_errno : EIO;
+  return false;
+
+pread_ok:
+  if (bytes_read > size) {
+    errno = EPROTO;
+    return false;
+  }
+  if (bytes_read < size && data) {
+    const size_t short_bytes = size - bytes_read;
+    short_read_count.fetch_add(1, std::memory_order_relaxed);
+    short_read_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
+    std::memset(static_cast<char *>(data) + bytes_read, 0, short_bytes);
+  }
   return true;
 }
 

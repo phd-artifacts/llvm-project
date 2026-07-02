@@ -1722,6 +1722,138 @@ struct ProxyDevice {
     return It->second;
   }
 
+  uint64_t tileFreshnessKeyForPath(uint64_t PathKey, uint64_t TileId) const {
+    if (PathKey == 0)
+      return 0;
+    uint64_t X = PathKey ^ 0x9e3779b97f4a7c15ULL;
+    X ^= TileId + 0x9e3779b97f4a7c15ULL + (X << 6) + (X >> 2);
+    return X != 0 ? X : PathKey;
+  }
+
+  uint64_t configuredStageTileBytes() const {
+    if (uint64_t Bytes = envUint64OrDefault("LIBOMPFILE_STAGE_TILE_BYTES", 0))
+      return Bytes;
+    const uint64_t Nb = envUint64OrDefault("OMPFILE_CHOLESKY_NB", 0);
+    if (Nb == 0 || Nb > (std::numeric_limits<uint64_t>::max() / Nb) ||
+        (Nb * Nb) > (std::numeric_limits<uint64_t>::max() / sizeof(float)))
+      return 0;
+    return Nb * Nb * sizeof(float);
+  }
+
+  bool dirtyOwnerExpectedVersionMatchesRange(
+      const std::string &SourcePath, uint64_t Begin, uint64_t End,
+      uint64_t ExpectedVersion, const OmpFileStageEntry &Entry) {
+    if (ExpectedVersion == 0)
+      return true;
+
+    const uint64_t PathKey =
+        OmpFileHeadnodeManager::computePathKeyForPath(SourcePath);
+    const uint64_t TileBytes = configuredStageTileBytes();
+    if (PathKey != 0 && TileBytes != 0 && End > Begin &&
+        Begin % TileBytes == 0 && End == Begin + TileBytes) {
+      const uint64_t TileId = Begin / TileBytes;
+      const uint64_t CompositeKey = tileFreshnessKeyForPath(PathKey, TileId);
+      const uint64_t LocalVersion =
+          lastLocalFreshnessVersionForPathKey(CompositeKey);
+      if (LocalVersion == ExpectedVersion)
+        return true;
+
+      OmpFileFreshnessQueryRequest Query{};
+      Query.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+      Query.PathKey = CompositeKey;
+      Query.LocalVersion = LocalVersion;
+      Query.RequesterRank = EventSystem.LocalRank;
+      OmpFileFreshnessQueryReply Reply{};
+      if (!freshnessQueryOnHeadnode(Query, Reply) || Reply.Status != 0)
+        return false;
+      const auto Decision =
+          static_cast<OmpFileFreshnessDecision>(Reply.Decision);
+      const bool NamesThisRank =
+          (Decision == OmpFileFreshnessDecision::USE_LOCAL) ||
+          (Decision == OmpFileFreshnessDecision::COPY_FROM_RANK &&
+           Reply.SourceRank == EventSystem.LocalRank);
+      if (!NamesThisRank || Reply.SelectedVersion != ExpectedVersion)
+        return false;
+      rememberWritebackFreshnessCommit(CompositeKey, ExpectedVersion);
+      return true;
+    }
+
+    return Entry.DirtyEpoch == ExpectedVersion;
+  }
+
+  bool completeDerivedTileFlushesOnHeadnode(
+      uint64_t PathKey, const std::vector<OmpFileStageExtent> &Extents,
+      uint64_t TileBytes, const std::string &SourcePath) {
+    if (PathKey == 0 || TileBytes == 0 || Extents.empty())
+      return false;
+
+    for (const OmpFileStageExtent &Extent : Extents) {
+      if (Extent.End <= Extent.Begin || Extent.Begin % TileBytes != 0 ||
+          Extent.End % TileBytes != 0) {
+        errno = ESTALE;
+        return false;
+      }
+      for (uint64_t TileBegin = Extent.Begin; TileBegin < Extent.End;
+           TileBegin += TileBytes) {
+        const uint64_t TileId = TileBegin / TileBytes;
+        const uint64_t CompositeKey = tileFreshnessKeyForPath(PathKey, TileId);
+        if (CompositeKey == 0) {
+          errno = EINVAL;
+          return false;
+        }
+
+        uint64_t CompleteVersion =
+            lastLocalFreshnessVersionForPathKey(CompositeKey);
+        bool Completed = false;
+        if (CompleteVersion != 0) {
+          errno = 0;
+          Completed = completeDirtyFlushOnHeadnode(
+              CompositeKey, EventSystem.LocalRank, CompleteVersion,
+              /*Success=*/true);
+          if (!Completed && errno != ESTALE)
+            return false;
+        }
+        if (!Completed) {
+          OmpFileFreshnessQueryRequest Query{};
+          Query.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+          Query.PathKey = CompositeKey;
+          Query.LocalVersion = CompleteVersion;
+          Query.RequesterRank = EventSystem.LocalRank;
+          OmpFileFreshnessQueryReply Reply{};
+          if (!freshnessQueryOnHeadnode(Query, Reply) || Reply.Status != 0) {
+            errno = Reply.Errno != 0 ? Reply.Errno : (errno != 0 ? errno : EIO);
+            return false;
+          }
+          const auto Decision =
+              static_cast<OmpFileFreshnessDecision>(Reply.Decision);
+          if (Decision == OmpFileFreshnessDecision::READ_PFS)
+            continue;
+          const bool NamesThisRank =
+              (Decision == OmpFileFreshnessDecision::USE_LOCAL) ||
+              (Decision == OmpFileFreshnessDecision::COPY_FROM_RANK &&
+               Reply.SourceRank == EventSystem.LocalRank);
+          if (!NamesThisRank || Reply.SelectedVersion == 0) {
+            errno = ESTALE;
+            return false;
+          }
+          CompleteVersion = Reply.SelectedVersion;
+          rememberWritebackFreshnessCommit(CompositeKey, CompleteVersion);
+          if (!completeDirtyFlushOnHeadnode(CompositeKey, EventSystem.LocalRank,
+                                            CompleteVersion,
+                                            /*Success=*/true))
+            return false;
+        }
+        REPORT("MPIProxyDevice --> OMPFile derived tile dirty flush complete "
+               "rank=%d path=%s tile=%llu key=%llu version=%llu\n",
+               EventSystem.LocalRank, SourcePath.c_str(),
+               static_cast<unsigned long long>(TileId),
+               static_cast<unsigned long long>(CompositeKey),
+               static_cast<unsigned long long>(CompleteVersion));
+      }
+    }
+    return true;
+  }
+
   // Consult the headnode freshness table before serving a staged read from
   // a local stage.  Returns true when it is safe to serve from the local
   // stage (USE_LOCAL: this proxy holds the latest version, including its own
@@ -2135,7 +2267,42 @@ struct ProxyDevice {
         return failDirtyFlush("fdatasync-source", SyncErrno, 0, 0, Epoch);
       }
 
+      bool CompletedViaDerivedTileKeys = false;
       if (Epoch > 0 && !SourcePath.empty()) {
+        const char *DistributeWritesEnv =
+            std::getenv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES");
+        const uint64_t TileBytes = configuredStageTileBytes();
+        if (DistributeWritesEnv && std::strcmp(DistributeWritesEnv, "1") == 0 &&
+            TileBytes > 0) {
+          if (EventSystem.LocalRank != getHeadnodeRank()) {
+            // The close path already copied dirty bytes to the shared source and
+            // fdatasync'd them above.  Avoid sending one metadata-completion
+            // event per dirty tile from every remote proxy during shutdown; that
+            // control-event burst has reproduced MPI internal_Testall aborts on
+            // Sorgan.  Active in-run reads remain protected by the tile oracle;
+            // this deferral only affects end-of-session close metadata.
+            CompletedViaDerivedTileKeys = true;
+            REPORT("MPIProxyDevice --> OMPFile derived tile dirty flush "
+                   "completion deferred rank=%d path=%s tile_bytes=%llu "
+                   "extents=%zu\n",
+                   EventSystem.LocalRank, SourcePath.c_str(),
+                   static_cast<unsigned long long>(TileBytes), Extents.size());
+          } else {
+            errno = 0;
+            CompletedViaDerivedTileKeys = completeDerivedTileFlushesOnHeadnode(
+                PathKey, Extents, TileBytes, SourcePath);
+            if (!CompletedViaDerivedTileKeys) {
+              REPORT("MPIProxyDevice --> OMPFile derived tile dirty flush "
+                     "completion unavailable rank=%d errno=%d path=%s "
+                     "tile_bytes=%llu; falling back to path-key completion\n",
+                     EventSystem.LocalRank, errno, SourcePath.c_str(),
+                     static_cast<unsigned long long>(TileBytes));
+            }
+          }
+        }
+      }
+
+      if (Epoch > 0 && !SourcePath.empty() && !CompletedViaDerivedTileKeys) {
         errno = 0;
         if (PathKey == 0 ||
             !completeDirtyFlushOnHeadnode(PathKey, EventSystem.LocalRank,
@@ -2500,6 +2667,15 @@ struct ProxyDevice {
             InvalidatedBytes += (Extent.End - Extent.Begin);
         }
       }
+      if (isWritebackStageEnabled() &&
+          (Entry->DirtyBytes > 0 || !Entry->DirtyExtents.empty())) {
+        traceOmpFile("preserving dirty write-back stage during full "
+                     "invalidation path=%s dirty_bytes=%llu extents=%zu\n",
+                     SourcePath.c_str(),
+                     static_cast<unsigned long long>(Entry->DirtyBytes),
+                     Entry->DirtyExtents.size());
+        return;
+      }
       if (Entry->DirtyBytes > 0) {
         OmpFileStatsStageDirtyBytes.fetch_sub(Entry->DirtyBytes,
                                               std::memory_order_relaxed);
@@ -2595,6 +2771,17 @@ struct ProxyDevice {
     if (InvalidatedBytes == 0)
       return;
 
+    if (isWritebackStageEnabled() &&
+        (Entry->DirtyBytes > 0 || !Entry->DirtyExtents.empty())) {
+      traceOmpFile("preserving dirty write-back stage during range "
+                   "invalidation path=%s offset=%llu size=%llu dirty_bytes=%llu "
+                   "extents=%zu\n",
+                   SourcePath.c_str(), static_cast<unsigned long long>(Offset),
+                   static_cast<unsigned long long>(Size),
+                   static_cast<unsigned long long>(Entry->DirtyBytes),
+                   Entry->DirtyExtents.size());
+      return;
+    }
     Entry->Invalidated = true;
     if (Entry->DirtyBytes > 0) {
       OmpFileStatsStageDirtyBytes.fetch_sub(Entry->DirtyBytes,
@@ -2922,7 +3109,8 @@ struct ProxyDevice {
       ErrnoOut = ESTALE;
       return false;
     }
-    if (ExpectedVersion != 0 && Entry->DirtyEpoch != ExpectedVersion) {
+    if (!dirtyOwnerExpectedVersionMatchesRange(SourcePath, Begin, End,
+                                               ExpectedVersion, *Entry)) {
       ErrnoOut = ESTALE;
       return false;
     }
@@ -2970,6 +3158,79 @@ struct ProxyDevice {
       OmpFileStatsStagedReadHits.fetch_add(1, std::memory_order_relaxed);
       OmpFileStatsStagedReadBytes.fetch_add(Bytes, std::memory_order_relaxed);
     }
+    return true;
+  }
+
+  // Metadata-only classifier for dirty-owner routing. State values:
+  //   1 = requested range is fully covered by dirty staged bytes
+  //   0 = no dirty overlap for this range; normal source/PFS route may be clean
+  //  -1 = unknown/unsafe; caller must fail closed to owner-staged handling
+  bool queryDirtyOwnerStageRangeOnly(int Fd, int64_t Offset, uint64_t Size,
+                                     uint64_t ExpectedVersion, int &StateOut,
+                                     int &ErrnoOut) {
+    StateOut = -1;
+    ErrnoOut = 0;
+    if (Offset < 0) {
+      ErrnoOut = EINVAL;
+      return false;
+    }
+    if (Size == 0) {
+      StateOut = 0;
+      return true;
+    }
+    if (!isWritebackStageEnabled() || !isReadthroughStageEnabled()) {
+      StateOut = 0;
+      return true;
+    }
+
+    std::string SourcePath;
+    if (!getTrackedOmpFileFdPath(Fd, SourcePath)) {
+      ErrnoOut = EBADF;
+      return false;
+    }
+
+    std::shared_ptr<OmpFileStageEntry> Entry;
+    {
+      const std::lock_guard<std::mutex> StageLock(OmpFileStageMutex);
+      auto It = OmpFileStageEntries.find(SourcePath);
+      if (It == OmpFileStageEntries.end() || !It->second) {
+        StateOut = 0;
+        return true;
+      }
+      Entry = It->second;
+    }
+
+    const uint64_t Begin = static_cast<uint64_t>(Offset);
+    const uint64_t End = saturatingAdd(Begin, Size);
+    std::unique_lock<std::mutex> EntryLock(Entry->Mutex);
+    if (Entry->Invalidated) {
+      ErrnoOut = ESTALE;
+      return false;
+    }
+    if (!dirtyOwnerExpectedVersionMatchesRange(SourcePath, Begin, End,
+                                               ExpectedVersion, *Entry)) {
+      ErrnoOut = ESTALE;
+      return false;
+    }
+    if (Entry->DirtyBytes == 0 || Entry->DirtyExtents.empty()) {
+      StateOut = 0;
+      return true;
+    }
+    if (!overlapsAnyExtent(Entry->DirtyExtents, Begin, End)) {
+      StateOut = 0;
+      return true;
+    }
+    if (!isCoveredByExtents(Entry->DirtyExtents, Begin, End)) {
+      ErrnoOut = ESTALE;
+      return false;
+    }
+    const bool Covered = Entry->FullyPopulated ||
+                         isCoveredByExtents(Entry->CoveredExtents, Begin, End);
+    if (!Covered) {
+      ErrnoOut = ESTALE;
+      return false;
+    }
+    StateOut = 1;
     return true;
   }
 
@@ -3155,6 +3416,15 @@ struct ProxyDevice {
       }
 
       rememberWritebackFreshnessCommit(PathKey, CommittedVersion);
+      if (const uint64_t TileBytes = configuredStageTileBytes()) {
+        const uint64_t Begin = static_cast<uint64_t>(Offset);
+        const uint64_t End = saturatingAdd(Begin, Size);
+        if (Size > 0 && Begin % TileBytes == 0 && End == Begin + TileBytes) {
+          const uint64_t TileId = Begin / TileBytes;
+          const uint64_t CompositeKey = tileFreshnessKeyForPath(PathKey, TileId);
+          rememberWritebackFreshnessCommit(CompositeKey, CommittedVersion);
+        }
+      }
 
       uint64_t DirtyBytes = 0;
       {
@@ -3923,6 +4193,40 @@ struct ProxyDevice {
                  Fd, static_cast<long long>(Offset),
                  static_cast<unsigned long long>(Size), Ret, Errno,
                  static_cast<unsigned long long>(PayloadSize),
+                 static_cast<unsigned long long>(ExpectedVersion));
+
+    RequestManager.send(nullptr, 0, MPI_BYTE);
+    co_return (co_await RequestManager);
+  }
+
+  EventTy ompfileDirtyOwnerQuery(MPIRequestManagerTy RequestManager) {
+    int Fd = -1;
+    int64_t Offset = 0;
+    uint64_t Size = 0;
+    uint64_t ExpectedVersion = 0;
+
+    RequestManager.receive(&Fd, 1, MPI_INT);
+    RequestManager.receive(&Offset, 1, MPI_INT64_T);
+    RequestManager.receive(&Size, 1, MPI_UINT64_T);
+    RequestManager.receive(&ExpectedVersion, 1, MPI_UINT64_T);
+
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    int Errno = 0;
+    int State = -1;
+    const bool Ok = queryDirtyOwnerStageRangeOnly(Fd, Offset, Size,
+                                                  ExpectedVersion, State,
+                                                  Errno);
+    int Ret = Ok ? 0 : -1;
+
+    RequestManager.send(&Ret, 1, MPI_INT);
+    RequestManager.send(&Errno, 1, MPI_INT);
+    RequestManager.send(&State, 1, MPI_INT);
+    traceOmpFile("event ompfileDirtyOwnerQuery fd=%d offset=%lld size=%llu "
+                 "ret=%d errno=%d state=%d expected_version=%llu\n",
+                 Fd, static_cast<long long>(Offset),
+                 static_cast<unsigned long long>(Size), Ret, Errno, State,
                  static_cast<unsigned long long>(ExpectedVersion));
 
     RequestManager.send(nullptr, 0, MPI_BYTE);
@@ -5068,6 +5372,25 @@ struct ProxyDevice {
       errno = EINVAL;
       return OFFLOAD_FAIL;
     }
+    if (SourceRank == EventSystem.LocalRank) {
+      int LocalErrno = 0;
+      uint64_t LocalBytes = 0;
+      if (!preadDirtyOwnerStageOnly(Entry.RemoteHandle, Offset, Buffer, Size,
+                                    ExpectedVersion, &LocalBytes,
+                                    LocalErrno)) {
+        errno = LocalErrno != 0 ? LocalErrno : EIO;
+        return OFFLOAD_FAIL;
+      }
+      if (LocalBytes > Size) {
+        errno = EPROTO;
+        return OFFLOAD_FAIL;
+      }
+      if (LocalBytes < Size)
+        std::memset(static_cast<char *>(Buffer) + LocalBytes, 0,
+                    static_cast<size_t>(Size - LocalBytes));
+      *BytesRead = LocalBytes;
+      return OFFLOAD_SUCCESS;
+    }
 
     int IoRet = -1;
     int RemoteErrno = 0;
@@ -5091,6 +5414,50 @@ struct ProxyDevice {
       std::memset(static_cast<char *>(Buffer) + Bytes, 0,
                   static_cast<size_t>(Size - Bytes));
     *BytesRead = Bytes;
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppDirtyOwnerQueryEx(int Handle, int SourceRank,
+                           uint64_t ExpectedVersion, int64_t Offset,
+                           uint64_t Size, int *StateOut) {
+    if (!StateOut || SourceRank < 0)
+      return OFFLOAD_FAIL;
+    *StateOut = -1;
+    OmpFileHandleEntry Entry{};
+    if (!findRemoteHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+    if (Entry.Rank != SourceRank) {
+      errno = EINVAL;
+      return OFFLOAD_FAIL;
+    }
+    if (SourceRank == EventSystem.LocalRank) {
+      int LocalErrno = 0;
+      int LocalState = -1;
+      if (!queryDirtyOwnerStageRangeOnly(Entry.RemoteHandle, Offset, Size,
+                                         ExpectedVersion, LocalState,
+                                         LocalErrno)) {
+        errno = LocalErrno != 0 ? LocalErrno : EIO;
+        return OFFLOAD_FAIL;
+      }
+      *StateOut = LocalState;
+      return OFFLOAD_SUCCESS;
+    }
+
+    int IoRet = -1;
+    int RemoteErrno = 0;
+    int State = -1;
+    EventTy Event = createRankEvent(
+        OriginEvents::ompfileDirtyOwnerQuery,
+        EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY, SourceRank,
+        /*TargetDeviceId=*/0, Entry.RemoteHandle, Offset, Size,
+        ExpectedVersion, &IoRet, &RemoteErrno, &State);
+    if (!waitForEvent(Event, "dirty_owner_query"))
+      return OFFLOAD_FAIL;
+    if (IoRet != 0) {
+      errno = RemoteErrno;
+      return OFFLOAD_FAIL;
+    }
+    *StateOut = State;
     return OFFLOAD_SUCCESS;
   }
 
@@ -5209,6 +5576,8 @@ struct ProxyDevice {
                                         WriteThroughMode != 0, Committed)) {
       return errno != 0 ? errno : EIO;
     }
+    if (PathKey != 0 && Committed != 0 && WriterRank == EventSystem.LocalRank)
+      rememberWritebackFreshnessCommit(PathKey, Committed);
     *CommittedVersion = Committed;
     return OFFLOAD_SUCCESS;
   }
@@ -5730,6 +6099,9 @@ struct ProxyDevice {
       case OMPFILE_DIRTY_OWNER_PREAD:
         NewEvent = ompfileDirtyOwnerPread(std::move(RequestManager));
         break;
+      case OMPFILE_DIRTY_OWNER_QUERY:
+        NewEvent = ompfileDirtyOwnerQuery(std::move(RequestManager));
+        break;
       case OMPFILE_PWRITE:
         NewEvent = ompfilePwrite(std::move(RequestManager));
         break;
@@ -6037,6 +6409,16 @@ int ompfile_mpp_dirty_owner_pread_ex(int Handle, int SourceRank,
     return OFFLOAD_FAIL;
   return PD->mppDirtyOwnerPreadEx(Handle, SourceRank, ExpectedVersion, Offset,
                                   Buffer, Size, BytesRead);
+}
+
+int ompfile_mpp_dirty_owner_query_ex(int Handle, int SourceRank,
+                                     uint64_t ExpectedVersion, int64_t Offset,
+                                     uint64_t Size, int *StateOut) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppDirtyOwnerQueryEx(Handle, SourceRank, ExpectedVersion, Offset,
+                                  Size, StateOut);
 }
 
 int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,

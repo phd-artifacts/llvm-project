@@ -86,6 +86,8 @@ private:
   mutable std::atomic<bool> strict_failure_logged{false};
   bool writable_read_rebalance_enabled = false;
   bool dirty_owner_forwarding_enabled = false;
+  bool dirty_clean_pfs_rebalance_enabled = false;
+  bool dirty_clean_pfs_allow_clean_pfs_enabled = false;
   bool stage_global_invalidation_enabled = false;
   TwoPhasePolicy two_phase_policy = TwoPhasePolicy::Disabled;
   bool two_phase_enabled = false;
@@ -689,6 +691,12 @@ private:
   bool readAtRemoteRankWithBytes(int file_id, int target_rank, long offset,
                                  void *data, size_t size,
                                  size_t &bytes_read);
+  bool readAtRemoteRankNoStageWithBytes(int file_id, int target_rank,
+                                        long offset, void *data, size_t size,
+                                        size_t &bytes_read);
+  bool writeAtRemoteRankWithBytes(int file_id, int target_rank, long offset,
+                                  const void *data, size_t size,
+                                  size_t &bytes_written);
   bool readAtSourceStageAffinityRankWithBytes(
       int file_id, uint64_t path_key, const ompfile::OmpFileIOHint &hint,
       long offset, void *data, size_t size, size_t &bytes_read,

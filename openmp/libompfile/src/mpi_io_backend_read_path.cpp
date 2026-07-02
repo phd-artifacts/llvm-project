@@ -2,6 +2,7 @@
 #include "mpi_io_backend.h"
 #include "mpp_shim.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstdlib>
@@ -22,6 +23,56 @@ bool scalarPlannedReadRebalanceEnabledForStage() {
   return envEquals("LIBOMPFILE_STAGE_MODE", "readthrough") &&
          envEquals("LIBOMPFILE_STAGE_WRITE_MODE", "write-back") &&
          !envEquals("LIBOMPFILE_STAGE_FRESHNESS_GUARD", "0");
+}
+
+bool writebackCoherenceReadsRequireScalarOracle() {
+  return scalarPlannedReadRebalanceEnabledForStage() &&
+         envEquals("LIBOMPFILE_OPT_DIRTY_OWNER_FORWARDING", "1");
+}
+
+bool distributedWritebackRoutingEnabled() {
+  return envEquals("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES", "1");
+}
+
+unsigned parsePositiveEnv(const char *Name) {
+  const char *Value = std::getenv(Name);
+  if (!Value || Value[0] == '\0')
+    return 0;
+  char *End = nullptr;
+  errno = 0;
+  const unsigned long Parsed = std::strtoul(Value, &End, 10);
+  if (errno != 0 || End == Value || (End && *End != '\0') || Parsed == 0 ||
+      Parsed > static_cast<unsigned long>(std::numeric_limits<unsigned>::max()))
+    return 0;
+  return static_cast<unsigned>(Parsed);
+}
+
+unsigned distributedWritebackRankCount() {
+  if (const unsigned Explicit =
+          parsePositiveEnv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS"))
+    return Explicit;
+  if (const unsigned Workers = parsePositiveEnv("OMPFILE_CHOLESKY_WORKER_NODES"))
+    return Workers;
+  if (const unsigned Targets = parsePositiveEnv("OMPFILE_CHOLESKY_TARGET_REGIONS"))
+    return Targets;
+  return 0;
+}
+
+int rankForDistributedWriteKey(uint64_t Key) {
+  const unsigned Ranks = distributedWritebackRankCount();
+  if (Ranks <= 1)
+    return -1;
+  return static_cast<int>(Key % Ranks);
+}
+
+uint64_t tileFreshnessKey(uint64_t PathKey,
+                          const ompfile::OmpFileIOHint &Hint) {
+  if (PathKey == 0 ||
+      (Hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) == 0)
+    return PathKey;
+  uint64_t X = PathKey ^ 0x9e3779b97f4a7c15ULL;
+  X ^= Hint.TileId + 0x9e3779b97f4a7c15ULL + (X << 6) + (X >> 2);
+  return X != 0 ? X : PathKey;
 }
 
 struct FreshnessRouteDecision {
@@ -119,16 +170,25 @@ int MPIIOBackend::readAtWithContext(
   io_log("Reading %zu bytes from file %d at offset %lld\n", size, file_id,
          static_cast<long long>(offset));
 
-  if (isTwoPhaseActive())
+  const bool require_scalar_oracle =
+      writebackCoherenceReadsRequireScalarOracle() && hasUsablePlannedRead(context);
+  if (isTwoPhaseActive() && !require_scalar_oracle)
     return readAtTwoPhase(context, data, size);
+  if (isTwoPhaseActive() && require_scalar_oracle) {
+    io_log("Two-phase read bypassed for write-back coherence oracle: "
+           "request_id=%llu file=%d offset=%lld size=%zu\n",
+           static_cast<unsigned long long>(context.RequestId), file_id,
+           static_cast<long long>(offset), size);
+  }
 
   if (hasUsablePlannedRead(context)) {
     if (context.Plan.AggregatorRank >= 0 && mpp_remote_only &&
         scalarPlannedReadRebalanceEnabledForStage()) {
       const char *rebalance_reason = "none";
       int rebalance_errno = 0;
+      const uint64_t FreshnessPathKey = tileFreshnessKey(context.PathKey, context.Hint);
       const FreshnessRouteDecision InitialFreshnessRoute =
-          queryFreshnessForRank(context.PathKey, context.Plan.AggregatorRank);
+          queryFreshnessForRank(FreshnessPathKey, context.Plan.AggregatorRank);
       bool has_local_write_history = false;
       {
         const std::lock_guard<std::mutex> lock(handle_mutex);
@@ -140,18 +200,326 @@ int MPIIOBackend::readAtWithContext(
       const bool file_has_writeback_epoch =
           InitialFreshnessRoute.Valid &&
           InitialFreshnessRoute.SelectedVersion != 0;
+      if (dirty_owner_forwarding_enabled && InitialFreshnessRoute.Valid &&
+          InitialFreshnessRoute.Decision ==
+              ompfile::OmpFileFreshnessDecision::READ_PFS) {
+        size_t pfs_bytes_read = 0;
+        if (readAtRemoteRankNoStageWithBytes(file_id,
+                                             context.Plan.AggregatorRank,
+                                             offset, data, size,
+                                             pfs_bytes_read)) {
+          noteAppliedRebalancedReadForFile(file_id);
+          io_log("Phase 1 global-oracle pfs read: request_id=%llu file=%d "
+                 "aggregator_rank=%d offset=%lld size=%zu tile=%llu "
+                 "version=%llu bytes=%zu\n",
+                 static_cast<unsigned long long>(context.RequestId), file_id,
+                 context.Plan.AggregatorRank, static_cast<long long>(offset),
+                 size, static_cast<unsigned long long>(context.Hint.TileId),
+                 static_cast<unsigned long long>(
+                     InitialFreshnessRoute.SelectedVersion),
+                 pfs_bytes_read);
+          return 0;
+        }
+        io_log("Phase 1 global-oracle pfs read failed: request_id=%llu "
+               "file=%d aggregator_rank=%d errno=%d; fail-closed.\n",
+               static_cast<unsigned long long>(context.RequestId), file_id,
+               context.Plan.AggregatorRank, errno);
+        errno = errno != 0 ? errno : EIO;
+        return -1;
+      }
       if (dirty_owner_forwarding_enabled &&
           (has_local_write_history || file_has_writeback_epoch)) {
         constexpr int ConservativeWritebackOwnerRank = 0;
+        const bool freshness_has_source_rank =
+            InitialFreshnessRoute.Valid &&
+            InitialFreshnessRoute.Decision ==
+                ompfile::OmpFileFreshnessDecision::COPY_FROM_RANK &&
+            InitialFreshnessRoute.SourceRank >= 0;
+        int DirtySourceRank = freshness_has_source_rank
+                                  ? InitialFreshnessRoute.SourceRank
+                                  : ConservativeWritebackOwnerRank;
+        bool has_range_writeback_owner = false;
+        if (distributedWritebackRoutingEnabled() &&
+            (context.Hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0) {
+          const int tile_owner_rank = rankForDistributedWriteKey(context.Hint.TileId);
+          if (tile_owner_rank >= 0) {
+            DirtySourceRank = tile_owner_rank;
+            has_range_writeback_owner = true;
+          }
+        }
+        if (distributedWritebackRoutingEnabled() && !has_range_writeback_owner &&
+            !freshness_has_source_rank) {
+          uint64_t latest_sequence = 0;
+          int range_owner_rank = -1;
+          const long read_end =
+              (size <= static_cast<size_t>(std::numeric_limits<long>::max()) &&
+               offset <= std::numeric_limits<long>::max() -
+                             static_cast<long>(size))
+                  ? offset + static_cast<long>(size)
+                  : offset;
+          const std::lock_guard<std::mutex> lock(handle_mutex);
+          auto write_it = file_write_epoch_history.find(file_id);
+          if (write_it != file_write_epoch_history.end() && read_end > offset) {
+            for (const WriteEpochEntry &entry : write_it->second) {
+              if (!rangesOverlap(offset, read_end, entry.Start, entry.End))
+                continue;
+              const uint64_t key = entry.HasTile
+                                       ? entry.TileId
+                                       : static_cast<uint64_t>(entry.Start /
+                                             std::max<long>(1, entry.End - entry.Start));
+              const int candidate_rank = rankForDistributedWriteKey(key);
+              if (candidate_rank >= 0 && entry.Sequence >= latest_sequence) {
+                latest_sequence = entry.Sequence;
+                range_owner_rank = candidate_rank;
+              }
+            }
+          }
+          if (range_owner_rank >= 0) {
+            DirtySourceRank = range_owner_rank;
+            has_range_writeback_owner = true;
+          } else {
+            DirtySourceRank = ConservativeWritebackOwnerRank;
+          }
+        }
+        const uint64_t DirtyExpectedVersion =
+            (InitialFreshnessRoute.Valid &&
+             InitialFreshnessRoute.SelectedVersion != 0)
+                ? InitialFreshnessRoute.SelectedVersion
+                : 0;
+        bool dirty_source_known_clean = false;
+        bool dirty_source_unknown = false;
+        if (dirty_clean_pfs_rebalance_enabled &&
+            context.Plan.AggregatorRank != DirtySourceRank) {
+          io_log("Phase 1 dirty-worker oracle candidate: request_id=%llu "
+                 "file=%d aggregator_rank=%d source_rank=%d version=%llu "
+                 "local_write_history=%d file_writeback_epoch=%d\n",
+                 static_cast<unsigned long long>(context.RequestId), file_id,
+                 context.Plan.AggregatorRank, DirtySourceRank,
+                 static_cast<unsigned long long>(
+                     InitialFreshnessRoute.SelectedVersion),
+                 static_cast<int>(has_local_write_history),
+                 static_cast<int>(file_has_writeback_epoch));
+          int remote_handle = -1;
+          if (getOrCreateRemoteReadHandleForRank(file_id, DirtySourceRank,
+                                                 remote_handle) &&
+              remote_handle >= 0) {
+            dirty_owner_forward_attempt_count.fetch_add(
+                1, std::memory_order_relaxed);
+            int oracle_state = -1;
+            int oracle_errno = 0;
+            bool oracle_ok = false;
+            {
+              const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+              errno = 0;
+              oracle_ok = ompfile::mpp::dirtyOwnerQueryEx(
+                  remote_handle, DirtySourceRank, DirtyExpectedVersion, offset,
+                  size, oracle_state);
+              oracle_errno = errno;
+            }
+            if (oracle_ok && oracle_state == 1) {
+              size_t dirty_source_bytes_read = 0;
+              bool dirty_source_read_ok = false;
+              int dirty_source_read_errno = 0;
+              {
+                const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+                errno = 0;
+                dirty_source_read_ok = ompfile::mpp::dirtyOwnerPreadEx(
+                    remote_handle, DirtySourceRank, DirtyExpectedVersion,
+                    offset, data, size, dirty_source_bytes_read);
+                dirty_source_read_errno = errno;
+              }
+              if (dirty_source_read_ok) {
+                dirty_owner_forward_success_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                dirty_owner_forward_bytes_total.fetch_add(
+                    dirty_source_bytes_read, std::memory_order_relaxed);
+                remote_pread_event_count.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                remote_pread_bytes_total.fetch_add(size,
+                                                   std::memory_order_relaxed);
+                noteAppliedRebalancedReadForFile(file_id);
+                io_log("Phase 1 dirty-worker staged read: request_id=%llu "
+                       "file=%d aggregator_rank=%d source_rank=%d "
+                       "version=%llu bytes=%zu\n",
+                       static_cast<unsigned long long>(context.RequestId),
+                       file_id, context.Plan.AggregatorRank, DirtySourceRank,
+                       static_cast<unsigned long long>(
+                           InitialFreshnessRoute.SelectedVersion),
+                       dirty_source_bytes_read);
+                return 0;
+              }
+              dirty_source_unknown = true;
+              errno = dirty_source_read_errno != 0 ? dirty_source_read_errno
+                                                   : EIO;
+              io_log("Phase 1 dirty-worker staged read failed: request_id=%llu "
+                     "file=%d aggregator_rank=%d source_rank=%d offset=%lld "
+                     "size=%zu tile=%llu errno=%d; falling back.\n",
+                     static_cast<unsigned long long>(context.RequestId), file_id,
+                     context.Plan.AggregatorRank, DirtySourceRank,
+                     static_cast<long long>(offset), size,
+                     static_cast<unsigned long long>(context.Hint.TileId),
+                     errno);
+            } else if (oracle_ok && oracle_state == 0) {
+              dirty_source_known_clean = true;
+              dirty_owner_forward_failure_count.fetch_add(
+                  1, std::memory_order_relaxed);
+              if (dirty_clean_pfs_allow_clean_pfs_enabled) {
+                size_t clean_bytes_read = 0;
+                if (readAtRemoteRankNoStageWithBytes(
+                        file_id, context.Plan.AggregatorRank, offset, data,
+                        size, clean_bytes_read)) {
+                  noteAppliedRebalancedReadForFile(file_id);
+                  io_log("Phase 1 dirty-clean pfs rebalanced: request_id=%llu "
+                         "file=%d aggregator_rank=%d source_rank=%d "
+                         "version=%llu bytes=%zu\n",
+                         static_cast<unsigned long long>(context.RequestId),
+                         file_id, context.Plan.AggregatorRank, DirtySourceRank,
+                         static_cast<unsigned long long>(
+                             InitialFreshnessRoute.SelectedVersion),
+                         clean_bytes_read);
+                  return 0;
+                }
+                io_log("Phase 1 dirty-clean pfs rebalanced failed: "
+                       "request_id=%llu file=%d aggregator_rank=%d errno=%d; "
+                       "falling back to owner-staged read.\n",
+                       static_cast<unsigned long long>(context.RequestId),
+                       file_id, context.Plan.AggregatorRank, errno);
+              } else {
+                io_log("Phase 1 dirty-clean pfs rebalanced disabled: "
+                       "request_id=%llu file=%d aggregator_rank=%d "
+                       "source_rank=%d offset=%lld size=%zu tile=%llu "
+                       "version=%llu; falling back for clean-oracle range.\n",
+                       static_cast<unsigned long long>(context.RequestId),
+                       file_id, context.Plan.AggregatorRank, DirtySourceRank,
+                       static_cast<long long>(offset), size,
+                       static_cast<unsigned long long>(context.Hint.TileId),
+                       static_cast<unsigned long long>(
+                           InitialFreshnessRoute.SelectedVersion));
+              }
+            } else {
+              dirty_source_unknown = true;
+              dirty_owner_forward_failure_count.fetch_add(
+                  1, std::memory_order_relaxed);
+              io_log("Phase 1 dirty-worker oracle unavailable: request_id=%llu "
+                     "file=%d aggregator_rank=%d source_rank=%d offset=%lld "
+                     "size=%zu tile=%llu version=%llu state=%d errno=%d; "
+                     "falling back.\n",
+                     static_cast<unsigned long long>(context.RequestId),
+                     file_id, context.Plan.AggregatorRank, DirtySourceRank,
+                     static_cast<long long>(offset), size,
+                     static_cast<unsigned long long>(context.Hint.TileId),
+                     static_cast<unsigned long long>(
+                         InitialFreshnessRoute.SelectedVersion),
+                     oracle_state, oracle_errno);
+            }
+          } else {
+            dirty_source_unknown = true;
+            io_log("Phase 1 dirty-worker oracle skipped: request_id=%llu "
+                   "file=%d aggregator_rank=%d source_rank=%d reason=no-handle\n",
+                   static_cast<unsigned long long>(context.RequestId), file_id,
+                   context.Plan.AggregatorRank, DirtySourceRank);
+          }
+        } else if (dirty_clean_pfs_rebalance_enabled) {
+          io_log("Phase 1 dirty-worker oracle skipped: request_id=%llu file=%d "
+                 "aggregator_rank=%d source_rank=%d reason=source-rank\n",
+                 static_cast<unsigned long long>(context.RequestId), file_id,
+                 context.Plan.AggregatorRank, DirtySourceRank);
+        }
+        if (distributedWritebackRoutingEnabled() &&
+            DirtySourceRank == context.Plan.AggregatorRank) {
+          int local_remote_handle = -1;
+          if (!getOrCreateRemoteReadHandleForRank(file_id, DirtySourceRank,
+                                                  local_remote_handle) ||
+              local_remote_handle < 0) {
+            io_log("Phase 1 dirty-worker local staged read missing handle: "
+                   "request_id=%llu file=%d aggregator_rank=%d source_rank=%d; "
+                   "fail-closed.\n",
+                   static_cast<unsigned long long>(context.RequestId), file_id,
+                   context.Plan.AggregatorRank, DirtySourceRank);
+            errno = ENOKEY;
+            return -1;
+          }
+          size_t local_dirty_bytes_read = 0;
+          bool local_dirty_read_ok = false;
+          int local_dirty_read_errno = 0;
+          {
+            const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+            errno = 0;
+            local_dirty_read_ok = ompfile::mpp::dirtyOwnerPreadEx(
+                local_remote_handle, DirtySourceRank, DirtyExpectedVersion,
+                offset, data, size, local_dirty_bytes_read);
+            local_dirty_read_errno = errno;
+          }
+          if (local_dirty_read_ok) {
+            dirty_owner_forward_success_count.fetch_add(
+                1, std::memory_order_relaxed);
+            dirty_owner_forward_bytes_total.fetch_add(
+                local_dirty_bytes_read, std::memory_order_relaxed);
+            remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
+            remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
+            noteAppliedRebalancedReadForFile(file_id);
+            io_log("Phase 1 dirty-worker local staged read: request_id=%llu "
+                   "file=%d aggregator_rank=%d source_rank=%d version=%llu "
+                   "bytes=%zu\n",
+                   static_cast<unsigned long long>(context.RequestId), file_id,
+                   context.Plan.AggregatorRank, DirtySourceRank,
+                   static_cast<unsigned long long>(
+                       InitialFreshnessRoute.SelectedVersion),
+                   local_dirty_bytes_read);
+            return 0;
+          }
+          errno = local_dirty_read_errno != 0 ? local_dirty_read_errno : EIO;
+          io_log("Phase 1 dirty-worker local staged read failed: "
+                 "request_id=%llu file=%d aggregator_rank=%d source_rank=%d "
+                 "version=%llu errno=%d; fail-closed.\n",
+                 static_cast<unsigned long long>(context.RequestId), file_id,
+                 context.Plan.AggregatorRank, DirtySourceRank,
+                 static_cast<unsigned long long>(DirtyExpectedVersion), errno);
+          return -1;
+        }
+
+        if (distributedWritebackRoutingEnabled() && dirty_source_known_clean &&
+            !dirty_source_unknown) {
+          io_log("Phase 1 dirty-worker source-clean pfs disabled: "
+                 "request_id=%llu file=%d aggregator_rank=%d source_rank=%d "
+                 "offset=%lld size=%zu tile=%llu version=%llu; fail-closed.\n",
+                 static_cast<unsigned long long>(context.RequestId), file_id,
+                 context.Plan.AggregatorRank, DirtySourceRank,
+                 static_cast<long long>(offset), size,
+                 static_cast<unsigned long long>(context.Hint.TileId),
+                 static_cast<unsigned long long>(
+                     InitialFreshnessRoute.SelectedVersion));
+          errno = ESTALE;
+          return -1;
+        }
+
+        if (distributedWritebackRoutingEnabled()) {
+          io_log("Phase 1 dirty-worker distributed fallback refused: "
+                 "request_id=%llu file=%d aggregator_rank=%d source_rank=%d "
+                 "offset=%lld size=%zu tile=%llu version=%llu clean=%d "
+                 "unknown=%d; fail-closed.\n",
+                 static_cast<unsigned long long>(context.RequestId), file_id,
+                 context.Plan.AggregatorRank, DirtySourceRank,
+                 static_cast<long long>(offset), size,
+                 static_cast<unsigned long long>(context.Hint.TileId),
+                 static_cast<unsigned long long>(
+                     InitialFreshnessRoute.SelectedVersion),
+                 static_cast<int>(dirty_source_known_clean),
+                 static_cast<int>(dirty_source_unknown));
+          errno = ESTALE;
+          return -1;
+        }
+
+        const int ConservativeReadSourceRank = ConservativeWritebackOwnerRank;
         size_t source_bytes_read = 0;
-        if (readAtRemoteRankWithBytes(file_id, ConservativeWritebackOwnerRank,
+        if (readAtRemoteRankWithBytes(file_id, ConservativeReadSourceRank,
                                       offset, data, size, source_bytes_read)) {
           noteAppliedRebalancedReadForFile(file_id);
           io_log("Phase 1 write-back owner-staged read: request_id=%llu "
                  "file=%d aggregator_rank=%d source_rank=%d version=%llu "
                  "bytes=%zu local_write_history=%d file_writeback_epoch=%d\n",
                  static_cast<unsigned long long>(context.RequestId), file_id,
-                 context.Plan.AggregatorRank, ConservativeWritebackOwnerRank,
+                 context.Plan.AggregatorRank, ConservativeReadSourceRank,
                  static_cast<unsigned long long>(
                      InitialFreshnessRoute.SelectedVersion),
                  source_bytes_read, static_cast<int>(has_local_write_history),

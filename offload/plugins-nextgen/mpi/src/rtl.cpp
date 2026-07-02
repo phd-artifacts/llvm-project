@@ -2134,6 +2134,56 @@ int ompfile_mpp_freshness_query(const OmpFileFreshnessQueryRequest *Request,
   return OFFLOAD_SUCCESS;
 }
 
+int ompfile_mpp_dirty_owner_query_ex(int Handle, int SourceRank,
+                                     uint64_t ExpectedVersion, int64_t Offset,
+                                     uint64_t Size, int *StateOut) {
+  using namespace llvm::omp::target::plugin;
+  if (!StateOut || SourceRank < 0)
+    return OFFLOAD_FAIL;
+  *StateOut = -1;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  OmpfileMppHandleEntry Entry{};
+  {
+    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+    if (!findOmpfileMppHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+  }
+
+  if (Entry.Rank != SourceRank) {
+    errno = EINVAL;
+    return OFFLOAD_FAIL;
+  }
+
+  int IoRet = -1;
+  int RemoteErrno = 0;
+  int State = -1;
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfileDirtyOwnerQuery,
+      EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY,
+      /*DstDeviceID=*/SourceRank, Entry.RemoteHandle, Offset, Size,
+      ExpectedVersion, &IoRet, &RemoteErrno, &State);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+
+  Event.wait();
+  if (auto Error = Event.getError())
+    return OFFLOAD_FAIL;
+  if (IoRet != 0) {
+    errno = RemoteErrno;
+    return OFFLOAD_FAIL;
+  }
+  *StateOut = State;
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_freshness_write_commit(uint64_t PathKey, int WriterRank,
                                        uint64_t TileId, int WriteThroughMode,
                                        uint64_t *CommittedVersion) {
