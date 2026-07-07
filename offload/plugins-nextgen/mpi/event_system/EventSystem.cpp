@@ -452,7 +452,7 @@ EventTy MPIRequestManagerTy::wait() {
   if (Requests.empty())
     co_return llvm::Error::success();
 
-  int RequestsCompleted = false;
+  size_t CompletedRequests = 0;
   uint64_t PollIterations = 0;
   ompfileTrace("MPIRequestManagerTy::wait enter this=%p req_count=%zu "
                "other_rank=%d tag=%d event_type=%d\n",
@@ -460,28 +460,31 @@ EventTy MPIRequestManagerTy::wait() {
                EventType);
   traceRequestSample(Requests);
 
-  while (!RequestsCompleted) {
+  while (CompletedRequests < Requests.size()) {
     ++PollIterations;
     if (ompfileTraceEnabled() &&
         (PollIterations <= 3 || (PollIterations % 1024) == 0)) {
       ompfileTrace("MPIRequestManagerTy::wait poll this=%p iter=%llu "
-                   "req_count=%zu\n",
+                   "req_count=%zu completed=%zu\n",
                    static_cast<void *>(this),
                    static_cast<unsigned long long>(PollIterations),
-                   Requests.size());
+                   Requests.size(), CompletedRequests);
       traceRequestSample(Requests);
     }
 
+    int CompletedIndex = MPI_UNDEFINED;
+    int RequestCompleted = false;
     int MPIError = ompfileWithMPICallLock([&]() {
-      return MPI_Testall(Requests.size(), Requests.data(), &RequestsCompleted,
-                         MPI_STATUSES_IGNORE);
+      return MPI_Testany(static_cast<int>(Requests.size()), Requests.data(),
+                         &CompletedIndex, &RequestCompleted,
+                         MPI_STATUS_IGNORE);
     });
 
     if (MPIError != MPI_SUCCESS) {
       char ErrBuf[MPI_MAX_ERROR_STRING] = {0};
       int ErrLen = 0;
       MPI_Error_string(MPIError, ErrBuf, &ErrLen);
-      ompfileTrace("MPIRequestManagerTy::wait MPI_Testall error this=%p "
+      ompfileTrace("MPIRequestManagerTy::wait MPI_Testany error this=%p "
                    "iter=%llu mpi_error=%d msg=%.*s\n",
                    static_cast<void *>(this),
                    static_cast<unsigned long long>(PollIterations), MPIError,
@@ -489,6 +492,18 @@ EventTy MPIRequestManagerTy::wait() {
       traceRequestSample(Requests);
       co_return createError("Waiting of MPI requests failed with code %d",
                             MPIError);
+    }
+
+    if (RequestCompleted) {
+      if (CompletedIndex == MPI_UNDEFINED) {
+        // MPI reports no active requests. This can happen if a lower layer
+        // completed all handles and replaced them with MPI_REQUEST_NULL; treat
+        // the manager as drained rather than entering a spin loop.
+        CompletedRequests = Requests.size();
+      } else {
+        ++CompletedRequests;
+      }
+      continue;
     }
 
     co_await std::suspend_always{};

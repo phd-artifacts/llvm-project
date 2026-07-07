@@ -2140,6 +2140,129 @@ struct ProxyDevice {
     return Entry.DirtyBytes;
   }
 
+  bool flushLocalDirtyTileToSource(uint64_t TilePathKey, uint64_t Version) {
+    if (TilePathKey == 0 || Version == 0) {
+      errno = EINVAL;
+      return false;
+    }
+    if (lastLocalFreshnessVersionForPathKey(TilePathKey) != Version) {
+      errno = ESTALE;
+      return false;
+    }
+
+    const uint64_t TileBytes = configuredStageTileBytes();
+    if (TileBytes == 0) {
+      errno = EINVAL;
+      return false;
+    }
+
+    std::vector<std::shared_ptr<OmpFileStageEntry>> Entries;
+    {
+      const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
+      Entries.reserve(OmpFileStageEntries.size());
+      for (auto &It : OmpFileStageEntries)
+        Entries.push_back(It.second);
+    }
+
+    for (const std::shared_ptr<OmpFileStageEntry> &Entry : Entries) {
+      if (!Entry || Entry->SourcePath.empty())
+        continue;
+      const uint64_t BasePathKey =
+          OmpFileHeadnodeManager::computePathKeyForPath(Entry->SourcePath);
+      if (BasePathKey == 0)
+        continue;
+
+      int StageFd = -1;
+      uint64_t FlushBegin = 0;
+      uint64_t FlushEnd = 0;
+      {
+        std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
+        StageFd = Entry->StageFd;
+        for (const OmpFileStageExtent &Extent : Entry->DirtyExtents) {
+          if (Extent.End <= Extent.Begin)
+            continue;
+          const uint64_t FirstTile = Extent.Begin / TileBytes;
+          const uint64_t LastTile = (Extent.End - 1) / TileBytes;
+          for (uint64_t TileId = FirstTile; TileId <= LastTile; ++TileId) {
+            if (tileFreshnessKeyForPath(BasePathKey, TileId) != TilePathKey)
+              continue;
+            FlushBegin = std::max(Extent.Begin, TileId * TileBytes);
+            FlushEnd = std::min(Extent.End, (TileId + 1) * TileBytes);
+            break;
+          }
+          if (FlushEnd > FlushBegin)
+            break;
+        }
+      }
+
+      if (FlushEnd <= FlushBegin)
+        continue;
+      if (StageFd < 0) {
+        errno = EBADF;
+        return false;
+      }
+
+      const int SourceFd = ::open(Entry->SourcePath.c_str(), O_RDWR);
+      if (SourceFd < 0)
+        return false;
+
+      const uint64_t Len = FlushEnd - FlushBegin;
+      std::vector<char> Buffer(Len);
+      uint64_t Done = 0;
+      while (Done < Len) {
+        const ssize_t N = ::pread(StageFd, Buffer.data() + Done,
+                                  static_cast<size_t>(Len - Done),
+                                  static_cast<off_t>(FlushBegin + Done));
+        if (N <= 0) {
+          const int SavedErrno = N < 0 ? errno : EIO;
+          (void)::close(SourceFd);
+          errno = SavedErrno;
+          return false;
+        }
+        Done += static_cast<uint64_t>(N);
+      }
+      Done = 0;
+      while (Done < Len) {
+        const ssize_t N = ::pwrite(SourceFd, Buffer.data() + Done,
+                                   static_cast<size_t>(Len - Done),
+                                   static_cast<off_t>(FlushBegin + Done));
+        if (N <= 0) {
+          const int SavedErrno = N < 0 ? errno : EIO;
+          (void)::close(SourceFd);
+          errno = SavedErrno;
+          return false;
+        }
+        Done += static_cast<uint64_t>(N);
+      }
+      if (::fdatasync(SourceFd) != 0) {
+        const int SavedErrno = errno;
+        (void)::close(SourceFd);
+        errno = SavedErrno;
+        return false;
+      }
+      (void)::close(SourceFd);
+
+      {
+        std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
+        clearDirtyRangeLocked(*Entry, FlushBegin, FlushEnd);
+      }
+      OmpFileStatsStageDirtyFlushes.fetch_add(1, std::memory_order_relaxed);
+      OmpFileStatsStageDirtyFlushBytes.fetch_add(Len,
+                                                  std::memory_order_relaxed);
+      REPORT("MPIProxyDevice --> OMPFile local dirty tile flushed rank=%d "
+             "path=%s key=%llu version=%llu begin=%llu end=%llu\n",
+             EventSystem.LocalRank, Entry->SourcePath.c_str(),
+             static_cast<unsigned long long>(TilePathKey),
+             static_cast<unsigned long long>(Version),
+             static_cast<unsigned long long>(FlushBegin),
+             static_cast<unsigned long long>(FlushEnd));
+      return true;
+    }
+
+    errno = ENODATA;
+    return false;
+  }
+
   // Flush all dirty ranges of Entry from the stage fd to the source fd and
   // clear them on success. Returns true on success (including the trivial
   // no-dirty case). On any I/O failure the stage entry is invalidated (the
@@ -2149,7 +2272,8 @@ struct ProxyDevice {
   // advances PfsVersion; if Entry.DirtyEpoch is zero (no write-back commit
   // recorded yet) the headnode completion is skipped.
   bool flushDirtyRangesToSource(OmpFileStageEntry &Entry, int SourceFd,
-                                const std::string &SourcePath) {
+                                const std::string &SourcePath,
+                                bool DeferCloseMetadataCompletion = false) {
     auto failDirtyFlush = [&](const char *Reason, int ErrnoValue,
                               uint64_t Begin = 0, uint64_t End = 0,
                               uint64_t Epoch = 0) -> bool {
@@ -2274,19 +2398,24 @@ struct ProxyDevice {
         const uint64_t TileBytes = configuredStageTileBytes();
         if (DistributeWritesEnv && std::strcmp(DistributeWritesEnv, "1") == 0 &&
             TileBytes > 0) {
-          if (EventSystem.LocalRank != getHeadnodeRank()) {
+          if (DeferCloseMetadataCompletion) {
             // The close path already copied dirty bytes to the shared source and
-            // fdatasync'd them above.  Avoid sending one metadata-completion
-            // event per dirty tile from every remote proxy during shutdown; that
-            // control-event burst has reproduced MPI internal_Testall aborts on
-            // Sorgan.  Active in-run reads remain protected by the tile oracle;
-            // this deferral only affects end-of-session close metadata.
+            // fdatasync'd them above. Avoid one metadata-completion operation per
+            // dirty tile during shutdown on every proxy, including the headnode:
+            // the headnode-local loop reproduced MPI internal_Testall aborts on
+            // AMD 8192x128/9-proxy runs after thousands of close-time derived
+            // completions, and remote completion events had already reproduced
+            // the same class of abort on Sorgan. Active in-run reads remain
+            // protected by the tile oracle because this deferral is used only by
+            // close-time flushes; in-run watermark flushes still complete
+            // metadata immediately.
             CompletedViaDerivedTileKeys = true;
             REPORT("MPIProxyDevice --> OMPFile derived tile dirty flush "
                    "completion deferred rank=%d path=%s tile_bytes=%llu "
-                   "extents=%zu\n",
+                   "extents=%zu headnode=%d\n",
                    EventSystem.LocalRank, SourcePath.c_str(),
-                   static_cast<unsigned long long>(TileBytes), Extents.size());
+                   static_cast<unsigned long long>(TileBytes), Extents.size(),
+                   EventSystem.LocalRank == getHeadnodeRank() ? 1 : 0);
           } else {
             errno = 0;
             CompletedViaDerivedTileKeys = completeDerivedTileFlushesOnHeadnode(
@@ -3662,7 +3791,8 @@ struct ProxyDevice {
         const std::string &SourcePath = TrackedEntry.Path;
         std::shared_ptr<OmpFileStageEntry> StageEntry;
         if (getStageEntryForPath(SourcePath, StageEntry) && StageEntry) {
-          if (!flushDirtyRangesToSource(*StageEntry, Fd, SourcePath)) {
+          if (!flushDirtyRangesToSource(*StageEntry, Fd, SourcePath,
+                                        /*DeferCloseMetadataCompletion=*/true)) {
             // Flush failed: the stage entry has already been invalidated by
             // the flush helper (PFS is the authority). Surface the failure so
             // the caller does not silently drop writes.
@@ -4489,8 +4619,13 @@ struct ProxyDevice {
       Reply.SourceRank = Request.SourceRank;
       Reply.FlushedVersion = Request.Version;
     } else if (Request.Action == 2) {
-      Reply.SourceRank = EventSystem.LocalRank;
-      Reply.FlushedVersion = Request.Version;
+      if (!flushLocalDirtyTileToSource(Request.PathKey, Request.Version)) {
+        Reply.Status = -1;
+        Reply.Errno = errno != 0 ? errno : EIO;
+      } else {
+        Reply.SourceRank = EventSystem.LocalRank;
+        Reply.FlushedVersion = Request.Version;
+      }
     } else {
       Reply.Status = -1;
       Reply.Errno = EINVAL;
@@ -5618,23 +5753,28 @@ struct ProxyDevice {
       return errno != 0 ? errno : EIO;
 
     if (Source >= 0) {
-      OmpFileFlushDirtyTileRequest WritebackReq{};
-      WritebackReq.Action = 2;
-      WritebackReq.PathKey = PathKey;
-      WritebackReq.SourceRank = Source;
-      WritebackReq.Version = Version;
-      WritebackReq.Success = 1;
-      OmpFileFlushDirtyTileReply WritebackReply{};
-      EventTy WritebackEvent = createRankEvent(
-          OriginEvents::ompfileFlushDirtyTile,
-          EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE, Source,
-          /*TargetDeviceId=*/0, &WritebackReq, &WritebackReply);
-      if (!waitForEvent(WritebackEvent, "flush_dirty_tile_writeback"))
-        return errno != 0 ? errno : EIO;
-      if (WritebackReply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
-        return EPROTO;
-      if (WritebackReply.Status != 0)
-        return WritebackReply.Errno != 0 ? WritebackReply.Errno : EIO;
+      if (Source == EventSystem.LocalRank) {
+        if (!flushLocalDirtyTileToSource(PathKey, Version))
+          return errno != 0 ? errno : EIO;
+      } else {
+        OmpFileFlushDirtyTileRequest WritebackReq{};
+        WritebackReq.Action = 2;
+        WritebackReq.PathKey = PathKey;
+        WritebackReq.SourceRank = Source;
+        WritebackReq.Version = Version;
+        WritebackReq.Success = 1;
+        OmpFileFlushDirtyTileReply WritebackReply{};
+        EventTy WritebackEvent = createRankEvent(
+            OriginEvents::ompfileFlushDirtyTile,
+            EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE, Source,
+            /*TargetDeviceId=*/0, &WritebackReq, &WritebackReply);
+        if (!waitForEvent(WritebackEvent, "flush_dirty_tile_writeback"))
+          return errno != 0 ? errno : EIO;
+        if (WritebackReply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
+          return EPROTO;
+        if (WritebackReply.Status != 0)
+          return WritebackReply.Errno != 0 ? WritebackReply.Errno : EIO;
+      }
       if (!completeDirtyFlushOnHeadnode(PathKey, Source, Version,
                                         /*Success=*/true))
         return errno != 0 ? errno : EIO;
