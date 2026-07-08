@@ -34,6 +34,10 @@ bool distributedWritebackRoutingEnabled() {
   return envEquals("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES", "1");
 }
 
+bool remoteDirtyOwnerPfsRebalanceEnabled() {
+  return envEquals("LIBOMPFILE_OPT_REMOTE_DIRTY_OWNER_PFS_REBALANCE", "1");
+}
+
 unsigned parsePositiveEnv(const char *Name) {
   const char *Value = std::getenv(Name);
   if (!Value || Value[0] == '\0')
@@ -317,6 +321,74 @@ int MPIIOBackend::readAtWithContext(
               oracle_errno = errno;
             }
             if (oracle_ok && oracle_state == 1) {
+              if (remoteDirtyOwnerPfsRebalanceEnabled()) {
+                int flushed_source_rank = -1;
+                uint64_t flushed_version = 0;
+                bool flush_ok = false;
+                int flush_errno = 0;
+                {
+                  const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+                  errno = 0;
+                  flush_ok = ompfile::mpp::flushDirtyTile(
+                      FreshnessPathKey, flushed_source_rank, flushed_version);
+                  flush_errno = errno;
+                }
+                if (!flush_ok || flushed_source_rank != DirtySourceRank ||
+                    (DirtyExpectedVersion != 0 &&
+                     flushed_version != DirtyExpectedVersion)) {
+                  dirty_source_unknown = true;
+                  dirty_owner_forward_failure_count.fetch_add(
+                      1, std::memory_order_relaxed);
+                  errno = flush_errno != 0 ? flush_errno : ESTALE;
+                  io_log("Phase 1 remote dirty-owner pfs rebalance failed: "
+                         "request_id=%llu file=%d aggregator_rank=%d "
+                         "source_rank=%d flushed_source_rank=%d "
+                         "version=%llu flushed_version=%llu errno=%d; "
+                         "fail-closed.\n",
+                         static_cast<unsigned long long>(context.RequestId),
+                         file_id, context.Plan.AggregatorRank, DirtySourceRank,
+                         flushed_source_rank,
+                         static_cast<unsigned long long>(DirtyExpectedVersion),
+                         static_cast<unsigned long long>(flushed_version),
+                         errno);
+                  return -1;
+                }
+                size_t pfs_bytes_read = 0;
+                if (readAtRemoteRankNoStageWithBytes(
+                        file_id, context.Plan.AggregatorRank, offset, data,
+                        size, pfs_bytes_read)) {
+                  dirty_owner_forward_success_count.fetch_add(
+                      1, std::memory_order_relaxed);
+                  dirty_owner_forward_bytes_total.fetch_add(
+                      pfs_bytes_read, std::memory_order_relaxed);
+                  remote_pread_event_count.fetch_add(1,
+                                                     std::memory_order_relaxed);
+                  remote_pread_bytes_total.fetch_add(size,
+                                                     std::memory_order_relaxed);
+                  noteAppliedRebalancedReadForFile(file_id);
+                  io_log("Phase 1 remote dirty-owner pfs rebalanced: "
+                         "request_id=%llu file=%d aggregator_rank=%d "
+                         "source_rank=%d version=%llu bytes=%zu\n",
+                         static_cast<unsigned long long>(context.RequestId),
+                         file_id, context.Plan.AggregatorRank, DirtySourceRank,
+                         static_cast<unsigned long long>(flushed_version),
+                         pfs_bytes_read);
+                  return 0;
+                }
+                dirty_source_unknown = true;
+                dirty_owner_forward_failure_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                errno = errno != 0 ? errno : EIO;
+                io_log("Phase 1 remote dirty-owner pfs read failed: "
+                       "request_id=%llu file=%d aggregator_rank=%d "
+                       "source_rank=%d offset=%lld size=%zu errno=%d; "
+                       "fail-closed.\n",
+                       static_cast<unsigned long long>(context.RequestId),
+                       file_id, context.Plan.AggregatorRank, DirtySourceRank,
+                       static_cast<long long>(offset), size, errno);
+                return -1;
+              }
+
               size_t dirty_source_bytes_read = 0;
               bool dirty_source_read_ok = false;
               int dirty_source_read_errno = 0;

@@ -1395,6 +1395,7 @@ EventTy EventSystemTy::createExchangeEvent(int SrcDevice, const void *SrcBuffer,
                                            __tgt_async_info *AsyncInfo) {
   const int EventTag = createNewEventTag();
   auto &EventComm = getNewEventComm(EventTag);
+  const int MPITag = getEventMPITag(EventTag);
 
   int32_t SrcRank, SrcDeviceId, DstRank, DstDeviceId;
 
@@ -1425,7 +1426,7 @@ EventTy EventSystemTy::createExchangeEvent(int SrcDevice, const void *SrcBuffer,
         "MPI failed during exchange event notification with error %d",
         MPIError);
 
-  MPIRequestManagerTy RequestManager(EventComm, EventTag, SrcRank, SrcDeviceId,
+  MPIRequestManagerTy RequestManager(EventComm, MPITag, SrcRank, SrcDeviceId,
                                      {SrcRequest, DstRequest});
 
   co_return (co_await OriginEvents::exchange(std::move(RequestManager), SrcRank,
@@ -1437,22 +1438,24 @@ EventTy EventSystemTy::createExchangeEvent(int SrcDevice, const void *SrcBuffer,
 /// Tag values smaller than 'FIRST_EVENT' are reserved for control
 /// messages between the event systems of different MPI processes.
 int EventSystemTy::createNewEventTag() {
-  if (MPITagMaxValue <= static_cast<int>(ControlTagsTy::FIRST_EVENT)) {
-    REPORT("Invalid MPI tag upper bound (%d); using fallback tag %d.\n",
-           MPITagMaxValue, static_cast<int>(ControlTagsTy::FIRST_EVENT));
-    return static_cast<int>(ControlTagsTy::FIRST_EVENT);
-  }
-
-  int tag = 0;
-
-  do {
-    tag = EventCounter.fetch_add(1) % MPITagMaxValue;
-  } while (tag < static_cast<int>(ControlTagsTy::FIRST_EVENT));
-
-  return tag;
+  return EventCounter.fetch_add(1);
 }
 
-MPI_Comm &EventSystemTy::getNewEventComm(int MPITag) {
+int EventSystemTy::getEventMPITag(int EventId) const {
+  const int FirstEventTag = static_cast<int>(ControlTagsTy::FIRST_EVENT);
+  if (MPITagMaxValue < FirstEventTag) {
+    REPORT("Invalid MPI tag upper bound (%d); using fallback tag %d.\n",
+           MPITagMaxValue, FirstEventTag);
+    return FirstEventTag;
+  }
+
+  const int TagSpan = MPITagMaxValue - FirstEventTag + 1;
+  const int Offset = static_cast<int>(
+      static_cast<unsigned int>(EventId) % static_cast<unsigned int>(TagSpan));
+  return FirstEventTag + Offset;
+}
+
+MPI_Comm &EventSystemTy::getNewEventComm(int EventId) {
   if (EventCommPool.empty()) {
     REPORT("Event communicator pool is empty; falling back to GateThreadComm.\n");
     assert(GateThreadComm != MPI_COMM_NULL &&
@@ -1460,8 +1463,14 @@ MPI_Comm &EventSystemTy::getNewEventComm(int MPITag) {
     return GateThreadComm;
   }
 
-  // Retrieve a comm using a round-robin strategy around the event's mpi tag.
-  return EventCommPool[MPITag % EventCommPool.size()];
+  const int FirstEventTag = static_cast<int>(ControlTagsTy::FIRST_EVENT);
+  const int TagSpan = MPITagMaxValue >= FirstEventTag
+                          ? MPITagMaxValue - FirstEventTag + 1
+                          : 1;
+  const size_t CommIndex =
+      (static_cast<unsigned int>(EventId) / static_cast<unsigned int>(TagSpan)) %
+      EventCommPool.size();
+  return EventCommPool[CommIndex];
 }
 
 static const char *threadLevelToString(int ThreadLevel) {

@@ -889,11 +889,19 @@ class EventSystemTy {
   bool OwnsMPIInitialization = false;
 
 private:
-  /// Creates a new unique event tag for a new event.
+  /// Creates a new logical event id for a new event. The logical id is carried
+  /// in the control notification and mapped to a physical (communicator, MPI
+  /// tag) pair by getNewEventComm/getEventMPITag. This lets the communicator
+  /// pool extend the usable event id space instead of reusing the same physical
+  /// MPI tag as soon as MPI_TAG_UB is reached.
   int createNewEventTag();
 
+  /// Maps a logical event id to the physical MPI tag used on its event
+  /// communicator.
+  int getEventMPITag(int EventId) const;
+
   /// Gets a comm for a new event from the comm pool.
-  MPI_Comm &getNewEventComm(int MPITag);
+  MPI_Comm &getNewEventComm(int EventId);
 
   /// Creates a local MPI context containing a exclusive comm for the gate
   /// thread, and a comm pool to be used internally by the events. It also
@@ -963,6 +971,7 @@ EventTy EventSystemTy::NotificationEvent(EventFuncTy EventFunc, EventTypeTy Even
   // Create event MPI request manager.
   const int EventTag = createNewEventTag();
   auto &EventComm = getNewEventComm(EventTag);
+  const int MPITag = getEventMPITag(EventTag);
 
   int32_t RemoteRank = DstDeviceID, RemoteDeviceId = -1;
 
@@ -986,7 +995,7 @@ EventTy EventSystemTy::NotificationEvent(EventFuncTy EventFunc, EventTypeTy Even
     co_return createError("MPI failed during event notification with error %d",
                           MPIError);
 
-  MPIRequestManagerTy RequestManager(EventComm, EventTag, RemoteRank,
+  MPIRequestManagerTy RequestManager(EventComm, MPITag, RemoteRank,
                                     RemoteDeviceId, {NotificationRequest});
 
   RequestManager.EventType = EventNotificationInfo[0];
