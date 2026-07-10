@@ -51,6 +51,13 @@ unsigned parsePositiveEnv(const char *Name) {
   return static_cast<unsigned>(Parsed);
 }
 
+uint64_t dirtyOwnerReadAheadBytes() {
+  if (const unsigned Value = parsePositiveEnv(
+          "LIBOMPFILE_OPT_DIRTY_OWNER_READAHEAD_BYTES"))
+    return Value;
+  return 0;
+}
+
 unsigned distributedWritebackRankCount() {
   if (const unsigned Explicit =
           parsePositiveEnv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS"))
@@ -392,7 +399,83 @@ int MPIIOBackend::readAtWithContext(
               size_t dirty_source_bytes_read = 0;
               bool dirty_source_read_ok = false;
               int dirty_source_read_errno = 0;
+              bool served_from_readahead = false;
               {
+                const std::lock_guard<std::mutex> lock(handle_mutex);
+                for (const DirtyOwnerReadCacheEntry &CacheEntry :
+                     dirty_owner_read_cache) {
+                  if (CacheEntry.FileId != file_id ||
+                      CacheEntry.SourceRank != DirtySourceRank ||
+                      CacheEntry.Version != DirtyExpectedVersion ||
+                      offset < CacheEntry.Start ||
+                      offset + static_cast<long>(size) > CacheEntry.End)
+                    continue;
+                  const size_t CacheOffset =
+                      static_cast<size_t>(offset - CacheEntry.Start);
+                  std::memcpy(data, CacheEntry.Data.data() + CacheOffset, size);
+                  dirty_source_bytes_read = size;
+                  dirty_source_read_ok = true;
+                  served_from_readahead = true;
+                  break;
+                }
+              }
+              if (!dirty_source_read_ok) {
+                const uint64_t ReadAheadBytes = dirtyOwnerReadAheadBytes();
+                const uint64_t RequestedBytes =
+                    ReadAheadBytes > size ? ReadAheadBytes : size;
+                if (RequestedBytes > size) {
+                  std::vector<char> ReadAheadBuffer(
+                      static_cast<size_t>(RequestedBytes));
+                  size_t ReadAheadBytesRead = 0;
+                  bool ReadAheadOk = false;
+                  int ReadAheadErrno = 0;
+                  {
+                    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+                    errno = 0;
+                    ReadAheadOk = ompfile::mpp::dirtyOwnerPreadEx(
+                        remote_handle, DirtySourceRank, DirtyExpectedVersion,
+                        offset, ReadAheadBuffer.data(),
+                        static_cast<size_t>(RequestedBytes),
+                        ReadAheadBytesRead);
+                    ReadAheadErrno = errno;
+                  }
+                  if (ReadAheadOk && ReadAheadBytesRead >= size) {
+                    std::memcpy(data, ReadAheadBuffer.data(), size);
+                    dirty_source_bytes_read = size;
+                    dirty_source_read_ok = true;
+                    DirtyOwnerReadCacheEntry CacheEntry{};
+                    CacheEntry.FileId = file_id;
+                    CacheEntry.SourceRank = DirtySourceRank;
+                    CacheEntry.Version = DirtyExpectedVersion;
+                    CacheEntry.Start = offset;
+                    CacheEntry.End = offset + static_cast<long>(ReadAheadBytesRead);
+                    CacheEntry.Data.assign(ReadAheadBuffer.begin(),
+                                           ReadAheadBuffer.begin() +
+                                               static_cast<long>(
+                                                   ReadAheadBytesRead));
+                    {
+                      const std::lock_guard<std::mutex> lock(handle_mutex);
+                      dirty_owner_read_cache.push_back(std::move(CacheEntry));
+                      while (dirty_owner_read_cache.size() > 1024)
+                        dirty_owner_read_cache.pop_front();
+                    }
+                    io_log("Phase 1 dirty-worker staged read-ahead: "
+                           "request_id=%llu file=%d aggregator_rank=%d "
+                           "source_rank=%d version=%llu bytes=%zu "
+                           "cached_bytes=%zu\n",
+                           static_cast<unsigned long long>(context.RequestId),
+                           file_id, context.Plan.AggregatorRank,
+                           DirtySourceRank,
+                           static_cast<unsigned long long>(
+                               InitialFreshnessRoute.SelectedVersion),
+                           dirty_source_bytes_read, ReadAheadBytesRead);
+                  } else {
+                    dirty_source_read_errno =
+                        ReadAheadErrno != 0 ? ReadAheadErrno : EIO;
+                  }
+                }
+              }
+              if (!dirty_source_read_ok) {
                 const std::lock_guard<std::mutex> lock(mpp_call_mutex);
                 errno = 0;
                 dirty_source_read_ok = ompfile::mpp::dirtyOwnerPreadEx(

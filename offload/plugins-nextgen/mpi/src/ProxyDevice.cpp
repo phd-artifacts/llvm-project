@@ -4313,19 +4313,27 @@ struct ProxyDevice {
           1, std::memory_order_relaxed);
     int Ret = Ok ? 0 : -1;
 
-    RequestManager.send(&Ret, 1, MPI_INT);
-    RequestManager.send(&Errno, 1, MPI_INT);
-    RequestManager.send(&PayloadSize, 1, MPI_UINT64_T);
+    OmpFileDirtyOwnerPreadReplyFrame Reply{};
+    Reply.Ret = Ret;
+    Reply.Errno = Errno;
+    Reply.PayloadBytes = PayloadSize;
+    Reply.ExpectedVersion = ExpectedVersion;
+    Reply.Offset = static_cast<uint64_t>(Offset);
+
+    RequestManager.sendTagged(&Reply, sizeof(Reply), MPI_BYTE,
+                              /*TagOffset=*/1);
     if (PayloadSize > 0)
-      RequestManager.sendInBatchs(Buffer.data(), PayloadSize);
-    traceOmpFile("event ompfileDirtyOwnerPread fd=%d offset=%lld size=%llu "
-                 "ret=%d errno=%d bytes=%llu expected_version=%llu\n",
+      RequestManager.sendInBatchsTagged(Buffer.data(), PayloadSize,
+                                        /*TagOffset=*/2);
+    traceOmpFile("event ompfileDirtyOwnerPread framed fd=%d offset=%lld "
+                 "size=%llu ret=%d errno=%d bytes=%llu "
+                 "expected_version=%llu\n",
                  Fd, static_cast<long long>(Offset),
                  static_cast<unsigned long long>(Size), Ret, Errno,
                  static_cast<unsigned long long>(PayloadSize),
                  static_cast<unsigned long long>(ExpectedVersion));
 
-    RequestManager.send(nullptr, 0, MPI_BYTE);
+    RequestManager.sendTagged(nullptr, 0, MPI_BYTE, /*TagOffset=*/3);
     co_return (co_await RequestManager);
   }
 

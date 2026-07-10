@@ -246,6 +246,19 @@ struct OmpFileFlushDirtyTileReply {
   uint64_t FlushedVersion = 0;
 };
 
+constexpr uint32_t OMPFILE_DIRTY_OWNER_PREAD_ABI_VERSION = 1u;
+constexpr uint32_t OMPFILE_DIRTY_OWNER_PREAD_REPLY_MAGIC = 0x44525052u;
+
+struct OmpFileDirtyOwnerPreadReplyFrame {
+  uint32_t AbiVersion = OMPFILE_DIRTY_OWNER_PREAD_ABI_VERSION;
+  uint32_t Magic = OMPFILE_DIRTY_OWNER_PREAD_REPLY_MAGIC;
+  int32_t Ret = -1;
+  int32_t Errno = 0;
+  uint64_t PayloadBytes = 0;
+  uint64_t ExpectedVersion = 0;
+  uint64_t Offset = 0;
+};
+
 std::string EventTypeToString(EventTypeTy eventType);
 
 enum class OmpFileIOOp : uint32_t {
@@ -626,11 +639,18 @@ public:
   /// Sends a buffer of given datatype items with determined size to target.
   void send(const void *Buffer, int Size, MPI_Datatype Datatype);
 
+  /// Sends a buffer on this event's reserved tag plus TagOffset.
+  void sendTagged(const void *Buffer, int Size, MPI_Datatype Datatype,
+                  int TagOffset);
+
   /// Sends a message to target using a blocking MPI call.
   llvm::Error sendBlocking(const void *Buffer, int Size, MPI_Datatype Datatype);
 
   /// Send a buffer with determined size to target in batchs.
   void sendInBatchs(void *Buffer, int64_t Size);
+
+  /// Send a fragmented buffer on this event's reserved tag plus TagOffset.
+  void sendInBatchsTagged(void *Buffer, int64_t Size, int TagOffset);
 
   /// Sends a buffer with determined size to target using blocking MPI calls.
   llvm::Error sendInBatchsBlocking(const void *Buffer, uint64_t Size);
@@ -639,11 +659,18 @@ public:
   /// target.
   void receive(void *Buffer, int Size, MPI_Datatype Datatype);
 
+  /// Receives a buffer on this event's reserved tag plus TagOffset.
+  void receiveTagged(void *Buffer, int Size, MPI_Datatype Datatype,
+                     int TagOffset);
+
   /// Receives a message from target using a blocking MPI call.
   llvm::Error receiveBlocking(void *Buffer, int Size, MPI_Datatype Datatype);
 
   /// Receives a buffer with determined size from target in batchs.
   void receiveInBatchs(void *Buffer, int64_t Size);
+
+  /// Receives a fragmented buffer on this event's reserved tag plus TagOffset.
+  void receiveInBatchsTagged(void *Buffer, int64_t Size, int TagOffset);
 
   /// Receives a buffer with determined size from target using blocking MPI
   /// calls. This is used for payload paths that need to avoid coroutine-owned

@@ -268,9 +268,15 @@ MPIRequestManagerTy::~MPIRequestManagerTy() {
 /// Send a message to \p OtherRank asynchronously.
 void MPIRequestManagerTy::send(const void *Buffer, int Size,
                                MPI_Datatype Datatype) {
+  sendTagged(Buffer, Size, Datatype, 0);
+}
+
+void MPIRequestManagerTy::sendTagged(const void *Buffer, int Size,
+                                     MPI_Datatype Datatype, int TagOffset) {
   MPI_Request &Req = Requests.emplace_back(MPI_REQUEST_NULL);
   int MPIError = ompfileWithMPICallLock([&]() {
-    return MPI_Isend(Buffer, Size, Datatype, OtherRank, Tag, Comm, &Req);
+    return MPI_Isend(Buffer, Size, Datatype, OtherRank, Tag + TagOffset, Comm,
+                     &Req);
   });
   if (MPIError != MPI_SUCCESS) {
     PendingMPIError = MPIError;
@@ -292,6 +298,11 @@ llvm::Error MPIRequestManagerTy::sendBlocking(const void *Buffer, int Size,
 /// Divide the \p Buffer into fragments of size \p MPIFragmentSize and send them
 /// to \p OtherRank asynchronously.
 void MPIRequestManagerTy::sendInBatchs(void *Buffer, int64_t Size) {
+  sendInBatchsTagged(Buffer, Size, 0);
+}
+
+void MPIRequestManagerTy::sendInBatchsTagged(void *Buffer, int64_t Size,
+                                             int TagOffset) {
   if (Size <= 0)
     return;
 
@@ -312,7 +323,8 @@ void MPIRequestManagerTy::sendInBatchs(void *Buffer, int64_t Size) {
   while (RemainingBytes > 0) {
     const int64_t Chunk = std::min({RemainingBytes, FragmentSize, MaxMPIChunk});
     assert(Chunk > 0 && "MPI fragment chunk must be positive.");
-    send(&BufferByteArray[Offset], static_cast<int>(Chunk), MPI_BYTE);
+    sendTagged(&BufferByteArray[Offset], static_cast<int>(Chunk), MPI_BYTE,
+               TagOffset);
     Offset += Chunk;
     RemainingBytes -= Chunk;
   }
@@ -321,9 +333,15 @@ void MPIRequestManagerTy::sendInBatchs(void *Buffer, int64_t Size) {
 /// Receive a message from \p OtherRank asynchronously.
 void MPIRequestManagerTy::receive(void *Buffer, int Size,
                                   MPI_Datatype Datatype) {
+  receiveTagged(Buffer, Size, Datatype, 0);
+}
+
+void MPIRequestManagerTy::receiveTagged(void *Buffer, int Size,
+                                        MPI_Datatype Datatype, int TagOffset) {
   MPI_Request &Req = Requests.emplace_back(MPI_REQUEST_NULL);
   int MPIError = ompfileWithMPICallLock([&]() {
-    return MPI_Irecv(Buffer, Size, Datatype, OtherRank, Tag, Comm, &Req);
+    return MPI_Irecv(Buffer, Size, Datatype, OtherRank, Tag + TagOffset, Comm,
+                     &Req);
   });
   if (MPIError != MPI_SUCCESS) {
     PendingMPIError = MPIError;
@@ -345,6 +363,11 @@ llvm::Error MPIRequestManagerTy::receiveBlocking(void *Buffer, int Size,
 /// Asynchronously receive message fragments from \p OtherRank and reconstruct
 /// them into \p Buffer.
 void MPIRequestManagerTy::receiveInBatchs(void *Buffer, int64_t Size) {
+  receiveInBatchsTagged(Buffer, Size, 0);
+}
+
+void MPIRequestManagerTy::receiveInBatchsTagged(void *Buffer, int64_t Size,
+                                                int TagOffset) {
   if (Size <= 0)
     return;
 
@@ -365,7 +388,8 @@ void MPIRequestManagerTy::receiveInBatchs(void *Buffer, int64_t Size) {
   while (RemainingBytes > 0) {
     const int64_t Chunk = std::min({RemainingBytes, FragmentSize, MaxMPIChunk});
     assert(Chunk > 0 && "MPI fragment chunk must be positive.");
-    receive(&BufferByteArray[Offset], static_cast<int>(Chunk), MPI_BYTE);
+    receiveTagged(&BufferByteArray[Offset], static_cast<int>(Chunk), MPI_BYTE,
+                  TagOffset);
     Offset += Chunk;
     RemainingBytes -= Chunk;
   }
@@ -870,20 +894,43 @@ EventTy ompfileDirtyOwnerPread(MPIRequestManagerTy RequestManager,
   RequestManager.send(&Size, 1, MPI_UINT64_T);
   RequestManager.send(&ExpectedVersion, 1, MPI_UINT64_T);
 
-  RequestManager.receive(IoRet, 1, MPI_INT);
-  RequestManager.receive(RemoteErrno, 1, MPI_INT);
-  RequestManager.receive(Bytes, 1, MPI_UINT64_T);
-
   if (auto Error = co_await RequestManager; Error)
     co_return Error;
 
+  OmpFileDirtyOwnerPreadReplyFrame Reply{};
+  RequestManager.receiveTagged(&Reply, sizeof(Reply), MPI_BYTE,
+                               /*TagOffset=*/1);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+  if (Reply.AbiVersion != OMPFILE_DIRTY_OWNER_PREAD_ABI_VERSION ||
+      Reply.Magic != OMPFILE_DIRTY_OWNER_PREAD_REPLY_MAGIC ||
+      Reply.Offset != static_cast<uint64_t>(Offset) ||
+      Reply.ExpectedVersion != ExpectedVersion) {
+    co_return createError("Invalid dirty-owner pread reply frame: abi=%u "
+                          "magic=%u offset=%llu expected_offset=%llu "
+                          "version=%llu expected_version=%llu",
+                          Reply.AbiVersion, Reply.Magic,
+                          static_cast<unsigned long long>(Reply.Offset),
+                          static_cast<unsigned long long>(Offset),
+                          static_cast<unsigned long long>(Reply.ExpectedVersion),
+                          static_cast<unsigned long long>(ExpectedVersion));
+  }
+
+  *IoRet = Reply.Ret;
+  *RemoteErrno = Reply.Errno;
+  *Bytes = Reply.PayloadBytes;
+  if (*Bytes > Size)
+    co_return createError("Dirty-owner pread reply payload too large: %llu > %llu",
+                          static_cast<unsigned long long>(*Bytes),
+                          static_cast<unsigned long long>(Size));
+
   if (*Bytes > 0) {
-    RequestManager.receiveInBatchs(Buffer, *Bytes);
+    RequestManager.receiveInBatchsTagged(Buffer, *Bytes, /*TagOffset=*/2);
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
   }
 
-  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  RequestManager.receiveTagged(nullptr, 0, MPI_BYTE, /*TagOffset=*/3);
   co_return (co_await RequestManager);
 }
 
@@ -1442,16 +1489,20 @@ int EventSystemTy::createNewEventTag() {
 }
 
 int EventSystemTy::getEventMPITag(int EventId) const {
+  constexpr int EventTagStride = 8;
   const int FirstEventTag = static_cast<int>(ControlTagsTy::FIRST_EVENT);
-  if (MPITagMaxValue < FirstEventTag) {
+  if (MPITagMaxValue < FirstEventTag + EventTagStride) {
     REPORT("Invalid MPI tag upper bound (%d); using fallback tag %d.\n",
            MPITagMaxValue, FirstEventTag);
     return FirstEventTag;
   }
 
   const int TagSpan = MPITagMaxValue - FirstEventTag + 1;
+  const int BaseSpan = std::max(1, TagSpan - EventTagStride + 1);
   const int Offset = static_cast<int>(
-      static_cast<unsigned int>(EventId) % static_cast<unsigned int>(TagSpan));
+      (static_cast<uint64_t>(static_cast<unsigned int>(EventId)) *
+       EventTagStride) %
+      static_cast<uint64_t>(BaseSpan));
   return FirstEventTag + Offset;
 }
 
@@ -1463,12 +1514,17 @@ MPI_Comm &EventSystemTy::getNewEventComm(int EventId) {
     return GateThreadComm;
   }
 
+  constexpr int EventTagStride = 8;
   const int FirstEventTag = static_cast<int>(ControlTagsTy::FIRST_EVENT);
-  const int TagSpan = MPITagMaxValue >= FirstEventTag
+  const int TagSpan = MPITagMaxValue >= FirstEventTag + EventTagStride
                           ? MPITagMaxValue - FirstEventTag + 1
                           : 1;
+  const int BaseSpan = std::max(1, TagSpan - EventTagStride + 1);
+  const uint64_t LogicalTagOffset =
+      static_cast<uint64_t>(static_cast<unsigned int>(EventId)) *
+      EventTagStride;
   const size_t CommIndex =
-      (static_cast<unsigned int>(EventId) / static_cast<unsigned int>(TagSpan)) %
+      (LogicalTagOffset / static_cast<uint64_t>(BaseSpan)) %
       EventCommPool.size();
   return EventCommPool[CommIndex];
 }

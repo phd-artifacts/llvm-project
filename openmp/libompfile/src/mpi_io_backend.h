@@ -66,6 +66,15 @@ private:
     bool HasTile = false;
   };
   std::unordered_map<int, std::vector<WriteEpochEntry>> file_write_epoch_history;
+  struct DirtyOwnerReadCacheEntry {
+    int FileId = -1;
+    int SourceRank = -1;
+    uint64_t Version = 0;
+    long Start = 0;
+    long End = 0;
+    std::vector<char> Data;
+  };
+  std::deque<DirtyOwnerReadCacheEntry> dirty_owner_read_cache;
   std::unordered_map<int, WritableStageCoherenceState>
       writable_stage_coherence;
   uint64_t next_write_sequence = 1;
