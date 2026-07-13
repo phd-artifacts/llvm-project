@@ -2134,6 +2134,75 @@ int ompfile_mpp_freshness_query(const OmpFileFreshnessQueryRequest *Request,
   return OFFLOAD_SUCCESS;
 }
 
+int ompfile_mpp_dirty_owner_pread_batch_ex(
+    int Handle, int SourceRank,
+    const OmpFileDirtyOwnerPreadBatchSegment *Segments, uint64_t SegmentCount,
+    void *const *Buffers, uint64_t *BytesRead, int *Statuses, int *Errnos) {
+  using namespace llvm::omp::target::plugin;
+  if (!Segments || !Buffers || !BytesRead || !Statuses || !Errnos ||
+      SourceRank < 0 || SegmentCount == 0) {
+    errno = EINVAL;
+    return OFFLOAD_FAIL;
+  }
+  for (uint64_t I = 0; I < SegmentCount; ++I) {
+    BytesRead[I] = 0;
+    Statuses[I] = -1;
+    Errnos[I] = 0;
+  }
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  OmpfileMppHandleEntry Entry{};
+  {
+    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+    if (!findOmpfileMppHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+  }
+  if (Entry.Rank != SourceRank) {
+    errno = EINVAL;
+    return OFFLOAD_FAIL;
+  }
+
+  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfileDirtyOwnerPreadBatch,
+      EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD_BATCH,
+      /*DstDeviceID=*/SourceRank, Entry.RemoteHandle, Segments, SegmentCount,
+      Buffers, Statuses, Errnos, BytesRead);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+  Event.wait();
+  if (auto Error = Event.getError())
+    return OFFLOAD_FAIL;
+
+  bool AnyFailure = false;
+  for (uint64_t I = 0; I < SegmentCount; ++I) {
+    if (Statuses[I] != 0) {
+      AnyFailure = true;
+      continue;
+    }
+    if (BytesRead[I] > Segments[I].Size) {
+      Statuses[I] = -1;
+      Errnos[I] = EPROTO;
+      AnyFailure = true;
+      continue;
+    }
+    if (BytesRead[I] < Segments[I].Size)
+      std::memset(static_cast<char *>(Buffers[I]) + BytesRead[I], 0,
+                  static_cast<size_t>(Segments[I].Size - BytesRead[I]));
+  }
+  if (AnyFailure) {
+    errno = EIO;
+    return OFFLOAD_FAIL;
+  }
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_dirty_owner_query_ex(int Handle, int SourceRank,
                                      uint64_t ExpectedVersion, int64_t Offset,
                                      uint64_t Size, int *StateOut) {

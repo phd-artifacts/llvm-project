@@ -102,6 +102,8 @@ std::string EventTypeToString(EventTypeTy eventType) {
       return "OMPFILE_DIRTY_OWNER_PREAD";
     case EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY:
       return "OMPFILE_DIRTY_OWNER_QUERY";
+    case EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD_BATCH:
+      return "OMPFILE_DIRTY_OWNER_PREAD_BATCH";
     case EventTypeTy::EXIT: return "EXIT";
     default: return "UNKNOWN_EVENT_TYPE";
   }
@@ -931,6 +933,86 @@ EventTy ompfileDirtyOwnerPread(MPIRequestManagerTy RequestManager,
   }
 
   RequestManager.receiveTagged(nullptr, 0, MPI_BYTE, /*TagOffset=*/3);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileDirtyOwnerPreadBatch(
+    MPIRequestManagerTy RequestManager, int RemoteHandle,
+    const OmpFileDirtyOwnerPreadBatchSegment *Segments, uint64_t SegmentCount,
+    void *const *Buffers, int *IoRets, int *RemoteErrnos, uint64_t *Bytes) {
+  if (!Segments || !Buffers || !IoRets || !RemoteErrnos || !Bytes)
+    co_return createError("OMPFile dirty-owner batch missing buffers.");
+  if (SegmentCount == 0)
+    co_return createError("OMPFile dirty-owner batch has no segments.");
+
+  RequestManager.send(&RemoteHandle, 1, MPI_INT);
+  RequestManager.send(&SegmentCount, 1, MPI_UINT64_T);
+  RequestManager.send(Segments,
+                      SegmentCount * sizeof(OmpFileDirtyOwnerPreadBatchSegment),
+                      MPI_BYTE);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  OmpFileDirtyOwnerPreadBatchReplyHeader Header{};
+  RequestManager.receiveTagged(&Header, sizeof(Header), MPI_BYTE,
+                               /*TagOffset=*/1);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+  if (Header.AbiVersion != OMPFILE_DIRTY_OWNER_PREAD_ABI_VERSION ||
+      Header.Magic != OMPFILE_DIRTY_OWNER_PREAD_BATCH_REPLY_MAGIC ||
+      Header.SegmentCount != SegmentCount)
+    co_return createError("Invalid dirty-owner batch header: abi=%u magic=%u "
+                          "segments=%llu expected=%llu",
+                          Header.AbiVersion, Header.Magic,
+                          static_cast<unsigned long long>(Header.SegmentCount),
+                          static_cast<unsigned long long>(SegmentCount));
+
+  std::vector<OmpFileDirtyOwnerPreadBatchReplySegment> Replies(SegmentCount);
+  RequestManager.receiveTagged(Replies.data(),
+                               Replies.size() * sizeof(Replies.front()),
+                               MPI_BYTE, /*TagOffset=*/2);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  for (uint64_t I = 0; I < SegmentCount; ++I) {
+    const auto &Reply = Replies[I];
+    if (Reply.ClientSegmentId >= SegmentCount)
+      co_return createError("Invalid dirty-owner batch segment id: %llu >= %llu",
+                            static_cast<unsigned long long>(
+                                Reply.ClientSegmentId),
+                            static_cast<unsigned long long>(SegmentCount));
+    const auto &Segment = Segments[Reply.ClientSegmentId];
+    if (Reply.Offset != static_cast<uint64_t>(Segment.Offset) ||
+        Reply.ExpectedVersion != Segment.ExpectedVersion ||
+        Reply.Bytes > Segment.Size)
+      co_return createError("Invalid dirty-owner batch segment reply: id=%llu "
+                            "offset=%llu expected_offset=%llu bytes=%llu "
+                            "size=%llu version=%llu expected_version=%llu",
+                            static_cast<unsigned long long>(
+                                Reply.ClientSegmentId),
+                            static_cast<unsigned long long>(Reply.Offset),
+                            static_cast<unsigned long long>(Segment.Offset),
+                            static_cast<unsigned long long>(Reply.Bytes),
+                            static_cast<unsigned long long>(Segment.Size),
+                            static_cast<unsigned long long>(
+                                Reply.ExpectedVersion),
+                            static_cast<unsigned long long>(
+                                Segment.ExpectedVersion));
+    IoRets[Reply.ClientSegmentId] = Reply.Ret;
+    RemoteErrnos[Reply.ClientSegmentId] = Reply.Errno;
+    Bytes[Reply.ClientSegmentId] = Reply.Bytes;
+  }
+
+  for (uint64_t I = 0; I < SegmentCount; ++I) {
+    if (Bytes[I] == 0)
+      continue;
+    RequestManager.receiveInBatchsTagged(Buffers[I], Bytes[I],
+                                         /*TagOffset=*/3);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+  }
+
+  RequestManager.receiveTagged(nullptr, 0, MPI_BYTE, /*TagOffset=*/4);
   co_return (co_await RequestManager);
 }
 

@@ -26,6 +26,18 @@ bool preadNoStageEx(int handle, int64_t offset, void *buffer, size_t size,
 bool dirtyOwnerPreadEx(int handle, int source_rank, uint64_t expected_version,
                        int64_t offset, void *buffer, size_t size,
                        size_t &bytes_read);
+struct DirtyOwnerPreadBatchSegment {
+  int64_t offset = 0;
+  size_t size = 0;
+  uint64_t expected_version = 0;
+  void *buffer = nullptr;
+  size_t bytes_read = 0;
+  int status = -1;
+  int error = 0;
+};
+bool dirtyOwnerPreadBatchEx(int handle, int source_rank,
+                            DirtyOwnerPreadBatchSegment *segments,
+                            size_t segment_count);
 bool dirtyOwnerQueryEx(int handle, int source_rank, uint64_t expected_version,
                        int64_t offset, size_t size, int &state_out);
 bool pread(int handle, int64_t offset, void *buffer, size_t size);

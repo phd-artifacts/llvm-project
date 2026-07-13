@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <limits>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -33,6 +34,15 @@ using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppPreadNoStageExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
 using MppDirtyOwnerPreadExFn = int (*)(int, int, uint64_t, int64_t, void *,
                                        uint64_t, uint64_t *);
+struct MppDirtyOwnerPreadBatchAbiSegment {
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+  uint64_t ExpectedVersion = 0;
+  uint64_t ClientSegmentId = 0;
+};
+using MppDirtyOwnerPreadBatchExFn = int (*)(
+    int, int, const MppDirtyOwnerPreadBatchAbiSegment *, uint64_t,
+    void *const *, uint64_t *, int *, int *);
 using MppDirtyOwnerQueryExFn = int (*)(int, int, uint64_t, int64_t, uint64_t,
                                        int *);
 using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
@@ -65,6 +75,7 @@ struct MppApi {
   MppPreadExFn pread_ex = nullptr;
   MppPreadNoStageExFn pread_no_stage_ex = nullptr;
   MppDirtyOwnerPreadExFn dirty_owner_pread_ex = nullptr;
+  MppDirtyOwnerPreadBatchExFn dirty_owner_pread_batch_ex = nullptr;
   MppDirtyOwnerQueryExFn dirty_owner_query_ex = nullptr;
   MppPwriteFn pwrite = nullptr;
   MppPwriteExFn pwrite_ex = nullptr;
@@ -102,6 +113,9 @@ MppApi loadMppApi() {
       dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_no_stage_ex"));
   loaded.dirty_owner_pread_ex = reinterpret_cast<MppDirtyOwnerPreadExFn>(
       dlsym(RTLD_DEFAULT, "ompfile_mpp_dirty_owner_pread_ex"));
+  loaded.dirty_owner_pread_batch_ex =
+      reinterpret_cast<MppDirtyOwnerPreadBatchExFn>(
+          dlsym(RTLD_DEFAULT, "ompfile_mpp_dirty_owner_pread_batch_ex"));
   loaded.dirty_owner_query_ex = reinterpret_cast<MppDirtyOwnerQueryExFn>(
       dlsym(RTLD_DEFAULT, "ompfile_mpp_dirty_owner_query_ex"));
   loaded.pwrite = reinterpret_cast<MppPwriteFn>(dlsym(RTLD_DEFAULT,
@@ -177,6 +191,9 @@ bool init() {
                         reinterpret_cast<void *>(api.pread_ex));
   io_trace_symbol_owner("ompfile_mpp_dirty_owner_pread_ex",
                         reinterpret_cast<void *>(api.dirty_owner_pread_ex));
+  io_trace_symbol_owner(
+      "ompfile_mpp_dirty_owner_pread_batch_ex",
+      reinterpret_cast<void *>(api.dirty_owner_pread_batch_ex));
   io_trace_symbol_owner("ompfile_mpp_pwrite",
                         reinterpret_cast<void *>(api.pwrite));
   io_trace_symbol_owner("ompfile_mpp_pwrite_ex",
@@ -461,6 +478,66 @@ bool dirtyOwnerPreadEx(int handle, int source_rank, uint64_t expected_version,
   }
   bytes_read = static_cast<size_t>(remote_bytes_read);
   return true;
+}
+
+bool dirtyOwnerPreadBatchEx(int handle, int source_rank,
+                            DirtyOwnerPreadBatchSegment *segments,
+                            size_t segment_count) {
+  if (!segments || segment_count == 0 || source_rank < 0) {
+    errno = EINVAL;
+    return false;
+  }
+  if (!init())
+    return false;
+  auto &api = getMppApi();
+  if (!api.dirty_owner_pread_batch_ex)
+    api = loadMppApi();
+  if (!api.dirty_owner_pread_batch_ex) {
+    errno = ENOSYS;
+    return false;
+  }
+
+  std::vector<MppDirtyOwnerPreadBatchAbiSegment> AbiSegments(segment_count);
+  std::vector<void *> Buffers(segment_count, nullptr);
+  std::vector<uint64_t> Bytes(segment_count, 0);
+  std::vector<int> Statuses(segment_count, -1);
+  std::vector<int> Errnos(segment_count, 0);
+  for (size_t I = 0; I < segment_count; ++I) {
+    if (!segments[I].buffer && segments[I].size > 0) {
+      errno = EINVAL;
+      return false;
+    }
+    AbiSegments[I].Offset = segments[I].offset;
+    AbiSegments[I].Size = static_cast<uint64_t>(segments[I].size);
+    AbiSegments[I].ExpectedVersion = segments[I].expected_version;
+    AbiSegments[I].ClientSegmentId = I;
+    Buffers[I] = segments[I].buffer;
+    segments[I].bytes_read = 0;
+    segments[I].status = -1;
+    segments[I].error = 0;
+  }
+
+  const int rc = api.dirty_owner_pread_batch_ex(
+      handle, source_rank, AbiSegments.data(),
+      static_cast<uint64_t>(segment_count), Buffers.data(), Bytes.data(),
+      Statuses.data(), Errnos.data());
+  bool AllOk = rc == 0;
+  for (size_t I = 0; I < segment_count; ++I) {
+    segments[I].status = Statuses[I];
+    segments[I].error = Errnos[I];
+    if (Bytes[I] > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      segments[I].status = -1;
+      segments[I].error = EOVERFLOW;
+      AllOk = false;
+      continue;
+    }
+    segments[I].bytes_read = static_cast<size_t>(Bytes[I]);
+    if (segments[I].status != 0)
+      AllOk = false;
+  }
+  if (!AllOk && errno == 0)
+    errno = EIO;
+  return AllOk;
 }
 
 bool dirtyOwnerQueryEx(int handle, int source_rank, uint64_t expected_version,

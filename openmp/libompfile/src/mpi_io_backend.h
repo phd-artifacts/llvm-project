@@ -199,8 +199,22 @@ private:
   std::atomic<uint64_t> stage_affinity_source_applied_count{0};
   std::atomic<uint64_t> stage_affinity_source_applied_bytes{0};
   std::atomic<uint64_t> stage_affinity_source_fallback_count{0};
+  std::atomic<uint64_t> dirty_owner_batch_candidate_count{0};
+  std::atomic<uint64_t> dirty_owner_batch_count{0};
+  std::atomic<uint64_t> dirty_owner_batch_segment_count{0};
+  std::atomic<uint64_t> dirty_owner_batch_saved_events{0};
+  std::atomic<uint64_t> dirty_owner_batch_bytes{0};
+  std::atomic<uint64_t> dirty_owner_batch_failure_count{0};
+  std::atomic<uint64_t> dirty_owner_prefetch_attempt_count{0};
+  std::atomic<uint64_t> dirty_owner_prefetch_cached_count{0};
+  std::atomic<uint64_t> dirty_owner_prefetch_disabled_count{0};
+  std::atomic<uint64_t> dirty_owner_queue_max_depth{0};
+  std::atomic<uint64_t> dirty_owner_follower_wait_count{0};
+  std::atomic<uint64_t> dirty_owner_follower_wait_us_total{0};
+  std::atomic<uint64_t> dirty_owner_batch_window_wait_us_total{0};
   bool two_phase_batch_in_progress = false;
   bool write_batch_in_progress = false;
+  bool dirty_owner_batch_in_progress = false;
 
   struct TwoPhaseReadRequest {
     uint64_t DebugRequestId = 0;
@@ -236,6 +250,25 @@ private:
   std::mutex write_batch_mutex;
   std::condition_variable write_batch_queue_cv;
   std::deque<WriteBatchRequest *> write_batch_queue;
+
+  struct DirtyOwnerBatchRequest {
+    int FileId = -1;
+    int RemoteHandle = -1;
+    int SourceRank = -1;
+    uint64_t ExpectedVersion = 0;
+    long Offset = 0;
+    size_t Size = 0;
+    void *Buffer = nullptr;
+    uint64_t DebugRequestId = 0;
+    size_t BytesRead = 0;
+    int Status = 0;
+    int Errno = 0;
+    bool Done = false;
+  };
+
+  std::mutex dirty_owner_batch_mutex;
+  std::condition_variable dirty_owner_batch_cv;
+  std::deque<DirtyOwnerBatchRequest *> dirty_owner_batch_queue;
   struct TwoPhaseReadCacheEntry {
     long Start = 0;
     std::vector<char> Data;
@@ -703,6 +736,11 @@ private:
   bool readAtRemoteRankNoStageWithBytes(int file_id, int target_rank,
                                         long offset, void *data, size_t size,
                                         size_t &bytes_read);
+  bool dirtyOwnerPreadMaybeBatch(int file_id, int remote_handle,
+                                 int source_rank, uint64_t expected_version,
+                                 long offset, void *data, size_t size,
+                                 size_t &bytes_read, int &read_errno,
+                                 uint64_t debug_request_id);
   bool writeAtRemoteRankWithBytes(int file_id, int target_rank, long offset,
                                   const void *data, size_t size,
                                   size_t &bytes_written);

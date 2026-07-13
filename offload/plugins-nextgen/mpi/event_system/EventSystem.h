@@ -138,6 +138,7 @@ enum class EventTypeTy : unsigned int {
   OMPFILE_FLUSH_DIRTY_TILE = 42, // Flush dirty tile metadata on headnode.
   OMPFILE_DIRTY_OWNER_PREAD = 43, // Read dirty staged bytes from owner proxy.
   OMPFILE_DIRTY_OWNER_QUERY = 44, // Classify dirty staged bytes without reading.
+  OMPFILE_DIRTY_OWNER_PREAD_BATCH = 45, // Batched dirty staged reads.
 
   // Internal event system commands.
   EXIT = 35 // Stops the event system execution at the remote process.
@@ -170,6 +171,9 @@ static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD) 
               43);
 static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY) ==
               44);
+static_assert(
+    static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD_BATCH) ==
+    45);
 
 using OmpFileFreshnessDecision = ompfile::OmpFileFreshnessDecision;
 using OmpFileFreshnessQueryRequest = ompfile::OmpFileFreshnessQueryRequest;
@@ -255,6 +259,32 @@ struct OmpFileDirtyOwnerPreadReplyFrame {
   int32_t Ret = -1;
   int32_t Errno = 0;
   uint64_t PayloadBytes = 0;
+  uint64_t ExpectedVersion = 0;
+  uint64_t Offset = 0;
+};
+
+constexpr uint32_t OMPFILE_DIRTY_OWNER_PREAD_BATCH_REPLY_MAGIC = 0x44525042u;
+
+struct OmpFileDirtyOwnerPreadBatchSegment {
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+  uint64_t ExpectedVersion = 0;
+  uint64_t ClientSegmentId = 0;
+};
+
+struct OmpFileDirtyOwnerPreadBatchReplyHeader {
+  uint32_t AbiVersion = OMPFILE_DIRTY_OWNER_PREAD_ABI_VERSION;
+  uint32_t Magic = OMPFILE_DIRTY_OWNER_PREAD_BATCH_REPLY_MAGIC;
+  uint64_t SegmentCount = 0;
+  uint64_t PayloadBytes = 0;
+};
+
+struct OmpFileDirtyOwnerPreadBatchReplySegment {
+  uint64_t ClientSegmentId = 0;
+  int32_t Ret = -1;
+  int32_t Errno = 0;
+  uint64_t Bytes = 0;
+  uint64_t PayloadOffset = 0;
   uint64_t ExpectedVersion = 0;
   uint64_t Offset = 0;
 };
@@ -744,6 +774,10 @@ EventTy ompfileDirtyOwnerPread(MPIRequestManagerTy RequestManager,
                                void *Buffer, uint64_t Size,
                                uint64_t ExpectedVersion, int *IoRet,
                                int *RemoteErrno, uint64_t *Bytes);
+EventTy ompfileDirtyOwnerPreadBatch(
+    MPIRequestManagerTy RequestManager, int RemoteHandle,
+    const OmpFileDirtyOwnerPreadBatchSegment *Segments, uint64_t SegmentCount,
+    void *const *Buffers, int *IoRets, int *RemoteErrnos, uint64_t *Bytes);
 EventTy ompfileDirtyOwnerQuery(MPIRequestManagerTy RequestManager,
                                int RemoteHandle, int64_t Offset,
                                uint64_t Size, uint64_t ExpectedVersion,

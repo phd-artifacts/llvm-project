@@ -58,6 +58,31 @@ uint64_t dirtyOwnerReadAheadBytes() {
   return 0;
 }
 
+bool dirtyOwnerBatchEnabled() {
+  return envEquals("LIBOMPFILE_OPT_DIRTY_OWNER_BATCH", "1");
+}
+
+unsigned dirtyOwnerBatchMaxSegments() {
+  if (const unsigned Value = parsePositiveEnv(
+          "LIBOMPFILE_OPT_DIRTY_OWNER_BATCH_MAX_SEGS"))
+    return std::max(1u, Value);
+  return 16;
+}
+
+unsigned dirtyOwnerBatchWindowUs() {
+  if (const unsigned Value = parsePositiveEnv(
+          "LIBOMPFILE_OPT_DIRTY_OWNER_BATCH_WINDOW_US"))
+    return Value;
+  return 0;
+}
+
+unsigned dirtyOwnerBatchPrefetchSegments() {
+  if (const unsigned Value = parsePositiveEnv(
+          "LIBOMPFILE_OPT_DIRTY_OWNER_BATCH_PREFETCH_SEGS"))
+    return Value;
+  return 1;
+}
+
 unsigned distributedWritebackRankCount() {
   if (const unsigned Explicit =
           parsePositiveEnv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS"))
@@ -117,6 +142,264 @@ FreshnessRouteDecision queryFreshnessForRank(uint64_t path_key,
 }
 
 } // namespace
+
+bool MPIIOBackend::dirtyOwnerPreadMaybeBatch(
+    int file_id, int remote_handle, int source_rank, uint64_t expected_version,
+    long offset, void *data, size_t size, size_t &bytes_read, int &read_errno,
+    uint64_t debug_request_id) {
+  bytes_read = 0;
+  read_errno = 0;
+  if (!dirtyOwnerBatchEnabled()) {
+    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    errno = 0;
+    const bool Ok = ompfile::mpp::dirtyOwnerPreadEx(
+        remote_handle, source_rank, expected_version, offset, data, size,
+        bytes_read);
+    read_errno = errno;
+    return Ok;
+  }
+
+  dirty_owner_batch_candidate_count.fetch_add(1, std::memory_order_relaxed);
+  DirtyOwnerBatchRequest Request{};
+  Request.FileId = file_id;
+  Request.RemoteHandle = remote_handle;
+  Request.SourceRank = source_rank;
+  Request.ExpectedVersion = expected_version;
+  Request.Offset = offset;
+  Request.Size = size;
+  Request.Buffer = data;
+  Request.DebugRequestId = debug_request_id;
+
+  bool IsLeader = false;
+  const auto WaitStart = std::chrono::steady_clock::now();
+  {
+    std::unique_lock<std::mutex> Lock(dirty_owner_batch_mutex);
+    dirty_owner_batch_queue.push_back(&Request);
+    const uint64_t QueueDepth = dirty_owner_batch_queue.size();
+    uint64_t Prev = dirty_owner_queue_max_depth.load(std::memory_order_relaxed);
+    while (QueueDepth > Prev &&
+           !dirty_owner_queue_max_depth.compare_exchange_weak(
+               Prev, QueueDepth, std::memory_order_relaxed)) {
+    }
+    if (!dirty_owner_batch_in_progress) {
+      dirty_owner_batch_in_progress = true;
+      IsLeader = true;
+    } else {
+      dirty_owner_follower_wait_count.fetch_add(1, std::memory_order_relaxed);
+      dirty_owner_batch_cv.wait(Lock, [&]() { return Request.Done; });
+      const auto WaitEnd = std::chrono::steady_clock::now();
+      dirty_owner_follower_wait_us_total.fetch_add(
+          std::chrono::duration_cast<std::chrono::microseconds>(WaitEnd -
+                                                                WaitStart)
+              .count(),
+          std::memory_order_relaxed);
+      bytes_read = Request.BytesRead;
+      read_errno = Request.Errno;
+      errno = Request.Errno;
+      return Request.Status == 0;
+    }
+  }
+
+  assert(IsLeader && "dirty-owner batch leader invariant");
+  bool FirstDrain = true;
+  while (true) {
+    if (FirstDrain) {
+      const unsigned WindowUs = dirtyOwnerBatchWindowUs();
+      if (WindowUs > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(WindowUs));
+        dirty_owner_batch_window_wait_us_total.fetch_add(
+            WindowUs, std::memory_order_relaxed);
+      }
+      FirstDrain = false;
+    }
+
+    std::vector<DirtyOwnerBatchRequest *> Batch;
+    {
+      std::lock_guard<std::mutex> Lock(dirty_owner_batch_mutex);
+      if (dirty_owner_batch_queue.empty()) {
+        dirty_owner_batch_in_progress = false;
+        dirty_owner_batch_cv.notify_all();
+        break;
+      }
+      DirtyOwnerBatchRequest *Seed = dirty_owner_batch_queue.front();
+      const unsigned MaxSegments = dirtyOwnerBatchMaxSegments();
+      for (auto It = dirty_owner_batch_queue.begin();
+           It != dirty_owner_batch_queue.end() && Batch.size() < MaxSegments;) {
+        DirtyOwnerBatchRequest *Candidate = *It;
+        if (Candidate->RemoteHandle == Seed->RemoteHandle &&
+            Candidate->SourceRank == Seed->SourceRank &&
+            Candidate->ExpectedVersion == Seed->ExpectedVersion) {
+          Batch.push_back(Candidate);
+          It = dirty_owner_batch_queue.erase(It);
+        } else {
+          ++It;
+        }
+      }
+    }
+
+    bool BatchOk = false;
+    if (Batch.size() > 1) {
+      std::vector<ompfile::mpp::DirtyOwnerPreadBatchSegment> Segments(
+          Batch.size());
+      size_t TotalBytes = 0;
+      for (size_t I = 0; I < Batch.size(); ++I) {
+        Segments[I].offset = Batch[I]->Offset;
+        Segments[I].size = Batch[I]->Size;
+        Segments[I].expected_version = Batch[I]->ExpectedVersion;
+        Segments[I].buffer = Batch[I]->Buffer;
+        TotalBytes += Batch[I]->Size;
+      }
+      {
+        const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+        errno = 0;
+        BatchOk = ompfile::mpp::dirtyOwnerPreadBatchEx(
+            Batch.front()->RemoteHandle, Batch.front()->SourceRank,
+            Segments.data(), Segments.size());
+      }
+      if (BatchOk) {
+        dirty_owner_batch_count.fetch_add(1, std::memory_order_relaxed);
+        dirty_owner_batch_segment_count.fetch_add(Batch.size(),
+                                                  std::memory_order_relaxed);
+        dirty_owner_batch_saved_events.fetch_add(Batch.size() - 1,
+                                                 std::memory_order_relaxed);
+        dirty_owner_batch_bytes.fetch_add(TotalBytes,
+                                          std::memory_order_relaxed);
+        for (size_t I = 0; I < Batch.size(); ++I) {
+          Batch[I]->BytesRead = Segments[I].bytes_read;
+          Batch[I]->Status = 0;
+          Batch[I]->Errno = 0;
+        }
+        io_log("Phase 1 dirty-worker batch staged read: request_id=%llu "
+               "file=%d source_rank=%d version=%llu segments=%zu bytes=%zu\n",
+               static_cast<unsigned long long>(Batch.front()->DebugRequestId),
+               Batch.front()->FileId, Batch.front()->SourceRank,
+               static_cast<unsigned long long>(Batch.front()->ExpectedVersion),
+               Batch.size(), TotalBytes);
+      } else {
+        dirty_owner_batch_failure_count.fetch_add(1,
+                                                  std::memory_order_relaxed);
+      }
+    }
+
+    if (Batch.size() <= 1 || !BatchOk) {
+      for (DirtyOwnerBatchRequest *Entry : Batch) {
+        unsigned PrefetchSegments = dirtyOwnerBatchPrefetchSegments();
+        const uint64_t PrefetchAttempts =
+            dirty_owner_prefetch_attempt_count.load(std::memory_order_relaxed);
+        const uint64_t PrefetchCached =
+            dirty_owner_prefetch_cached_count.load(std::memory_order_relaxed);
+        if (PrefetchAttempts >= 128 && PrefetchCached == 0) {
+          dirty_owner_prefetch_disabled_count.fetch_add(
+              1, std::memory_order_relaxed);
+          PrefetchSegments = 1;
+        }
+        if (PrefetchSegments > 1 && Entry->Size > 0) {
+          std::vector<ompfile::mpp::DirtyOwnerPreadBatchSegment> Segments(
+              PrefetchSegments);
+          std::vector<std::vector<char>> PrefetchBuffers(PrefetchSegments);
+          Segments[0].offset = Entry->Offset;
+          Segments[0].size = Entry->Size;
+          Segments[0].expected_version = Entry->ExpectedVersion;
+          Segments[0].buffer = Entry->Buffer;
+          for (unsigned I = 1; I < PrefetchSegments; ++I) {
+            PrefetchBuffers[I].resize(Entry->Size);
+            Segments[I].offset =
+                Entry->Offset + static_cast<long>(I * Entry->Size);
+            Segments[I].size = Entry->Size;
+            Segments[I].expected_version = Entry->ExpectedVersion;
+            Segments[I].buffer = PrefetchBuffers[I].data();
+          }
+          {
+            const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+            errno = 0;
+            (void)ompfile::mpp::dirtyOwnerPreadBatchEx(
+                Entry->RemoteHandle, Entry->SourceRank, Segments.data(),
+                Segments.size());
+          }
+          if (Segments[0].status == 0) {
+            size_t CachedSegments = 0;
+            size_t CachedBytes = 0;
+            for (unsigned I = 1; I < PrefetchSegments; ++I) {
+              if (Segments[I].status != 0 || Segments[I].bytes_read == 0)
+                continue;
+              DirtyOwnerReadCacheEntry CacheEntry{};
+              CacheEntry.FileId = Entry->FileId;
+              CacheEntry.SourceRank = Entry->SourceRank;
+              CacheEntry.Version = Entry->ExpectedVersion;
+              CacheEntry.Start = Segments[I].offset;
+              CacheEntry.End = Segments[I].offset +
+                               static_cast<long>(Segments[I].bytes_read);
+              CacheEntry.Data.assign(PrefetchBuffers[I].begin(),
+                                     PrefetchBuffers[I].begin() +
+                                         static_cast<long>(
+                                             Segments[I].bytes_read));
+              {
+                const std::lock_guard<std::mutex> lock(handle_mutex);
+                dirty_owner_read_cache.push_back(std::move(CacheEntry));
+                while (dirty_owner_read_cache.size() > 1024)
+                  dirty_owner_read_cache.pop_front();
+              }
+              ++CachedSegments;
+              CachedBytes += Segments[I].bytes_read;
+            }
+            dirty_owner_prefetch_attempt_count.fetch_add(
+                1, std::memory_order_relaxed);
+            dirty_owner_prefetch_cached_count.fetch_add(
+                CachedSegments, std::memory_order_relaxed);
+            dirty_owner_batch_count.fetch_add(1, std::memory_order_relaxed);
+            dirty_owner_batch_segment_count.fetch_add(PrefetchSegments,
+                                                      std::memory_order_relaxed);
+            dirty_owner_batch_saved_events.fetch_add(CachedSegments,
+                                                     std::memory_order_relaxed);
+            dirty_owner_batch_bytes.fetch_add(Entry->Size + CachedBytes,
+                                              std::memory_order_relaxed);
+            Entry->BytesRead = Segments[0].bytes_read;
+            Entry->Status = 0;
+            Entry->Errno = 0;
+            io_log("Phase 1 dirty-worker batch staged prefetch: "
+                   "request_id=%llu file=%d source_rank=%d version=%llu "
+                   "segments=%u cached_segments=%zu bytes=%zu cached_bytes=%zu\n",
+                   static_cast<unsigned long long>(Entry->DebugRequestId),
+                   Entry->FileId, Entry->SourceRank,
+                   static_cast<unsigned long long>(Entry->ExpectedVersion),
+                   PrefetchSegments, CachedSegments, Entry->BytesRead,
+                   CachedBytes);
+            continue;
+          }
+          dirty_owner_batch_failure_count.fetch_add(
+              1, std::memory_order_relaxed);
+        }
+
+        size_t ScalarBytes = 0;
+        bool ScalarOk = false;
+        int ScalarErrno = 0;
+        {
+          const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+          errno = 0;
+          ScalarOk = ompfile::mpp::dirtyOwnerPreadEx(
+              Entry->RemoteHandle, Entry->SourceRank, Entry->ExpectedVersion,
+              Entry->Offset, Entry->Buffer, Entry->Size, ScalarBytes);
+          ScalarErrno = errno;
+        }
+        Entry->BytesRead = ScalarBytes;
+        Entry->Status = ScalarOk ? 0 : -1;
+        Entry->Errno = ScalarOk ? 0 : (ScalarErrno != 0 ? ScalarErrno : EIO);
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> Lock(dirty_owner_batch_mutex);
+      for (DirtyOwnerBatchRequest *Entry : Batch)
+        Entry->Done = true;
+    }
+    dirty_owner_batch_cv.notify_all();
+  }
+
+  bytes_read = Request.BytesRead;
+  read_errno = Request.Errno;
+  errno = Request.Errno;
+  return Request.Status == 0;
+}
 
 int MPIIOBackend::readAt(int file_id, long offset, void *data, size_t size) {
   ompfile::OmpFileReadRequestContext context{};
@@ -476,12 +759,11 @@ int MPIIOBackend::readAtWithContext(
                 }
               }
               if (!dirty_source_read_ok) {
-                const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-                errno = 0;
-                dirty_source_read_ok = ompfile::mpp::dirtyOwnerPreadEx(
-                    remote_handle, DirtySourceRank, DirtyExpectedVersion,
-                    offset, data, size, dirty_source_bytes_read);
-                dirty_source_read_errno = errno;
+                dirty_source_read_ok = dirtyOwnerPreadMaybeBatch(
+                    file_id, remote_handle, DirtySourceRank,
+                    DirtyExpectedVersion, offset, data, size,
+                    dirty_source_bytes_read, dirty_source_read_errno,
+                    context.RequestId);
               }
               if (dirty_source_read_ok) {
                 dirty_owner_forward_success_count.fetch_add(

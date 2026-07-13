@@ -4337,6 +4337,85 @@ struct ProxyDevice {
     co_return (co_await RequestManager);
   }
 
+  EventTy ompfileDirtyOwnerPreadBatch(MPIRequestManagerTy RequestManager) {
+    int Fd = -1;
+    uint64_t SegmentCount = 0;
+
+    RequestManager.receive(&Fd, 1, MPI_INT);
+    RequestManager.receive(&SegmentCount, 1, MPI_UINT64_T);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+    if (SegmentCount == 0 || SegmentCount > 4096)
+      co_return createError("Invalid dirty-owner batch segment count: %llu",
+                            static_cast<unsigned long long>(SegmentCount));
+
+    std::vector<OmpFileDirtyOwnerPreadBatchSegment> Segments(SegmentCount);
+    RequestManager.receive(Segments.data(),
+                           Segments.size() * sizeof(Segments.front()),
+                           MPI_BYTE);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+
+    std::vector<std::vector<char>> Payloads(SegmentCount);
+    std::vector<OmpFileDirtyOwnerPreadBatchReplySegment> Replies(SegmentCount);
+    uint64_t PayloadTotal = 0;
+    for (uint64_t I = 0; I < SegmentCount; ++I) {
+      const auto &Segment = Segments[I];
+      auto &Reply = Replies[I];
+      Reply.ClientSegmentId = Segment.ClientSegmentId;
+      Reply.ExpectedVersion = Segment.ExpectedVersion;
+      Reply.Offset = static_cast<uint64_t>(Segment.Offset);
+      Reply.PayloadOffset = PayloadTotal;
+      if (Segment.Size > 0)
+        Payloads[I].resize(static_cast<size_t>(Segment.Size));
+      int Errno = 0;
+      uint64_t PayloadSize = 0;
+      const bool Ok = Segment.Size == 0 ||
+                      preadDirtyOwnerStageOnly(
+                          Fd, Segment.Offset, Payloads[I].data(), Segment.Size,
+                          Segment.ExpectedVersion, &PayloadSize, Errno);
+      if (!Ok) {
+        OmpFileStatsDirtyOwnerForwardFailures.fetch_add(
+            1, std::memory_order_relaxed);
+        Reply.Ret = -1;
+        Reply.Errno = Errno != 0 ? Errno : EIO;
+        Reply.Bytes = 0;
+        Payloads[I].clear();
+        continue;
+      }
+      if (PayloadSize > Segment.Size)
+        PayloadSize = Segment.Size;
+      Payloads[I].resize(static_cast<size_t>(PayloadSize));
+      Reply.Ret = 0;
+      Reply.Errno = 0;
+      Reply.Bytes = PayloadSize;
+      Reply.PayloadOffset = PayloadTotal;
+      PayloadTotal += PayloadSize;
+    }
+
+    OmpFileDirtyOwnerPreadBatchReplyHeader Header{};
+    Header.SegmentCount = SegmentCount;
+    Header.PayloadBytes = PayloadTotal;
+    RequestManager.sendTagged(&Header, sizeof(Header), MPI_BYTE,
+                              /*TagOffset=*/1);
+    RequestManager.sendTagged(Replies.data(),
+                              Replies.size() * sizeof(Replies.front()),
+                              MPI_BYTE, /*TagOffset=*/2);
+    for (uint64_t I = 0; I < SegmentCount; ++I) {
+      if (Payloads[I].empty())
+        continue;
+      RequestManager.sendInBatchsTagged(Payloads[I].data(), Payloads[I].size(),
+                                        /*TagOffset=*/3);
+    }
+    traceOmpFile("event ompfileDirtyOwnerPreadBatch framed fd=%d segments=%llu "
+                 "payload_bytes=%llu\n",
+                 Fd, static_cast<unsigned long long>(SegmentCount),
+                 static_cast<unsigned long long>(PayloadTotal));
+
+    RequestManager.sendTagged(nullptr, 0, MPI_BYTE, /*TagOffset=*/4);
+    co_return (co_await RequestManager);
+  }
+
   EventTy ompfileDirtyOwnerQuery(MPIRequestManagerTy RequestManager) {
     int Fd = -1;
     int64_t Offset = 0;
@@ -5561,6 +5640,84 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
+  int mppDirtyOwnerPreadBatchEx(
+      int Handle, int SourceRank,
+      const OmpFileDirtyOwnerPreadBatchSegment *Segments, uint64_t SegmentCount,
+      void *const *Buffers, uint64_t *BytesRead, int *Statuses,
+      int *Errnos) {
+    if (!Segments || !Buffers || !BytesRead || !Statuses || !Errnos ||
+        SourceRank < 0 || SegmentCount == 0) {
+      errno = EINVAL;
+      return OFFLOAD_FAIL;
+    }
+    for (uint64_t I = 0; I < SegmentCount; ++I) {
+      BytesRead[I] = 0;
+      Statuses[I] = -1;
+      Errnos[I] = 0;
+    }
+    OmpFileHandleEntry Entry{};
+    if (!findRemoteHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+    if (Entry.Rank != SourceRank) {
+      errno = EINVAL;
+      return OFFLOAD_FAIL;
+    }
+    if (SourceRank == EventSystem.LocalRank) {
+      for (uint64_t I = 0; I < SegmentCount; ++I) {
+        int LocalErrno = 0;
+        uint64_t LocalBytes = 0;
+        if (!preadDirtyOwnerStageOnly(Entry.RemoteHandle, Segments[I].Offset,
+                                      Buffers[I], Segments[I].Size,
+                                      Segments[I].ExpectedVersion, &LocalBytes,
+                                      LocalErrno)) {
+          Statuses[I] = -1;
+          Errnos[I] = LocalErrno != 0 ? LocalErrno : EIO;
+          continue;
+        }
+        if (LocalBytes > Segments[I].Size) {
+          Statuses[I] = -1;
+          Errnos[I] = EPROTO;
+          continue;
+        }
+        if (LocalBytes < Segments[I].Size)
+          std::memset(static_cast<char *>(Buffers[I]) + LocalBytes, 0,
+                      static_cast<size_t>(Segments[I].Size - LocalBytes));
+        BytesRead[I] = LocalBytes;
+        Statuses[I] = 0;
+      }
+      return OFFLOAD_SUCCESS;
+    }
+
+    EventTy Event = createRankEvent(
+        OriginEvents::ompfileDirtyOwnerPreadBatch,
+        EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD_BATCH, SourceRank,
+        /*TargetDeviceId=*/0, Entry.RemoteHandle, Segments, SegmentCount,
+        Buffers, Statuses, Errnos, BytesRead);
+    if (!waitForEvent(Event, "dirty_owner_pread_batch"))
+      return OFFLOAD_FAIL;
+    bool AnyFailure = false;
+    for (uint64_t I = 0; I < SegmentCount; ++I) {
+      if (Statuses[I] != 0) {
+        AnyFailure = true;
+        continue;
+      }
+      if (BytesRead[I] > Segments[I].Size) {
+        Statuses[I] = -1;
+        Errnos[I] = EPROTO;
+        AnyFailure = true;
+        continue;
+      }
+      if (BytesRead[I] < Segments[I].Size)
+        std::memset(static_cast<char *>(Buffers[I]) + BytesRead[I], 0,
+                    static_cast<size_t>(Segments[I].Size - BytesRead[I]));
+    }
+    if (AnyFailure) {
+      errno = EIO;
+      return OFFLOAD_FAIL;
+    }
+    return OFFLOAD_SUCCESS;
+  }
+
   int mppDirtyOwnerQueryEx(int Handle, int SourceRank,
                            uint64_t ExpectedVersion, int64_t Offset,
                            uint64_t Size, int *StateOut) {
@@ -6249,6 +6406,9 @@ struct ProxyDevice {
       case OMPFILE_DIRTY_OWNER_PREAD:
         NewEvent = ompfileDirtyOwnerPread(std::move(RequestManager));
         break;
+      case OMPFILE_DIRTY_OWNER_PREAD_BATCH:
+        NewEvent = ompfileDirtyOwnerPreadBatch(std::move(RequestManager));
+        break;
       case OMPFILE_DIRTY_OWNER_QUERY:
         NewEvent = ompfileDirtyOwnerQuery(std::move(RequestManager));
         break;
@@ -6559,6 +6719,18 @@ int ompfile_mpp_dirty_owner_pread_ex(int Handle, int SourceRank,
     return OFFLOAD_FAIL;
   return PD->mppDirtyOwnerPreadEx(Handle, SourceRank, ExpectedVersion, Offset,
                                   Buffer, Size, BytesRead);
+}
+
+int ompfile_mpp_dirty_owner_pread_batch_ex(
+    int Handle, int SourceRank,
+    const OmpFileDirtyOwnerPreadBatchSegment *Segments, uint64_t SegmentCount,
+    void *const *Buffers, uint64_t *BytesRead, int *Statuses, int *Errnos) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppDirtyOwnerPreadBatchEx(Handle, SourceRank, Segments,
+                                       SegmentCount, Buffers, BytesRead,
+                                       Statuses, Errnos);
 }
 
 int ompfile_mpp_dirty_owner_query_ex(int Handle, int SourceRank,
