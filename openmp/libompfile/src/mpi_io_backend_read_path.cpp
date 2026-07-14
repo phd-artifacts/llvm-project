@@ -76,13 +76,6 @@ unsigned dirtyOwnerBatchWindowUs() {
   return 0;
 }
 
-unsigned dirtyOwnerBatchPrefetchSegments() {
-  if (const unsigned Value = parsePositiveEnv(
-          "LIBOMPFILE_OPT_DIRTY_OWNER_BATCH_PREFETCH_SEGS"))
-    return Value;
-  return 1;
-}
-
 unsigned distributedWritebackRankCount() {
   if (const unsigned Explicit =
           parsePositiveEnv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS"))
@@ -226,7 +219,8 @@ bool MPIIOBackend::dirtyOwnerPreadMaybeBatch(
       for (auto It = dirty_owner_batch_queue.begin();
            It != dirty_owner_batch_queue.end() && Batch.size() < MaxSegments;) {
         DirtyOwnerBatchRequest *Candidate = *It;
-        if (Candidate->RemoteHandle == Seed->RemoteHandle &&
+        if (Candidate->FileId == Seed->FileId &&
+            Candidate->RemoteHandle == Seed->RemoteHandle &&
             Candidate->SourceRank == Seed->SourceRank &&
             Candidate->ExpectedVersion == Seed->ExpectedVersion) {
           Batch.push_back(Candidate);
@@ -258,6 +252,10 @@ bool MPIIOBackend::dirtyOwnerPreadMaybeBatch(
       }
       if (BatchOk) {
         dirty_owner_batch_count.fetch_add(1, std::memory_order_relaxed);
+        dirty_owner_remote_read_event_count.fetch_add(
+            1, std::memory_order_relaxed);
+        dirty_owner_remote_read_bytes_total.fetch_add(
+            TotalBytes, std::memory_order_relaxed);
         dirty_owner_batch_segment_count.fetch_add(Batch.size(),
                                                   std::memory_order_relaxed);
         dirty_owner_batch_saved_events.fetch_add(Batch.size() - 1,
@@ -283,93 +281,6 @@ bool MPIIOBackend::dirtyOwnerPreadMaybeBatch(
 
     if (Batch.size() <= 1 || !BatchOk) {
       for (DirtyOwnerBatchRequest *Entry : Batch) {
-        unsigned PrefetchSegments = dirtyOwnerBatchPrefetchSegments();
-        const uint64_t PrefetchAttempts =
-            dirty_owner_prefetch_attempt_count.load(std::memory_order_relaxed);
-        const uint64_t PrefetchCached =
-            dirty_owner_prefetch_cached_count.load(std::memory_order_relaxed);
-        if (PrefetchAttempts >= 128 && PrefetchCached == 0) {
-          dirty_owner_prefetch_disabled_count.fetch_add(
-              1, std::memory_order_relaxed);
-          PrefetchSegments = 1;
-        }
-        if (PrefetchSegments > 1 && Entry->Size > 0) {
-          std::vector<ompfile::mpp::DirtyOwnerPreadBatchSegment> Segments(
-              PrefetchSegments);
-          std::vector<std::vector<char>> PrefetchBuffers(PrefetchSegments);
-          Segments[0].offset = Entry->Offset;
-          Segments[0].size = Entry->Size;
-          Segments[0].expected_version = Entry->ExpectedVersion;
-          Segments[0].buffer = Entry->Buffer;
-          for (unsigned I = 1; I < PrefetchSegments; ++I) {
-            PrefetchBuffers[I].resize(Entry->Size);
-            Segments[I].offset =
-                Entry->Offset + static_cast<long>(I * Entry->Size);
-            Segments[I].size = Entry->Size;
-            Segments[I].expected_version = Entry->ExpectedVersion;
-            Segments[I].buffer = PrefetchBuffers[I].data();
-          }
-          {
-            const std::lock_guard<std::mutex> lock(mpp_call_mutex);
-            errno = 0;
-            (void)ompfile::mpp::dirtyOwnerPreadBatchEx(
-                Entry->RemoteHandle, Entry->SourceRank, Segments.data(),
-                Segments.size());
-          }
-          if (Segments[0].status == 0) {
-            size_t CachedSegments = 0;
-            size_t CachedBytes = 0;
-            for (unsigned I = 1; I < PrefetchSegments; ++I) {
-              if (Segments[I].status != 0 || Segments[I].bytes_read == 0)
-                continue;
-              DirtyOwnerReadCacheEntry CacheEntry{};
-              CacheEntry.FileId = Entry->FileId;
-              CacheEntry.SourceRank = Entry->SourceRank;
-              CacheEntry.Version = Entry->ExpectedVersion;
-              CacheEntry.Start = Segments[I].offset;
-              CacheEntry.End = Segments[I].offset +
-                               static_cast<long>(Segments[I].bytes_read);
-              CacheEntry.Data.assign(PrefetchBuffers[I].begin(),
-                                     PrefetchBuffers[I].begin() +
-                                         static_cast<long>(
-                                             Segments[I].bytes_read));
-              {
-                const std::lock_guard<std::mutex> lock(handle_mutex);
-                dirty_owner_read_cache.push_back(std::move(CacheEntry));
-                while (dirty_owner_read_cache.size() > 1024)
-                  dirty_owner_read_cache.pop_front();
-              }
-              ++CachedSegments;
-              CachedBytes += Segments[I].bytes_read;
-            }
-            dirty_owner_prefetch_attempt_count.fetch_add(
-                1, std::memory_order_relaxed);
-            dirty_owner_prefetch_cached_count.fetch_add(
-                CachedSegments, std::memory_order_relaxed);
-            dirty_owner_batch_count.fetch_add(1, std::memory_order_relaxed);
-            dirty_owner_batch_segment_count.fetch_add(PrefetchSegments,
-                                                      std::memory_order_relaxed);
-            dirty_owner_batch_saved_events.fetch_add(CachedSegments,
-                                                     std::memory_order_relaxed);
-            dirty_owner_batch_bytes.fetch_add(Entry->Size + CachedBytes,
-                                              std::memory_order_relaxed);
-            Entry->BytesRead = Segments[0].bytes_read;
-            Entry->Status = 0;
-            Entry->Errno = 0;
-            io_log("Phase 1 dirty-worker batch staged prefetch: "
-                   "request_id=%llu file=%d source_rank=%d version=%llu "
-                   "segments=%u cached_segments=%zu bytes=%zu cached_bytes=%zu\n",
-                   static_cast<unsigned long long>(Entry->DebugRequestId),
-                   Entry->FileId, Entry->SourceRank,
-                   static_cast<unsigned long long>(Entry->ExpectedVersion),
-                   PrefetchSegments, CachedSegments, Entry->BytesRead,
-                   CachedBytes);
-            continue;
-          }
-          dirty_owner_batch_failure_count.fetch_add(
-              1, std::memory_order_relaxed);
-        }
-
         size_t ScalarBytes = 0;
         bool ScalarOk = false;
         int ScalarErrno = 0;
@@ -380,6 +291,14 @@ bool MPIIOBackend::dirtyOwnerPreadMaybeBatch(
               Entry->RemoteHandle, Entry->SourceRank, Entry->ExpectedVersion,
               Entry->Offset, Entry->Buffer, Entry->Size, ScalarBytes);
           ScalarErrno = errno;
+        }
+        if (ScalarOk) {
+          dirty_owner_single_read_count.fetch_add(1,
+                                                  std::memory_order_relaxed);
+          dirty_owner_remote_read_event_count.fetch_add(
+              1, std::memory_order_relaxed);
+          dirty_owner_remote_read_bytes_total.fetch_add(
+              ScalarBytes, std::memory_order_relaxed);
         }
         Entry->BytesRead = ScalarBytes;
         Entry->Status = ScalarOk ? 0 : -1;
@@ -533,7 +452,11 @@ int MPIIOBackend::readAtWithContext(
                                   ? InitialFreshnessRoute.SourceRank
                                   : ConservativeWritebackOwnerRank;
         bool has_range_writeback_owner = false;
-        if (distributedWritebackRoutingEnabled() &&
+        // Freshness commits report the rank that actually completed a write.
+        // This is authoritative when write batching falls back to a file
+        // owner, whereas the tile hash is only a prospective destination.
+        // Use the hash solely before a committed source is available.
+        if (distributedWritebackRoutingEnabled() && !freshness_has_source_rank &&
             (context.Hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0) {
           const int tile_owner_rank = rankForDistributedWriteKey(context.Hint.TileId);
           if (tile_owner_rank >= 0) {
@@ -582,8 +505,10 @@ int MPIIOBackend::readAtWithContext(
                 : 0;
         bool dirty_source_known_clean = false;
         bool dirty_source_unknown = false;
-        if (dirty_clean_pfs_rebalance_enabled &&
-            context.Plan.AggregatorRank != DirtySourceRank) {
+        // Dirty-owner forwarding is independent from the optional clean-PFS
+        // rebalance policy. Route cross-rank dirty data through the owner;
+        // version and extent checks in the query/read protocol stay fail-closed.
+        if (context.Plan.AggregatorRank != DirtySourceRank) {
           io_log("Phase 1 dirty-worker oracle candidate: request_id=%llu "
                  "file=%d aggregator_rank=%d source_rank=%d version=%llu "
                  "local_write_history=%d file_writeback_epoch=%d\n",

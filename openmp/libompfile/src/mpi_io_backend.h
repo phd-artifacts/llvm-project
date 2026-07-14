@@ -201,13 +201,13 @@ private:
   std::atomic<uint64_t> stage_affinity_source_fallback_count{0};
   std::atomic<uint64_t> dirty_owner_batch_candidate_count{0};
   std::atomic<uint64_t> dirty_owner_batch_count{0};
+  std::atomic<uint64_t> dirty_owner_single_read_count{0};
+  std::atomic<uint64_t> dirty_owner_remote_read_event_count{0};
+  std::atomic<uint64_t> dirty_owner_remote_read_bytes_total{0};
   std::atomic<uint64_t> dirty_owner_batch_segment_count{0};
   std::atomic<uint64_t> dirty_owner_batch_saved_events{0};
   std::atomic<uint64_t> dirty_owner_batch_bytes{0};
   std::atomic<uint64_t> dirty_owner_batch_failure_count{0};
-  std::atomic<uint64_t> dirty_owner_prefetch_attempt_count{0};
-  std::atomic<uint64_t> dirty_owner_prefetch_cached_count{0};
-  std::atomic<uint64_t> dirty_owner_prefetch_disabled_count{0};
   std::atomic<uint64_t> dirty_owner_queue_max_depth{0};
   std::atomic<uint64_t> dirty_owner_follower_wait_count{0};
   std::atomic<uint64_t> dirty_owner_follower_wait_us_total{0};

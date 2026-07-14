@@ -180,6 +180,12 @@ void MPIIOBackend::reportPhase0Stats() const {
       dirty_owner_batch_candidate_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batches =
       dirty_owner_batch_count.load(std::memory_order_relaxed);
+  const uint64_t dirty_owner_single_reads =
+      dirty_owner_single_read_count.load(std::memory_order_relaxed);
+  const uint64_t dirty_owner_remote_read_events =
+      dirty_owner_remote_read_event_count.load(std::memory_order_relaxed);
+  const uint64_t dirty_owner_remote_read_bytes =
+      dirty_owner_remote_read_bytes_total.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_segments =
       dirty_owner_batch_segment_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_saved =
@@ -188,12 +194,6 @@ void MPIIOBackend::reportPhase0Stats() const {
       dirty_owner_batch_bytes.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_failures =
       dirty_owner_batch_failure_count.load(std::memory_order_relaxed);
-  const uint64_t dirty_owner_prefetch_attempts =
-      dirty_owner_prefetch_attempt_count.load(std::memory_order_relaxed);
-  const uint64_t dirty_owner_prefetch_cached =
-      dirty_owner_prefetch_cached_count.load(std::memory_order_relaxed);
-  const uint64_t dirty_owner_prefetch_disabled =
-      dirty_owner_prefetch_disabled_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_queue_depth_max =
       dirty_owner_queue_max_depth.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_follower_waits =
@@ -282,13 +282,13 @@ void MPIIOBackend::reportPhase0Stats() const {
           "stage_affinity_source_fallbacks=%llu "
           "dirty_owner_batch_candidates=%llu "
           "dirty_owner_batch_count=%llu "
+          "dirty_owner_single_reads=%llu "
+          "dirty_owner_remote_read_events=%llu "
+          "dirty_owner_remote_read_bytes=%llu "
           "dirty_owner_batch_segments=%llu "
           "dirty_owner_batch_saved_events=%llu "
           "dirty_owner_batch_bytes=%llu "
           "dirty_owner_batch_failures=%llu "
-          "dirty_owner_prefetch_attempts=%llu "
-          "dirty_owner_prefetch_cached_segments=%llu "
-          "dirty_owner_prefetch_disabled=%llu "
           "dirty_owner_queue_max_depth=%llu "
           "dirty_owner_follower_waits=%llu "
           "dirty_owner_follower_wait_us=%llu "
@@ -386,13 +386,13 @@ void MPIIOBackend::reportPhase0Stats() const {
           static_cast<unsigned long long>(stage_affinity_fallbacks),
           static_cast<unsigned long long>(dirty_owner_batch_candidates),
           static_cast<unsigned long long>(dirty_owner_batches),
+          static_cast<unsigned long long>(dirty_owner_single_reads),
+          static_cast<unsigned long long>(dirty_owner_remote_read_events),
+          static_cast<unsigned long long>(dirty_owner_remote_read_bytes),
           static_cast<unsigned long long>(dirty_owner_batch_segments),
           static_cast<unsigned long long>(dirty_owner_batch_saved),
           static_cast<unsigned long long>(dirty_owner_batch_total_bytes),
           static_cast<unsigned long long>(dirty_owner_batch_failures),
-          static_cast<unsigned long long>(dirty_owner_prefetch_attempts),
-          static_cast<unsigned long long>(dirty_owner_prefetch_cached),
-          static_cast<unsigned long long>(dirty_owner_prefetch_disabled),
           static_cast<unsigned long long>(dirty_owner_queue_depth_max),
           static_cast<unsigned long long>(dirty_owner_follower_waits),
           static_cast<unsigned long long>(dirty_owner_follower_wait_us),
