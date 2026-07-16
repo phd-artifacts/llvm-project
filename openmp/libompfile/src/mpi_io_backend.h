@@ -4,6 +4,7 @@
 #include "abstract_backend.h"
 #include "ompfile_sched.h"
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <atomic>
 #include <cstddef> // for size_t
@@ -38,6 +39,11 @@ private:
 
   MPI_Comm file_comm = MPI_COMM_NULL;
   int externally_initialized;
+  int mpi_provided_thread_level = -1;
+  // When false (default) the InstrumentedLock guards are plain mutex locks
+  // with no timing/counting overhead. Set from LIBOMPFILE_OPT_STATS at
+  // construction so production runs pay nothing.
+  bool lock_stats_enabled = false;
   std::unordered_map<int, MPI_File> file_handle_map;
   std::unordered_map<int, int> remote_file_handle_map;
   std::unordered_map<int, int> remote_file_owner_rank_map;
@@ -81,7 +87,7 @@ private:
   std::unordered_set<int> logical_handle_set;
   std::atomic<int> next_file_handle{0};
   mutable std::mutex handle_mutex;
-  std::mutex mpp_call_mutex;
+  mutable std::mutex mpp_call_mutex;
   bool mpp_open_enabled = false;
   bool mpp_io_enabled = false;
   bool mpp_requested = false;
@@ -212,6 +218,90 @@ private:
   std::atomic<uint64_t> dirty_owner_follower_wait_count{0};
   std::atomic<uint64_t> dirty_owner_follower_wait_us_total{0};
   std::atomic<uint64_t> dirty_owner_batch_window_wait_us_total{0};
+  // Lock-contention instrumentation for the code-review Phase 3 (C2/C3/P1)
+  // decision. Sampled at the hottest per-request acquisition sites via
+  // instrumentedLock() so the "contended" ratio faithfully reflects whether
+  // a lock is usually free or usually held under the Cholesky workload;
+  // hold-time is a lower bound (only instrumented sites contribute). See
+  // reportPhase0Stats for how these surface.
+  // mutable so the instrumented lock helpers can be const (some const
+  // methods, e.g. tileFreshnessEntry, acquire handle_mutex).
+  mutable std::atomic<uint64_t> handle_mutex_acquire_count{0};
+  mutable std::atomic<uint64_t> handle_mutex_contended_count{0};
+  mutable std::atomic<uint64_t> handle_mutex_wait_us_total{0};
+  mutable std::atomic<uint64_t> handle_mutex_hold_us_total{0};
+  mutable std::atomic<uint64_t> mpp_call_mutex_acquire_count{0};
+  mutable std::atomic<uint64_t> mpp_call_mutex_contended_count{0};
+  mutable std::atomic<uint64_t> mpp_call_mutex_wait_us_total{0};
+  mutable std::atomic<uint64_t> mpp_call_mutex_hold_us_total{0};
+
+  // RAII lock guard that optionally records contention/wait/hold-time into
+  // the counters above. When instrumentation is disabled (the default, unless
+  // LIBOMPFILE_OPT_STATS=1) it is a plain lock_guard-equivalent with zero
+  // extra overhead on the hot path. When enabled it try_lock()s first: if
+  // that succeeds the lock was uncontended (no waiting); if it fails another
+  // thread held it, so we count a contended acquisition and time the blocking
+  // lock(). All ~68 backend acquisition sites route through this guard, so the
+  // contended ratio and hold time are complete (not sampled) when enabled.
+  class InstrumentedLock {
+  public:
+    InstrumentedLock(std::mutex &m, bool enabled,
+                     std::atomic<uint64_t> &acquires,
+                     std::atomic<uint64_t> &contended,
+                     std::atomic<uint64_t> &wait_us,
+                     std::atomic<uint64_t> &hold_us)
+        : mutex_(m), enabled_(enabled), hold_us_(hold_us) {
+      if (!enabled_) {
+        mutex_.lock();
+        return;
+      }
+      acquires.fetch_add(1, std::memory_order_relaxed);
+      if (!mutex_.try_lock()) {
+        contended.fetch_add(1, std::memory_order_relaxed);
+        const auto wait_start = std::chrono::steady_clock::now();
+        mutex_.lock();
+        wait_us.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count(),
+            std::memory_order_relaxed);
+      }
+      hold_start_ = std::chrono::steady_clock::now();
+    }
+    ~InstrumentedLock() {
+      if (enabled_)
+        hold_us_.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - hold_start_)
+                .count(),
+            std::memory_order_relaxed);
+      mutex_.unlock();
+    }
+    InstrumentedLock(const InstrumentedLock &) = delete;
+    InstrumentedLock &operator=(const InstrumentedLock &) = delete;
+
+  private:
+    std::mutex &mutex_;
+    bool enabled_;
+    std::atomic<uint64_t> &hold_us_;
+    std::chrono::steady_clock::time_point hold_start_;
+  };
+
+  InstrumentedLock instrumentedHandleLock() const {
+    return InstrumentedLock(handle_mutex, lock_stats_enabled,
+                            handle_mutex_acquire_count,
+                            handle_mutex_contended_count,
+                            handle_mutex_wait_us_total,
+                            handle_mutex_hold_us_total);
+  }
+  InstrumentedLock instrumentedMppCallLock() const {
+    return InstrumentedLock(mpp_call_mutex, lock_stats_enabled,
+                            mpp_call_mutex_acquire_count,
+                            mpp_call_mutex_contended_count,
+                            mpp_call_mutex_wait_us_total,
+                            mpp_call_mutex_hold_us_total);
+  }
+
   bool two_phase_batch_in_progress = false;
   bool write_batch_in_progress = false;
   bool dirty_owner_batch_in_progress = false;

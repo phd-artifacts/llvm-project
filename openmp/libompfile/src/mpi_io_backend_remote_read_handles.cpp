@@ -14,7 +14,7 @@ bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
   std::string path;
 
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
       errno = EBADF;
       return false;
@@ -43,7 +43,7 @@ bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
 
   int opened_handle = -1;
   {
-    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    const auto lock = instrumentedMppCallLock();
     const int read_flags = open_flags == O_RDONLY ? O_RDONLY : O_RDWR;
     if (!ompfile::mpp::openOnRank(path.c_str(), read_flags, 0666, target_rank,
                                   opened_handle)) {
@@ -54,7 +54,7 @@ bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
   bool must_close_opened_handle = false;
   bool closed_during_open = false;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
       must_close_opened_handle = true;
       closed_during_open = true;
@@ -70,7 +70,7 @@ bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
   }
 
   if (must_close_opened_handle) {
-    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    const auto lock = instrumentedMppCallLock();
     (void)ompfile::mpp::close(opened_handle);
     if (closed_during_open)
       return false;
@@ -84,7 +84,7 @@ void MPIIOBackend::evictAndCloseRemoteReadHandle(int file_id,
                                                  int target_rank) {
   int stale_handle = -1;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto cache_it = remote_read_handle_cache.find(file_id);
     if (cache_it != remote_read_handle_cache.end()) {
       auto rank_it = cache_it->second.find(target_rank);
@@ -95,7 +95,7 @@ void MPIIOBackend::evictAndCloseRemoteReadHandle(int file_id,
     }
   }
   if (stale_handle >= 0) {
-    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    const auto lock = instrumentedMppCallLock();
     (void)ompfile::mpp::close(stale_handle);
   }
 }
@@ -168,7 +168,7 @@ bool MPIIOBackend::readAtRemoteRankNoStageWithBytes(
     bytes_read = 0;
     bool ok = false;
     {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      const auto lock = instrumentedMppCallLock();
       ok = ompfile::mpp::preadNoStageEx(remote_handle, offset, data, size,
                                         bytes_read);
     }
@@ -227,7 +227,7 @@ bool MPIIOBackend::readAtRemoteRankWithBytes(int file_id, int target_rank,
     bytes_read = 0;
     bool ok = false;
     {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      const auto lock = instrumentedMppCallLock();
       ok = ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
     }
     if (ok)

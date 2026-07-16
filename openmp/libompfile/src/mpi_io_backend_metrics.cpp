@@ -297,7 +297,12 @@ void MPIIOBackend::reportPhase0Stats() const {
           "two_phase_enabled=%d "
          "two_phase_active=%d two_phase_policy=%s window_us=%llu "
          "max_batch_bytes=%llu sieve_bytes=%llu write_batch_policy=%s "
-         "write_batch_window_us=%llu write_batch_max_batch_bytes=%llu\n",
+         "write_batch_window_us=%llu write_batch_max_batch_bytes=%llu "
+         "mpi_thread_level=%d "
+         "handle_mutex_acquires=%llu handle_mutex_contended=%llu "
+         "handle_mutex_wait_us=%llu handle_mutex_hold_us=%llu "
+         "mpp_call_mutex_acquires=%llu mpp_call_mutex_contended=%llu "
+         "mpp_call_mutex_wait_us=%llu mpp_call_mutex_hold_us=%llu\n",
          static_cast<unsigned long long>(pread_reqs),
          static_cast<unsigned long long>(remote_events),
          static_cast<unsigned long long>(remote_bytes), avg_remote_bytes,
@@ -406,5 +411,22 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(two_phase_sieve_bytes),
          twoPhasePolicyToString(write_batch_policy),
          static_cast<unsigned long long>(write_batch_window_us),
-         static_cast<unsigned long long>(write_batch_max_batch_bytes));
+         static_cast<unsigned long long>(write_batch_max_batch_bytes),
+         mpi_provided_thread_level,
+         static_cast<unsigned long long>(
+             handle_mutex_acquire_count.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(
+             handle_mutex_contended_count.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(
+             handle_mutex_wait_us_total.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(
+             handle_mutex_hold_us_total.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(
+             mpp_call_mutex_acquire_count.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(
+             mpp_call_mutex_contended_count.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(
+             mpp_call_mutex_wait_us_total.load(std::memory_order_relaxed)),
+         static_cast<unsigned long long>(
+             mpp_call_mutex_hold_us_total.load(std::memory_order_relaxed)));
 }

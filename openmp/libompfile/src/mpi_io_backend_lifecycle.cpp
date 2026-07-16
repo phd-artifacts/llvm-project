@@ -45,7 +45,23 @@ MPIIOBackend::MPIIOBackend() {
   } else {
     io_log("MPI already initialized by user program.\n");
     externally_initialized = 1;
+    // MPI was initialized elsewhere (offload runtime / launcher), so we did
+    // not choose the thread level. Query the level actually granted, since
+    // it decides whether mpp_call_mutex is load-bearing for correctness: if
+    // the runtime only got MPI_THREAD_SERIALIZED (or lower), concurrent
+    // outbound MPP/MPI calls from multiple client threads MUST stay
+    // serialized and mpp_call_mutex cannot be removed or per-rank sharded.
+    MPI_Query_thread(&provided);
   }
+  mpi_provided_thread_level = provided;
+  lock_stats_enabled = parseBoolEnv("LIBOMPFILE_OPT_STATS", false);
+  io_log("libompfile MPI thread level: provided=%d (SINGLE=%d FUNNELED=%d "
+         "SERIALIZED=%d MULTIPLE=%d) externally_initialized=%d "
+         "lock_stats_enabled=%d\n",
+         provided, MPI_THREAD_SINGLE, MPI_THREAD_FUNNELED,
+         MPI_THREAD_SERIALIZED, MPI_THREAD_MULTIPLE,
+         static_cast<int>(externally_initialized),
+         static_cast<int>(lock_stats_enabled));
 
   if (parseBoolEnv("LIBOMPFILE_MPP_OPEN", false)) {
     mpp_open_enabled = true;
@@ -232,7 +248,7 @@ MPIIOBackend::~MPIIOBackend() {
   {
     std::vector<int> remote_handles;
     {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       remote_handles.reserve(remote_file_handle_map.size());
       for (const auto &entry : remote_file_handle_map) {
         if (entry.second >= 0)
@@ -242,7 +258,7 @@ MPIIOBackend::~MPIIOBackend() {
       remote_file_owner_rank_map.clear();
     }
     for (int remote_handle : remote_handles) {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      const auto lock = instrumentedMppCallLock();
       if (!ompfile::mpp::close(remote_handle)) {
         io_log("MPP close retry failed during backend teardown (handle=%d)\n",
                remote_handle);
@@ -252,7 +268,7 @@ MPIIOBackend::~MPIIOBackend() {
   {
     std::vector<int> remote_read_handles;
     {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       for (const auto &per_file : remote_read_handle_cache) {
         for (const auto &per_rank : per_file.second) {
           if (per_rank.second >= 0)
@@ -262,7 +278,7 @@ MPIIOBackend::~MPIIOBackend() {
       remote_read_handle_cache.clear();
     }
     for (int remote_handle : remote_read_handles) {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      const auto lock = instrumentedMppCallLock();
       if (!ompfile::mpp::close(remote_handle)) {
         io_log("MPP close retry failed during backend teardown for cached "
                "remote read handle=%d\n",
@@ -273,7 +289,7 @@ MPIIOBackend::~MPIIOBackend() {
   {
     std::vector<uint64_t> path_keys;
     {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       path_keys.reserve(file_path_key_map.size());
       for (const auto &entry : file_path_key_map) {
         if (entry.second != 0)

@@ -33,7 +33,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
   auto openRemoteHandle = [&](int &remote_handle_out, int &owner_rank_out) {
     bool open_ok = false;
     owner_rank_out = -1;
-    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    const auto lock = instrumentedMppCallLock();
     if (have_open_plan) {
       open_ok = ompfile::mpp::openOnRank(filename, open_flags, 0666,
                                          plan->AggregatorRank,
@@ -72,7 +72,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
       return -1;
     }
     {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       remote_file_handle_map[file_id] = remote_handle;
       remote_file_owner_rank_map[file_id] = owner_rank;
       remote_read_handle_cache[file_id].clear();
@@ -99,7 +99,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
     return -1;
   }
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     file_handle_map[file_id] = file_handle;
     remote_read_handle_cache[file_id].clear();
     logical_handle_set.insert(file_id);
@@ -114,7 +114,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
       io_log("MPP open failed for %s\n", filename);
       MPI_File_close(&file_handle);
       {
-        const std::lock_guard<std::mutex> lock(handle_mutex);
+        const auto lock = instrumentedHandleLock();
         file_handle_map.erase(file_id);
         logical_handle_set.erase(file_id);
         traceHandleStateLocked("open.mpp.fail.cleanup", file_id, -1);
@@ -123,7 +123,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
       return -1;
     }
     {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       remote_file_handle_map[file_id] = remote_handle;
       remote_file_owner_rank_map[file_id] = owner_rank;
       traceHandleStateLocked("open.mpp.remote.insert", file_id, remote_handle);
@@ -158,7 +158,7 @@ int MPIIOBackend::write(int file_id, const void *data, size_t size) {
 
   MPI_File file = MPI_FILE_NULL;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
@@ -214,7 +214,7 @@ int MPIIOBackend::close(int file_id) {
            static_cast<void *>(this), file_id, static_cast<int>(remote_only));
 
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
       traceHandleStateLocked("close.invalid_handle", file_id, -1);
@@ -265,14 +265,14 @@ int MPIIOBackend::close(int file_id) {
   if (has_remote_handle) {
     bool close_ok = false;
     {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      const auto lock = instrumentedMppCallLock();
       close_ok = ompfile::mpp::close(remote_handle);
     }
     if (!close_ok) {
       io_log("MPP close failed for file %d\n", file_id);
       mpp_ret = -1;
     } else {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       auto it = remote_file_handle_map.find(file_id);
       if (it != remote_file_handle_map.end() && it->second == remote_handle)
         remote_file_handle_map.erase(it);
@@ -287,7 +287,7 @@ int MPIIOBackend::close(int file_id) {
       continue;
     bool close_ok = false;
     {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      const auto lock = instrumentedMppCallLock();
       close_ok = ompfile::mpp::close(cached_handle);
     }
     if (!close_ok) {
@@ -361,7 +361,7 @@ int MPIIOBackend::read(int file_id, void *data, size_t size) {
 
   MPI_File file = MPI_FILE_NULL;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
@@ -415,7 +415,7 @@ int MPIIOBackend::seek(int file_id, long offset) {
 
   MPI_File file = MPI_FILE_NULL;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);

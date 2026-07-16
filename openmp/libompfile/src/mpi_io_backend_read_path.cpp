@@ -143,7 +143,7 @@ bool MPIIOBackend::dirtyOwnerPreadMaybeBatch(
   bytes_read = 0;
   read_errno = 0;
   if (!dirtyOwnerBatchEnabled()) {
-    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    const auto lock = instrumentedMppCallLock();
     errno = 0;
     const bool Ok = ompfile::mpp::dirtyOwnerPreadEx(
         remote_handle, source_rank, expected_version, offset, data, size,
@@ -244,7 +244,7 @@ bool MPIIOBackend::dirtyOwnerPreadMaybeBatch(
         TotalBytes += Batch[I]->Size;
       }
       {
-        const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+        const auto lock = instrumentedMppCallLock();
         errno = 0;
         BatchOk = ompfile::mpp::dirtyOwnerPreadBatchEx(
             Batch.front()->RemoteHandle, Batch.front()->SourceRank,
@@ -285,7 +285,7 @@ bool MPIIOBackend::dirtyOwnerPreadMaybeBatch(
         bool ScalarOk = false;
         int ScalarErrno = 0;
         {
-          const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+          const auto lock = instrumentedMppCallLock();
           errno = 0;
           ScalarOk = ompfile::mpp::dirtyOwnerPreadEx(
               Entry->RemoteHandle, Entry->SourceRank, Entry->ExpectedVersion,
@@ -404,7 +404,7 @@ int MPIIOBackend::readAtWithContext(
           queryFreshnessForRank(FreshnessPathKey, context.Plan.AggregatorRank);
       bool has_local_write_history = false;
       {
-        const std::lock_guard<std::mutex> lock(handle_mutex);
+        const auto lock = instrumentedHandleLock();
         auto write_it = file_write_epoch_history.find(file_id);
         has_local_write_history =
             write_it != file_write_epoch_history.end() &&
@@ -474,7 +474,7 @@ int MPIIOBackend::readAtWithContext(
                              static_cast<long>(size))
                   ? offset + static_cast<long>(size)
                   : offset;
-          const std::lock_guard<std::mutex> lock(handle_mutex);
+          const auto lock = instrumentedHandleLock();
           auto write_it = file_write_epoch_history.find(file_id);
           if (write_it != file_write_epoch_history.end() && read_end > offset) {
             for (const WriteEpochEntry &entry : write_it->second) {
@@ -531,7 +531,7 @@ int MPIIOBackend::readAtWithContext(
             int oracle_errno = 0;
             bool oracle_ok = false;
             {
-              const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+              const auto lock = instrumentedMppCallLock();
               errno = 0;
               oracle_ok = ompfile::mpp::dirtyOwnerQueryEx(
                   remote_handle, DirtySourceRank, DirtyExpectedVersion, offset,
@@ -545,7 +545,7 @@ int MPIIOBackend::readAtWithContext(
                 bool flush_ok = false;
                 int flush_errno = 0;
                 {
-                  const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+                  const auto lock = instrumentedMppCallLock();
                   errno = 0;
                   flush_ok = ompfile::mpp::flushDirtyTile(
                       FreshnessPathKey, flushed_source_rank, flushed_version);
@@ -612,7 +612,7 @@ int MPIIOBackend::readAtWithContext(
               int dirty_source_read_errno = 0;
               bool served_from_readahead = false;
               {
-                const std::lock_guard<std::mutex> lock(handle_mutex);
+                const auto lock = instrumentedHandleLock();
                 for (const DirtyOwnerReadCacheEntry &CacheEntry :
                      dirty_owner_read_cache) {
                   if (CacheEntry.FileId != file_id ||
@@ -641,7 +641,7 @@ int MPIIOBackend::readAtWithContext(
                   bool ReadAheadOk = false;
                   int ReadAheadErrno = 0;
                   {
-                    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+                    const auto lock = instrumentedMppCallLock();
                     errno = 0;
                     ReadAheadOk = ompfile::mpp::dirtyOwnerPreadEx(
                         remote_handle, DirtySourceRank, DirtyExpectedVersion,
@@ -665,7 +665,7 @@ int MPIIOBackend::readAtWithContext(
                                                static_cast<long>(
                                                    ReadAheadBytesRead));
                     {
-                      const std::lock_guard<std::mutex> lock(handle_mutex);
+                      const auto lock = instrumentedHandleLock();
                       dirty_owner_read_cache.push_back(std::move(CacheEntry));
                       while (dirty_owner_read_cache.size() > 1024)
                         dirty_owner_read_cache.pop_front();
@@ -808,7 +808,7 @@ int MPIIOBackend::readAtWithContext(
           bool local_dirty_read_ok = false;
           int local_dirty_read_errno = 0;
           {
-            const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+            const auto lock = instrumentedMppCallLock();
             errno = 0;
             local_dirty_read_ok = ompfile::mpp::dirtyOwnerPreadEx(
                 local_remote_handle, DirtySourceRank, DirtyExpectedVersion,
@@ -962,7 +962,7 @@ int MPIIOBackend::readAtWithContext(
                   std::strcmp(rebalance_reason, "unsafe-write-history") == 0)) {
         int remote_handle = -1;
         {
-          const std::lock_guard<std::mutex> lock(handle_mutex);
+          const auto lock = instrumentedHandleLock();
           auto it = remote_file_handle_map.find(file_id);
           if (it != remote_file_handle_map.end())
             remote_handle = it->second;
@@ -1045,7 +1045,7 @@ int MPIIOBackend::readAtWithContext(
             size_t bytes_read = 0;
             bool forward_ok = false;
             {
-              const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+              const auto lock = instrumentedMppCallLock();
               errno = 0;
               forward_ok = ompfile::mpp::dirtyOwnerPreadEx(
                   remote_handle, Route.SourceRank, Route.SelectedVersion,
@@ -1156,7 +1156,7 @@ int MPIIOBackend::readAtWithContext(
 
     int remote_handle = -1;
     {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       auto it = remote_file_handle_map.find(file_id);
       if (it != remote_file_handle_map.end())
         remote_handle = it->second;
@@ -1172,7 +1172,7 @@ int MPIIOBackend::readAtWithContext(
       bool pread_ok = false;
       size_t bytes_read = 0;
       {
-        const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+        const auto lock = instrumentedMppCallLock();
         pread_ok =
             ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
       }
@@ -1243,7 +1243,7 @@ int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
   if (mpp_io_enabled) {
     int remote_handle = -1;
     {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       auto it = remote_file_handle_map.find(file_id);
       if (it != remote_file_handle_map.end())
         remote_handle = it->second;
@@ -1259,7 +1259,7 @@ int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
     remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
     bool pread_ok = false;
     {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      const auto lock = instrumentedMppCallLock();
       if (hint && shouldUseNoStageFallback(*hint, force_no_stage)) {
         pread_ok = ompfile::mpp::preadNoStageEx(remote_handle, offset, data,
                                                 size, bytes_read);
@@ -1291,7 +1291,7 @@ int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
 
   MPI_File file = MPI_FILE_NULL;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);

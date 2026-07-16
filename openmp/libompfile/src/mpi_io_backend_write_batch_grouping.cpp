@@ -141,7 +141,7 @@ void MPIIOBackend::processWriteGroup(std::vector<WriteBatchRequest *> &group) {
 
   int remote_handle = -1;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto it = remote_file_handle_map.find(group.front()->FileHandle);
     if (it != remote_file_handle_map.end())
       remote_handle = it->second;

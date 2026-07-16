@@ -10,7 +10,7 @@ int MPIIOBackend::getNextFileHandle() {
 }
 
 bool MPIIOBackend::getFilePathKey(int file_id, uint64_t &path_key_out) {
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   const auto it = file_path_key_map.find(file_id);
   if (it == file_path_key_map.end())
     return false;
@@ -21,7 +21,7 @@ bool MPIIOBackend::getFilePathKey(int file_id, uint64_t &path_key_out) {
 void MPIIOBackend::rememberFilePathKey(int file_id, const char *path) {
   const uint64_t path_key = computePathKey(path);
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     file_path_key_map[file_id] = path_key;
   }
   invalidateTwoPhaseReadCacheKey(path_key);
@@ -30,19 +30,19 @@ void MPIIOBackend::rememberFilePathKey(int file_id, const char *path) {
 void MPIIOBackend::rememberFilePath(int file_id, const char *path) {
   if (!path)
     return;
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   file_path_map[file_id] = path;
   file_write_epoch_history.erase(file_id);
 }
 
 void MPIIOBackend::forgetFilePath(int file_id) {
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   file_path_map.erase(file_id);
   file_write_epoch_history.erase(file_id);
 }
 
 void MPIIOBackend::forgetFilePathKey(int file_id) {
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   file_path_key_map.erase(file_id);
 }
 
@@ -102,6 +102,6 @@ void MPIIOBackend::traceHandleState(const char *where, int file_id,
                                     int remote_handle) {
   if (!io_trace_enabled())
     return;
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   traceHandleStateLocked(where, file_id, remote_handle);
 }

@@ -45,7 +45,7 @@ void MPIIOBackend::recordWriteEpochForContext(
   entry.HasTile = (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0;
   entry.TileId = entry.HasTile ? hint.TileId : 0;
 
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   entry.Sequence = next_write_sequence++;
   auto &history = file_write_epoch_history[file_id];
   history.push_back(entry);
@@ -60,7 +60,7 @@ void MPIIOBackend::recordWriteEpochForContext(
 }
 
 bool MPIIOBackend::hasCompletedStageInvalidationForTesting(int file_id) const {
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   auto it = writable_stage_coherence.find(file_id);
   if (it == writable_stage_coherence.end())
     return false;
@@ -74,7 +74,7 @@ bool MPIIOBackend::globallyInvalidateStageForFile(int file_id) {
   uint64_t generation = 0;
   std::string path;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto path_key_it = file_path_key_map.find(file_id);
     auto path_it = file_path_map.find(file_id);
     auto coherence_it = writable_stage_coherence.find(file_id);
@@ -93,7 +93,7 @@ bool MPIIOBackend::globallyInvalidateStageForFile(int file_id) {
   stage_global_invalidations_requested.fetch_add(1, std::memory_order_relaxed);
   bool ok = false;
   {
-    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    const auto lock = instrumentedMppCallLock();
     ok = ompfile::mpp::stageInvalidatePathKey(path_key, generation,
                                               path.c_str());
   }
@@ -106,7 +106,7 @@ bool MPIIOBackend::sourceStageAffinityPreReadInvalidateForFile(int file_id) {
   uint64_t path_key = 0;
   std::string path;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto path_key_it = file_path_key_map.find(file_id);
     auto path_it = file_path_map.find(file_id);
     if (path_key_it == file_path_key_map.end() || path_key_it->second == 0 ||
@@ -118,7 +118,7 @@ bool MPIIOBackend::sourceStageAffinityPreReadInvalidateForFile(int file_id) {
     path = path_it->second;
   }
 
-  const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+  const auto lock = instrumentedMppCallLock();
   return ompfile::mpp::stageInvalidatePathKey(path_key, /*generation=*/0,
                                               path.c_str());
 }
@@ -126,7 +126,7 @@ bool MPIIOBackend::sourceStageAffinityPreReadInvalidateForFile(int file_id) {
 void MPIIOBackend::completeStageInvalidationForFile(int file_id,
                                                     uint64_t generation,
                                                     bool ok) {
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   auto &coherence = writable_stage_coherence[file_id];
   if (!ok) {
     if (generation == coherence.WriteGeneration)
@@ -152,7 +152,7 @@ void MPIIOBackend::noteAppliedRebalancedReadForFile(int file_id) {
   bool count_writable_read_applied = false;
   bool count_after_invalidation_applied = false;
   if (mpp_remote_only) {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto it = file_write_epoch_history.find(file_id);
     const bool has_local_write_history =
         it != file_write_epoch_history.end() && !it->second.empty();
@@ -220,7 +220,7 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
                                           bool record_stats) {
   reason_out = "none";
   reason_errno_out = 0;
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   auto it = file_write_epoch_history.find(file_id);
   const bool has_local_write_history =
       (it != file_write_epoch_history.end()) && !it->second.empty();
@@ -368,7 +368,7 @@ bool MPIIOBackend::commitTileFreshnessWrite(uint64_t path_key, int writer_rank,
     return false;
   }
 
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   TileFreshnessEntry &entry = tile_freshness_table[path_key];
   assert(entry.latest_version < std::numeric_limits<uint64_t>::max());
   ++entry.latest_version;
@@ -391,7 +391,7 @@ bool MPIIOBackend::markTileFresh(uint64_t path_key, int rank,
     return false;
   }
 
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   auto it = tile_freshness_table.find(path_key);
   if (it == tile_freshness_table.end()) {
     errno = ENOKEY;
@@ -412,7 +412,7 @@ bool MPIIOBackend::isTileStale(uint64_t path_key, int rank,
   if (path_key == 0 || rank < 0 || local_version == 0)
     return true;
 
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   auto it = tile_freshness_table.find(path_key);
   if (it == tile_freshness_table.end())
     return true;
@@ -427,7 +427,7 @@ MPIIOBackend::TileFreshnessEntry
 MPIIOBackend::tileFreshnessEntry(uint64_t path_key) const {
   if (path_key == 0)
     return {};
-  const std::lock_guard<std::mutex> lock(handle_mutex);
+  const auto lock = instrumentedHandleLock();
   auto it = tile_freshness_table.find(path_key);
   if (it == tile_freshness_table.end())
     return {};

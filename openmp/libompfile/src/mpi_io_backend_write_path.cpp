@@ -107,7 +107,7 @@ int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
     bool pwrite_ok = false;
     size_t call_bytes_written = 0;
     {
-      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      const auto lock = instrumentedMppCallLock();
       pwrite_ok = ompfile::mpp::pwriteEx(remote_handle, current_offset, cursor,
                                          remaining, call_bytes_written);
     }
@@ -204,7 +204,7 @@ int MPIIOBackend::writeAtWithContext(
 
     int writer_rank = writer_rank_override;
     if (writer_rank < 0) {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       auto owner_it = remote_file_owner_rank_map.find(file_id);
       if (owner_it != remote_file_owner_rank_map.end())
         writer_rank = owner_it->second;
@@ -289,7 +289,7 @@ int MPIIOBackend::writeAtWithContext(
 
     int remote_handle = -1;
     {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       auto it = remote_file_handle_map.find(file_id);
       if (it != remote_file_handle_map.end())
         remote_handle = it->second;
@@ -325,7 +325,7 @@ int MPIIOBackend::writeAtWithContext(
   if (mpp_io_enabled) {
     int remote_handle = -1;
     {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
+      const auto lock = instrumentedHandleLock();
       auto it = remote_file_handle_map.find(file_id);
       if (it != remote_file_handle_map.end())
         remote_handle = it->second;
@@ -358,7 +358,7 @@ int MPIIOBackend::writeAtWithContext(
 
   MPI_File file = MPI_FILE_NULL;
   {
-    const std::lock_guard<std::mutex> lock(handle_mutex);
+    const auto lock = instrumentedHandleLock();
     auto it = file_handle_map.find(file_id);
     if (it == file_handle_map.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
