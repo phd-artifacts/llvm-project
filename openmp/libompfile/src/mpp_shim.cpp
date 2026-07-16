@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <dlfcn.h>
 #include <limits>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -147,8 +148,42 @@ MppApi loadMppApi() {
   return loaded;
 }
 
-MppApi &getMppApi() {
+// The resolved MppApi function-pointer table is process-wide mutable state:
+// entrypoints below re-resolve (dlsym) and reassign it whenever a symbol they
+// need hasn't appeared yet (e.g. the proxy shim library is dlopen'd after
+// this translation unit's first call). That reassignment used to race
+// unsynchronized reads/writes of a shared static under MPI_THREAD_MULTIPLE.
+// All access now goes through this mutex, and callers get a thread-local
+// copy back instead of a reference into the shared static.
+std::mutex &mppApiMutex() {
+  static std::mutex m;
+  return m;
+}
+
+MppApi &mppApiStorage() {
   static MppApi api = loadMppApi();
+  return api;
+}
+
+MppApi getMppApi() {
+  const std::lock_guard<std::mutex> lock(mppApiMutex());
+  return mppApiStorage();
+}
+
+template <typename Fn>
+MppApi getMppApiReloadIfMissing(Fn MppApi::*member) {
+  const std::lock_guard<std::mutex> lock(mppApiMutex());
+  MppApi &api = mppApiStorage();
+  if (!(api.*member))
+    api = loadMppApi();
+  return api;
+}
+
+MppApi getMppApiReloadIfPwriteMissing() {
+  const std::lock_guard<std::mutex> lock(mppApiMutex());
+  MppApi &api = mppApiStorage();
+  if (!api.pwrite && !api.pwrite_ex)
+    api = loadMppApi();
   return api;
 }
 
@@ -169,9 +204,7 @@ bool init() {
 
   io_trace("mpp_shim::init enter\n");
 
-  auto &api = getMppApi();
-  if (!api.init)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::init);
 
   if (!api.init) {
     io_log("MPP shim not available (ompfile_mpp_init missing).\n");
@@ -260,9 +293,7 @@ bool open(const char *path, int flags, int mode, int &handle) {
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.open)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::open);
 
   if (!api.open) {
     io_log("MPP shim not available (ompfile_mpp_open missing).\n");
@@ -294,9 +325,7 @@ bool openOnRank(const char *path, int flags, int mode, int rank, int &handle) {
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.open_on_rank)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::open_on_rank);
 
   if (!api.open_on_rank) {
     io_log("MPP shim not available (ompfile_mpp_open_on_rank missing).\n");
@@ -323,9 +352,7 @@ bool handleOwnerRank(int handle, int &rank_out) {
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.handle_owner_rank)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::handle_owner_rank);
   if (!api.handle_owner_rank) {
     errno = ENOSYS;
     return false;
@@ -347,9 +374,7 @@ bool close(int handle) {
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.close)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::close);
 
   if (!api.close) {
     io_log("MPP shim not available (ompfile_mpp_close missing).\n");
@@ -382,9 +407,7 @@ bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.pread)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::pread);
 
   if (!api.pread) {
     io_log("MPP shim not available (ompfile_mpp_pread missing).\n");
@@ -426,9 +449,7 @@ bool preadNoStageEx(int handle, int64_t offset, void *buffer, size_t size,
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.pread_no_stage_ex)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::pread_no_stage_ex);
 
   if (!api.pread_no_stage_ex)
     return preadEx(handle, offset, buffer, size, bytes_read);
@@ -455,9 +476,7 @@ bool dirtyOwnerPreadEx(int handle, int source_rank, uint64_t expected_version,
   }
   if (!init())
     return false;
-  auto &api = getMppApi();
-  if (!api.dirty_owner_pread_ex)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::dirty_owner_pread_ex);
   if (!api.dirty_owner_pread_ex) {
     errno = ENOSYS;
     return false;
@@ -489,9 +508,7 @@ bool dirtyOwnerPreadBatchEx(int handle, int source_rank,
   }
   if (!init())
     return false;
-  auto &api = getMppApi();
-  if (!api.dirty_owner_pread_batch_ex)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::dirty_owner_pread_batch_ex);
   if (!api.dirty_owner_pread_batch_ex) {
     errno = ENOSYS;
     return false;
@@ -549,9 +566,7 @@ bool dirtyOwnerQueryEx(int handle, int source_rank, uint64_t expected_version,
   }
   if (!init())
     return false;
-  auto &api = getMppApi();
-  if (!api.dirty_owner_query_ex)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::dirty_owner_query_ex);
   if (!api.dirty_owner_query_ex) {
     errno = ENOSYS;
     return false;
@@ -582,9 +597,7 @@ bool pwriteEx(int handle, int64_t offset, const void *buffer, size_t size,
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.pwrite && !api.pwrite_ex)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfPwriteMissing();
 
   if (!api.pwrite && !api.pwrite_ex) {
     io_log("MPP shim not available (ompfile_mpp_pwrite{,_ex} missing).\n");
@@ -632,9 +645,7 @@ bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {
 bool stageInvalidatePathKey(uint64_t path_key, uint64_t generation,
                             const char *path) {
   const uint64_t call_id = nextShimCallId();
-  auto &api = getMppApi();
-  if (!api.stage_invalidate_path_key)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::stage_invalidate_path_key);
 
   if (!api.stage_invalidate_path_key) {
     io_log("MPP shim not available "
@@ -670,9 +681,7 @@ bool freshnessQuery(uint64_t path_key, uint64_t local_version,
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.freshness_query)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::freshness_query);
   if (!api.freshness_query) {
     errno = ENOSYS;
     return false;
@@ -735,9 +744,7 @@ bool freshnessWriteCommit(uint64_t path_key, int writer_rank, uint64_t tile_id,
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.freshness_write_commit)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::freshness_write_commit);
   if (!api.freshness_write_commit) {
     errno = ENOSYS;
     return false;
@@ -773,9 +780,7 @@ bool proxyCopyTile(uint64_t path_key, uint64_t tile_id, int source_rank,
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.proxy_copy_tile)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::proxy_copy_tile);
   if (!api.proxy_copy_tile) {
     errno = ENOSYS;
     return false;
@@ -808,9 +813,7 @@ bool freshnessMarkFresh(uint64_t path_key, int rank, uint64_t version) {
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.freshness_mark_fresh)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::freshness_mark_fresh);
   if (!api.freshness_mark_fresh) {
     errno = ENOSYS;
     return false;
@@ -848,9 +851,7 @@ bool flushDirtyTile(uint64_t path_key, int &source_rank_out,
   if (!init())
     return false;
 
-  auto &api = getMppApi();
-  if (!api.flush_dirty_tile)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::flush_dirty_tile);
   if (!api.flush_dirty_tile) {
     errno = ENOSYS;
     return false;
@@ -887,9 +888,7 @@ bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,
     return false;
   }
 
-  auto &api = getMppApi();
-  if (!api.sched_request)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::sched_request);
 
   if (!api.sched_request) {
     io_log("MPP shim not available (ompfile_mpp_sched_request missing).\n");
@@ -956,9 +955,7 @@ bool schedBatchRequest(
     return false;
   }
 
-  auto &api = getMppApi();
-  if (!api.sched_batch_request)
-    api = loadMppApi();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::sched_batch_request);
 
   if (api.sched_batch_request) {
     std::vector<uint8_t> plan_payload(

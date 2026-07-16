@@ -47,14 +47,12 @@ MPIIOBackend::MPIIOBackend() {
     externally_initialized = 1;
   }
 
-  const char *mpp_open_env = std::getenv("LIBOMPFILE_MPP_OPEN");
-  if (mpp_open_env && mpp_open_env[0] == '1' && mpp_open_env[1] == '\0') {
+  if (parseBoolEnv("LIBOMPFILE_MPP_OPEN", false)) {
     mpp_open_enabled = true;
     io_log("LIBOMPFILE_MPP_OPEN=1: enabling MPP open/close path.\n");
   }
 
-  const char *mpp_io_env = std::getenv("LIBOMPFILE_MPP_IO");
-  if (mpp_io_env && mpp_io_env[0] == '1' && mpp_io_env[1] == '\0') {
+  if (parseBoolEnv("LIBOMPFILE_MPP_IO", false)) {
     if (mpp_open_enabled) {
       mpp_io_enabled = true;
       io_log("LIBOMPFILE_MPP_IO=1: enabling MPP I/O path.\n");
@@ -247,6 +245,27 @@ MPIIOBackend::~MPIIOBackend() {
       const std::lock_guard<std::mutex> lock(mpp_call_mutex);
       if (!ompfile::mpp::close(remote_handle)) {
         io_log("MPP close retry failed during backend teardown (handle=%d)\n",
+               remote_handle);
+      }
+    }
+  }
+  {
+    std::vector<int> remote_read_handles;
+    {
+      const std::lock_guard<std::mutex> lock(handle_mutex);
+      for (const auto &per_file : remote_read_handle_cache) {
+        for (const auto &per_rank : per_file.second) {
+          if (per_rank.second >= 0)
+            remote_read_handles.push_back(per_rank.second);
+        }
+      }
+      remote_read_handle_cache.clear();
+    }
+    for (int remote_handle : remote_read_handles) {
+      const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+      if (!ompfile::mpp::close(remote_handle)) {
+        io_log("MPP close retry failed during backend teardown for cached "
+               "remote read handle=%d\n",
                remote_handle);
       }
     }

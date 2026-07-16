@@ -99,8 +99,12 @@ size_t MPIIOBackend::computeTwoPhaseTargetReadSize(long start, long end,
                                                    bool remote_only,
                                                    uint64_t sieve_bytes,
                                                    uint64_t max_batch_bytes) {
-  assert(start >= 0 && end >= start &&
-         "Coalesced read range must be monotonic.");
+  if (start < 0 || end < start) {
+    io_log("Error: computeTwoPhaseTargetReadSize received a non-monotonic "
+           "range start=%ld end=%ld; refusing to compute a target size.\n",
+           start, end);
+    return 0;
+  }
   const size_t read_size = static_cast<size_t>(end - start);
   if (sieve_bytes == 0)
     return read_size;

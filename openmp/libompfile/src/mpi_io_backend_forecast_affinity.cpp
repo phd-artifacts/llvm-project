@@ -1,3 +1,4 @@
+#include "debug_log.h"
 #include "mpi_io_backend.h"
 
 #include <cassert>
@@ -170,8 +171,12 @@ size_t MPIIOBackend::computeForecastTargetReadSize(
     const ompfile::OmpFileIOHint &hint, long start, long end,
     size_t request_count, bool remote_only, uint64_t sieve_bytes,
     uint64_t max_batch_bytes) const {
-  assert(start >= 0 && end >= start &&
-         "Forecast read range must be monotonic.");
+  if (start < 0 || end < start) {
+    io_log("Error: computeForecastTargetReadSize received a non-monotonic "
+           "range start=%ld end=%ld; refusing to compute a target size.\n",
+           start, end);
+    return 0;
+  }
   if (isForecastHintValid(hint))
     return static_cast<size_t>(end - start);
   return computeTwoPhaseTargetReadSize(start, end, request_count, remote_only,

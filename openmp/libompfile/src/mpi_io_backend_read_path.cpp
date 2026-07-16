@@ -480,10 +480,13 @@ int MPIIOBackend::readAtWithContext(
             for (const WriteEpochEntry &entry : write_it->second) {
               if (!rangesOverlap(offset, read_end, entry.Start, entry.End))
                 continue;
+              // Without a tile hint, key on the write's start offset alone
+              // (not its own byte width): two writes covering the same
+              // physical region but with differing widths must still route
+              // to the same rank, which dividing by (End-Start) breaks.
               const uint64_t key = entry.HasTile
                                        ? entry.TileId
-                                       : static_cast<uint64_t>(entry.Start /
-                                             std::max<long>(1, entry.End - entry.Start));
+                                       : static_cast<uint64_t>(entry.Start);
               const int candidate_rank = rankForDistributedWriteKey(key);
               if (candidate_rank >= 0 && entry.Sequence >= latest_sequence) {
                 latest_sequence = entry.Sequence;

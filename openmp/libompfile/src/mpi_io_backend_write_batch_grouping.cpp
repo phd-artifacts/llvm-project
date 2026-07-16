@@ -61,6 +61,9 @@ void MPIIOBackend::processWriteGroup(std::vector<WriteBatchRequest *> &group) {
     std::vector<WriteBatchRequest *> Requests;
   };
 
+  // Pass 1: decide coalescing groups and their [Start, End) extent by
+  // adjacency in offset order, exactly as before. Byte content is NOT
+  // materialized here.
   std::vector<CoalescedWrite> coalesced;
   coalesced.reserve(group.size());
   for (WriteBatchRequest *request : group) {
@@ -82,7 +85,6 @@ void MPIIOBackend::processWriteGroup(std::vector<WriteBatchRequest *> &group) {
       CoalescedWrite item{};
       item.Start = start;
       item.End = end;
-      item.Data = request->Data;
       item.Requests.push_back(request);
       coalesced.push_back(std::move(item));
       continue;
@@ -98,20 +100,35 @@ void MPIIOBackend::processWriteGroup(std::vector<WriteBatchRequest *> &group) {
       CoalescedWrite item{};
       item.Start = start;
       item.End = end;
-      item.Data = request->Data;
       item.Requests.push_back(request);
       coalesced.push_back(std::move(item));
       continue;
     }
 
-    tail.Data.resize(static_cast<size_t>(merged_end - tail.Start), 0);
-    const size_t copy_offset = static_cast<size_t>(start - tail.Start);
-    if (!request->Data.empty()) {
-      std::memcpy(tail.Data.data() + copy_offset, request->Data.data(),
-                  request->Data.size());
-    }
     tail.End = merged_end;
     tail.Requests.push_back(request);
+  }
+
+  // Pass 2: materialize each group's bytes by applying member requests in
+  // real submission order (ascending DebugRequestId, assigned when the
+  // request was enqueued), not offset order. Offset order only decided which
+  // requests coalesce; on a genuine byte-range overlap within a group, the
+  // request issued last must be the one whose bytes survive, independent of
+  // which one happens to sit at the lower offset.
+  for (CoalescedWrite &item : coalesced) {
+    item.Data.resize(static_cast<size_t>(item.End - item.Start), 0);
+    std::sort(item.Requests.begin(), item.Requests.end(),
+              [](const WriteBatchRequest *lhs, const WriteBatchRequest *rhs) {
+                return lhs->DebugRequestId < rhs->DebugRequestId;
+              });
+    for (WriteBatchRequest *request : item.Requests) {
+      if (request->Data.empty())
+        continue;
+      const size_t copy_offset =
+          static_cast<size_t>(request->Offset - item.Start);
+      std::memcpy(item.Data.data() + copy_offset, request->Data.data(),
+                  request->Data.size());
+    }
   }
 
   // Debug: log coalesced write ranges after grouping

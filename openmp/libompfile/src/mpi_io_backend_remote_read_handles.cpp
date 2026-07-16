@@ -80,6 +80,26 @@ bool MPIIOBackend::getOrCreateRemoteReadHandleForRank(int file_id,
   return true;
 }
 
+void MPIIOBackend::evictAndCloseRemoteReadHandle(int file_id,
+                                                 int target_rank) {
+  int stale_handle = -1;
+  {
+    const std::lock_guard<std::mutex> lock(handle_mutex);
+    auto cache_it = remote_read_handle_cache.find(file_id);
+    if (cache_it != remote_read_handle_cache.end()) {
+      auto rank_it = cache_it->second.find(target_rank);
+      if (rank_it != cache_it->second.end()) {
+        stale_handle = rank_it->second;
+        cache_it->second.erase(rank_it);
+      }
+    }
+  }
+  if (stale_handle >= 0) {
+    const std::lock_guard<std::mutex> lock(mpp_call_mutex);
+    (void)ompfile::mpp::close(stale_handle);
+  }
+}
+
 bool MPIIOBackend::writeAtRemoteRankWithBytes(
     int file_id, int target_rank, long offset, const void *data, size_t size,
     size_t &bytes_written) {
@@ -94,12 +114,8 @@ bool MPIIOBackend::writeAtRemoteRankWithBytes(
   }
   int last_errno = 0;
   for (int attempt = 0; attempt < 2; ++attempt) {
-    if (attempt > 0) {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
-      auto cache_it = remote_read_handle_cache.find(file_id);
-      if (cache_it != remote_read_handle_cache.end())
-        cache_it->second.erase(target_rank);
-    }
+    if (attempt > 0)
+      evictAndCloseRemoteReadHandle(file_id, target_rank);
 
     int remote_handle = -1;
     if (!getOrCreateRemoteReadHandleForRank(file_id, target_rank,
@@ -136,12 +152,8 @@ bool MPIIOBackend::readAtRemoteRankNoStageWithBytes(
   }
   int last_errno = 0;
   for (int attempt = 0; attempt < 2; ++attempt) {
-    if (attempt > 0) {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
-      auto cache_it = remote_read_handle_cache.find(file_id);
-      if (cache_it != remote_read_handle_cache.end())
-        cache_it->second.erase(target_rank);
-    }
+    if (attempt > 0)
+      evictAndCloseRemoteReadHandle(file_id, target_rank);
 
     int remote_handle = -1;
     if (!getOrCreateRemoteReadHandleForRank(file_id, target_rank,
@@ -199,12 +211,8 @@ bool MPIIOBackend::readAtRemoteRankWithBytes(int file_id, int target_rank,
   }
   int last_errno = 0;
   for (int attempt = 0; attempt < 2; ++attempt) {
-    if (attempt > 0) {
-      const std::lock_guard<std::mutex> lock(handle_mutex);
-      auto cache_it = remote_read_handle_cache.find(file_id);
-      if (cache_it != remote_read_handle_cache.end())
-        cache_it->second.erase(target_rank);
-    }
+    if (attempt > 0)
+      evictAndCloseRemoteReadHandle(file_id, target_rank);
 
     int remote_handle = -1;
     if (!getOrCreateRemoteReadHandleForRank(file_id, target_rank,

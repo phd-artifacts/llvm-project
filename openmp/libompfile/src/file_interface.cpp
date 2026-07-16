@@ -61,8 +61,8 @@ static bool envFlagEnabled(const char *name) {
 }
 
 static bool isMppRemoteOnlyEnabled() {
-  return envFlagEnabled("LIBOMPFILE_MPP_OPEN") &&
-         envFlagEnabled("LIBOMPFILE_MPP_IO");
+  return MPIIOBackend::parseBoolEnv("LIBOMPFILE_MPP_OPEN", false) &&
+         MPIIOBackend::parseBoolEnv("LIBOMPFILE_MPP_IO", false);
 }
 
 static void applyIoHint(ompfile::OmpFileIOHint &dst,

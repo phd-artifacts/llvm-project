@@ -276,6 +276,12 @@ private:
   std::unordered_map<uint64_t, TwoPhaseReadCacheEntry> two_phase_read_cache;
 
 public:
+  // Shared with file_interface.cpp's free-function env parsing so every
+  // LIBOMPFILE_OPT_*-style boolean knob (including LIBOMPFILE_MPP_OPEN and
+  // LIBOMPFILE_MPP_IO) rejects malformed values the same way instead of
+  // silently falling back with no diagnostic.
+  static bool parseBoolEnv(const char *name, bool default_value);
+
   MPIIOBackend();
   ~MPIIOBackend();
 
@@ -662,7 +668,6 @@ private:
   static const char *twoPhasePolicyToString(TwoPhasePolicy policy);
   static const char *forecastModeToString(ForecastMode mode);
   static const char *stageAffinityModeToString(StageAffinityMode mode);
-  static bool parseBoolEnv(const char *name, bool default_value);
   static uint64_t parseUint64Env(const char *name, uint64_t default_value);
   static void updateAtomicMax(std::atomic<uint64_t> &counter,
                               uint64_t candidate);
@@ -730,6 +735,7 @@ private:
   void noteWritableReadRebalanceBlocked(const char *reason);
   bool getOrCreateRemoteReadHandleForRank(int file_id, int target_rank,
                                           int &remote_handle_out);
+  void evictAndCloseRemoteReadHandle(int file_id, int target_rank);
   bool readAtRemoteRankWithBytes(int file_id, int target_rank, long offset,
                                  void *data, size_t size,
                                  size_t &bytes_read);
