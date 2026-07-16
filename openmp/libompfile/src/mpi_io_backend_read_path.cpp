@@ -474,10 +474,19 @@ int MPIIOBackend::readAtWithContext(
                              static_cast<long>(size))
                   ? offset + static_cast<long>(size)
                   : offset;
+          // Resolve the distributed-write rank count once, up front and
+          // outside handle_mutex: it is constant for the whole scan and is
+          // otherwise re-parsed from env vars (up to 3 getenv/strtoul each)
+          // on every epoch entry, which turns the O(n) history walk under the
+          // global lock into O(n) env parses.
+          const unsigned distribute_ranks = distributedWritebackRankCount();
           const auto lock = instrumentedHandleLock();
           auto write_it = file_write_epoch_history.find(file_id);
-          if (write_it != file_write_epoch_history.end() && read_end > offset) {
+          if (distribute_ranks > 1 &&
+              write_it != file_write_epoch_history.end() && read_end > offset) {
             for (const WriteEpochEntry &entry : write_it->second) {
+              if (entry.Sequence < latest_sequence)
+                continue;
               if (!rangesOverlap(offset, read_end, entry.Start, entry.End))
                 continue;
               // Without a tile hint, key on the write's start offset alone
@@ -487,11 +496,8 @@ int MPIIOBackend::readAtWithContext(
               const uint64_t key = entry.HasTile
                                        ? entry.TileId
                                        : static_cast<uint64_t>(entry.Start);
-              const int candidate_rank = rankForDistributedWriteKey(key);
-              if (candidate_rank >= 0 && entry.Sequence >= latest_sequence) {
-                latest_sequence = entry.Sequence;
-                range_owner_rank = candidate_rank;
-              }
+              latest_sequence = entry.Sequence;
+              range_owner_rank = static_cast<int>(key % distribute_ranks);
             }
           }
           if (range_owner_rank >= 0) {

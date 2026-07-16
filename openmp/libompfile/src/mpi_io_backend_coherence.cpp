@@ -295,6 +295,12 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
   bool saw_overlap = false;
   bool saw_missing_write_epoch = false;
   bool saw_newer_write_epoch = false;
+  // The blocking reason is precedence-ordered (missing-read-epoch >
+  // missing-write-epoch > newer-write-epoch > unsafe-write-overlap), so this
+  // O(n) scan under handle_mutex can stop as soon as an overlapping entry
+  // fixes the highest-precedence reason no later entry could change. This
+  // shortens the critical section (the epoch history is capped at 8192) for
+  // the common case where the outcome is decided early.
   for (const WriteEpochEntry &entry : it->second) {
     if (!rangesOverlap(start, end, entry.Start, entry.End))
       continue;
@@ -304,11 +310,14 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
     // owns dirty write-back data. Do not let mismatched tile metadata make an
     // overlapping byte range eligible for rebalanced reads.
     saw_overlap = true;
+    if (!read_has_epoch)
+      break; // outcome fixed: "missing-read-epoch" dominates everything below.
     if (!entry.HasEpoch) {
+      // "missing-write-epoch" dominates "newer-write-epoch"/"unsafe-overlap".
       saw_missing_write_epoch = true;
-      continue;
+      break;
     }
-    if (read_has_epoch && entry.EpochId > read_epoch)
+    if (entry.EpochId > read_epoch)
       saw_newer_write_epoch = true;
   }
 
