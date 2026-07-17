@@ -1778,7 +1778,18 @@ struct ProxyDevice {
       return true;
     }
 
-    return Entry.DirtyEpoch == ExpectedVersion;
+    // Whole-file (hint-less) fallback: DirtyEpoch is entry-global and is
+    // bumped by EVERY capture on this file, so with two concurrent writers an
+    // exact match races — writer B's unrelated capture advances DirtyEpoch
+    // past the version reader A was told to expect, the guard rejects the
+    // stage, and the read falls back to a PFS copy that write-back has
+    // deliberately not flushed yet (stale read-after-write, OOC repro jobs
+    // AMD 350175/350180, sorgan 3655). Monotonic comparison is safe here:
+    // capture writes the stage bytes *before* committing the epoch, so
+    // DirtyEpoch >= ExpectedVersion implies every commit up to
+    // ExpectedVersion already has its bytes in this stage, and the caller
+    // separately enforces dirty-extent coverage for the requested range.
+    return Entry.DirtyEpoch >= ExpectedVersion;
   }
 
   bool completeDerivedTileFlushesOnHeadnode(
@@ -2560,6 +2571,7 @@ struct ProxyDevice {
 
   bool populateStageRange(const std::string &SourcePath, int StageFd,
                           uint64_t Offset, uint64_t Size,
+                          const std::vector<OmpFileStageExtent> &SkipExtents,
                           uint64_t &PopulateBeginOut,
                           uint64_t &PopulateEndOut,
                           uint64_t &SourceSizeOut,
@@ -2621,22 +2633,50 @@ struct ProxyDevice {
         break;
       }
 
-      ssize_t WrittenTotal = 0;
-      while (WrittenTotal < BytesRead) {
-        const auto WriteStart = std::chrono::steady_clock::now();
-        const ssize_t BytesWritten = ::pwrite(
-            StageFd, Buffer.data() + WrittenTotal,
-            static_cast<size_t>(BytesRead - WrittenTotal),
-            static_cast<off_t>(Cursor + static_cast<uint64_t>(WrittenTotal)));
-        const auto WriteEnd = std::chrono::steady_clock::now();
-        Stats.CopyUs += elapsedMicros(WriteStart, WriteEnd);
-        if (BytesWritten <= 0) {
-          ErrnoOut = BytesWritten < 0 ? errno : EIO;
-          Success = false;
-          break;
+      // Never overwrite captured write-back data with source bytes: under
+      // write-back the source file is intentionally stale for dirty ranges,
+      // so populating over a dirty extent silently destroys an acked write
+      // (stale read-after-write; OOC repro sorgan 3655 / AMD 350175). Write
+      // only the sub-ranges of this chunk that fall outside SkipExtents.
+      const uint64_t ChunkBegin = Cursor;
+      const uint64_t ChunkEnd = Cursor + static_cast<uint64_t>(BytesRead);
+      uint64_t SubCursor = ChunkBegin;
+      while (Success && SubCursor < ChunkEnd) {
+        uint64_t CleanEnd = ChunkEnd;
+        bool InsideDirty = false;
+        for (const OmpFileStageExtent &Skip : SkipExtents) {
+          if (Skip.Begin <= SubCursor && SubCursor < Skip.End) {
+            InsideDirty = true;
+            SubCursor = std::min(Skip.End, ChunkEnd);
+            break;
+          }
+          if (Skip.Begin > SubCursor)
+            CleanEnd = std::min(CleanEnd, Skip.Begin);
         }
-        WrittenTotal += BytesWritten;
-        Stats.CopiedBytes += static_cast<uint64_t>(BytesWritten);
+        if (InsideDirty)
+          continue;
+        ssize_t WrittenTotal = 0;
+        const size_t CleanBytes = static_cast<size_t>(CleanEnd - SubCursor);
+        while (static_cast<size_t>(WrittenTotal) < CleanBytes) {
+          const auto WriteStart = std::chrono::steady_clock::now();
+          const ssize_t BytesWritten = ::pwrite(
+              StageFd,
+              Buffer.data() + (SubCursor - ChunkBegin) +
+                  static_cast<uint64_t>(WrittenTotal),
+              CleanBytes - static_cast<size_t>(WrittenTotal),
+              static_cast<off_t>(SubCursor +
+                                 static_cast<uint64_t>(WrittenTotal)));
+          const auto WriteEnd = std::chrono::steady_clock::now();
+          Stats.CopyUs += elapsedMicros(WriteStart, WriteEnd);
+          if (BytesWritten <= 0) {
+            ErrnoOut = BytesWritten < 0 ? errno : EIO;
+            Success = false;
+            break;
+          }
+          WrittenTotal += BytesWritten;
+          Stats.CopiedBytes += static_cast<uint64_t>(BytesWritten);
+        }
+        SubCursor = CleanEnd;
       }
       if (!Success)
         break;
@@ -3039,6 +3079,11 @@ struct ProxyDevice {
       Entry->Cond.wait(EntryLock);
     }
     Entry->PopulateInProgress = true;
+    // Snapshot dirty extents under the lock: captures wait on
+    // PopulateInProgress, so no new dirty extent can appear until populate
+    // finishes, and populate must never overwrite these ranges with the
+    // (write-back-stale) source bytes.
+    const std::vector<OmpFileStageExtent> DirtySnapshot = Entry->DirtyExtents;
     EntryLock.unlock();
 
     OmpFileStagePopulateStats PopulateStats;
@@ -3048,8 +3093,8 @@ struct ProxyDevice {
     const auto PopulateStart = std::chrono::steady_clock::now();
     const bool PopulateOk =
         populateStageRange(SourcePath, Entry->StageFd, Offset, Size,
-                           PopulateBegin, PopulateEnd, SourceSize, PopulateStats,
-                           ErrnoOut);
+                           DirtySnapshot, PopulateBegin, PopulateEnd,
+                           SourceSize, PopulateStats, ErrnoOut);
     PopulateStats.PopulateUs =
         elapsedMicros(PopulateStart, std::chrono::steady_clock::now());
 
@@ -3489,34 +3534,47 @@ struct ProxyDevice {
 
       uint64_t StageBytesWritten = 0;
       uint64_t StageWriteUs = 0;
-      if (!pwriteFully(StageFd, Offset, Buffer, Size, &StageBytesWritten,
-                       &StageWriteUs, StageErrno) ||
-          StageBytesWritten < Size) {
-        OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
-        OmpFileStatsStagingWriteBypassCount.fetch_add(
-            1, std::memory_order_relaxed);
-        invalidateStageForPath(SourcePath);
-        return writeSourceAuthoritative(/*CountBypassOnFailure=*/false,
-                                        /*InvalidateOnFailure=*/false);
-      }
-
-      if (shouldSyncStagePopulate()) {
-        const auto FsyncStart = std::chrono::steady_clock::now();
-        if (::fdatasync(StageFd) != 0) {
-          OmpFileStatsStageWriteFailures.fetch_add(
-              1, std::memory_order_relaxed);
+      uint64_t DirtyBytes = 0;
+      {
+        // Capture must be atomic against windowed stage population: populate
+        // copies its window from the source file, which write-back has
+        // deliberately left stale, so a capture racing a populate can be
+        // clobbered and the acked write silently lost (stale
+        // read-after-write; OOC repro sorgan 3655 / AMD 350175). Wait out
+        // any in-flight populate, then write the bytes AND record the dirty
+        // extent under one lock hold so any later populate's dirty-extent
+        // snapshot protects them.
+        std::unique_lock<std::mutex> CaptureLock(HeldStageEntry->Mutex);
+        while (HeldStageEntry->PopulateInProgress)
+          HeldStageEntry->Cond.wait(CaptureLock);
+        bool CaptureOk = !HeldStageEntry->Invalidated;
+        if (CaptureOk &&
+            (!pwriteFully(StageFd, Offset, Buffer, Size, &StageBytesWritten,
+                          &StageWriteUs, StageErrno) ||
+             StageBytesWritten < Size))
+          CaptureOk = false;
+        if (CaptureOk && shouldSyncStagePopulate()) {
+          const auto FsyncStart = std::chrono::steady_clock::now();
+          if (::fdatasync(StageFd) != 0)
+            CaptureOk = false;
+          StageWriteUs +=
+              elapsedMicros(FsyncStart, std::chrono::steady_clock::now());
+        }
+        if (!CaptureOk) {
+          CaptureLock.unlock();
+          OmpFileStatsStageWriteFailures.fetch_add(1,
+                                                   std::memory_order_relaxed);
           OmpFileStatsStagingWriteBypassCount.fetch_add(
               1, std::memory_order_relaxed);
-          OmpFileStatsStageWriteUs.fetch_add(
-              StageWriteUs +
-                  elapsedMicros(FsyncStart, std::chrono::steady_clock::now()),
-              std::memory_order_relaxed);
+          OmpFileStatsStageWriteUs.fetch_add(StageWriteUs,
+                                             std::memory_order_relaxed);
           invalidateStageForPath(SourcePath);
           return writeSourceAuthoritative(/*CountBypassOnFailure=*/false,
                                           /*InvalidateOnFailure=*/false);
         }
-        StageWriteUs +=
-            elapsedMicros(FsyncStart, std::chrono::steady_clock::now());
+        const uint64_t Begin = static_cast<uint64_t>(Offset);
+        const uint64_t End = saturatingAdd(Begin, Size);
+        DirtyBytes = markDirtyRangeLocked(*HeldStageEntry, Begin, End);
       }
 
       uint64_t SourceSize = 0;
@@ -3555,12 +3613,10 @@ struct ProxyDevice {
         }
       }
 
-      uint64_t DirtyBytes = 0;
       {
-        const uint64_t Begin = static_cast<uint64_t>(Offset);
-        const uint64_t End = saturatingAdd(Begin, Size);
+        // Dirty extent was already recorded atomically with the stage write
+        // above; only the epoch stamp needs the post-commit value.
         std::lock_guard<std::mutex> EntryLock(HeldStageEntry->Mutex);
-        DirtyBytes = markDirtyRangeLocked(*HeldStageEntry, Begin, End);
         HeldStageEntry->DirtyEpoch = CommittedVersion;
       }
       updateStageCoverageForWrite(HeldStageEntry, static_cast<uint64_t>(Offset),
