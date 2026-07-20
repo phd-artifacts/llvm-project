@@ -4521,20 +4521,34 @@ struct ProxyDevice {
     if (Size > 0) {
       Buffer.resize(Size);
       OmpFileStatsPwritePayloadBytes.fetch_add(Size, std::memory_order_relaxed);
-      OmpFileStatsPwriteBlockingFallbacks.fetch_add(1,
-                                                    std::memory_order_relaxed);
-      if (auto Error =
-              RequestManager.receiveInBatchsBlocking(Buffer.data(), Size);
-          Error) {
-        OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
-        co_return Error;
-      }
-      if (!OmpFileForceBlockingPwrite.get()) {
-        traceOmpFile("event ompfilePwrite using blocking receive path size=%llu "
-                     "fragments=%llu\n",
-                     static_cast<unsigned long long>(Size),
-                     static_cast<unsigned long long>(
-                         computePwriteFragmentCount(Size)));
+      if (OmpFileForceBlockingPwrite.get()) {
+        OmpFileStatsPwriteBlockingFallbacks.fetch_add(
+            1, std::memory_order_relaxed);
+        if (auto Error =
+                RequestManager.receiveInBatchsBlocking(Buffer.data(), Size);
+            Error) {
+          OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
+          co_return Error;
+        }
+      } else {
+        // Async coroutine-backed payload receive (the documented default).
+        // This branch was removed in 1e1327ce during the Apr 2026 stale-read
+        // narrowing and never restored — every pwrite silently took the
+        // blocking path while docs/quick-reference still claimed async was
+        // the default (sorgan 3704 payload sweep: pwrite_async_events=0,
+        // pwrite_blocking_fallbacks=64/128 in every cell). The stale-read
+        // surfaces that motivated the narrowing have since been closed
+        // (freshness guard, oracle gates, populate dirty-extent fix), so
+        // restore the async path behind the original
+        // LIBOMPFILE_MPP_FORCE_BLOCKING_PWRITE=1 escape hatch.
+        OmpFileStatsPwriteAsyncEvents.fetch_add(1, std::memory_order_relaxed);
+        OmpFileStatsPwriteAsyncFragments.fetch_add(
+            computePwriteFragmentCount(Size), std::memory_order_relaxed);
+        RequestManager.receiveInBatchs(Buffer.data(), Size);
+        if (auto Error = co_await RequestManager; Error) {
+          OmpFileStatsPwriteFailures.fetch_add(1, std::memory_order_relaxed);
+          co_return Error;
+        }
       }
     }
 
@@ -4560,7 +4574,7 @@ struct ProxyDevice {
                  static_cast<unsigned long long>(Size),
                  static_cast<void *>(Buffer.data()), Ret, Errno,
                  static_cast<unsigned long long>(BytesWrittenOut),
-                 "blocking",
+                 OmpFileForceBlockingPwrite.get() ? "blocking_debug" : "async",
                  static_cast<unsigned long long>(
                      computePwriteFragmentCount(Size)));
     RequestManager.send(nullptr, 0, MPI_BYTE);
