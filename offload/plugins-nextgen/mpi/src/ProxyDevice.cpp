@@ -809,6 +809,8 @@ struct ProxyDevice {
             envStringOrDefault("LIBOMPFILE_STAGE_WRITE_MODE", "write-through"))),
         OmpFileStageSyncPolicy(
             envStringOrDefault("LIBOMPFILE_STAGE_SYNC_POLICY", "cache")),
+        OmpFileWritethroughFsyncPolicy(envStringOrDefault(
+            "LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY", "each")),
         OmpFileStagePopulateMode(
             envStringOrDefault("LIBOMPFILE_STAGE_POPULATE_MODE", "windowed")),
         OmpFileStageRootPolicy(
@@ -1670,6 +1672,10 @@ struct ProxyDevice {
 
   bool isReadthroughStageEnabled() const {
     return OmpFileStageMode == "readthrough" && isStageEnabled();
+  }
+
+  bool writethroughFsyncEachEnabled() const {
+    return OmpFileWritethroughFsyncPolicy != "close";
   }
 
   bool isWritethroughStageEnabled() const {
@@ -3500,9 +3506,19 @@ struct ProxyDevice {
         }
         return false;
       }
-      if (Size > 0 && ::fdatasync(Fd) != 0) {
-        ErrnoOut = errno;
-        return false;
+      if (Size > 0) {
+        if (writethroughFsyncEachEnabled()) {
+          if (::fdatasync(Fd) != 0) {
+            ErrnoOut = errno;
+            return false;
+          }
+        } else {
+          // policy=close: defer durability to the logical close; remember the
+          // fd so closeWithOptionalCache drains it exactly once.
+          const std::lock_guard<std::mutex> UnsyncedLock(
+              OmpFileUnsyncedWriteFdMutex);
+          OmpFileUnsyncedWriteFds.insert(Fd);
+        }
       }
       if (BytesWrittenOut)
         *BytesWrittenOut = SourceBytesWritten;
@@ -3859,6 +3875,27 @@ struct ProxyDevice {
             return -1;
           }
         }
+      }
+    }
+
+    // Deferred write-through durability (fsync policy "close"): commit any
+    // unsynced authoritative writes at the logical close, regardless of
+    // whether the open-cache keeps the physical fd alive afterwards. This
+    // runs before the cache-defer logic so a later cache eviction never
+    // closes an fd with uncommitted data.
+    if (Fd >= 0) {
+      bool NeedDeferredSync = false;
+      {
+        const std::lock_guard<std::mutex> UnsyncedLock(
+            OmpFileUnsyncedWriteFdMutex);
+        NeedDeferredSync = OmpFileUnsyncedWriteFds.erase(Fd) > 0;
+      }
+      if (NeedDeferredSync && ::fdatasync(Fd) != 0) {
+        ErrnoOut = errno;
+        traceOmpFile("closeWithOptionalCache deferred fdatasync failed "
+                     "fd=%d errno=%d\n",
+                     Fd, ErrnoOut);
+        return -1;
       }
     }
 
@@ -6574,6 +6611,14 @@ private:
   std::string OmpFileStageMode;
   std::string OmpFileStageWriteMode;
   std::string OmpFileStageSyncPolicy;
+  // Write-through durability policy: "each" (default) fdatasyncs after every
+  // authoritative source pwrite (crash-safe per write, ~40 ms/op on NFS —
+  // sorgan 3704); "close" defers durability to the logical close, matching
+  // native POSIX/MPI-IO semantics for fair overhead comparisons. Explicitly
+  // opt-in: any value other than "close" behaves as "each".
+  std::string OmpFileWritethroughFsyncPolicy;
+  std::mutex OmpFileUnsyncedWriteFdMutex;
+  std::unordered_set<int> OmpFileUnsyncedWriteFds;
   std::string OmpFileStagePopulateMode;
   std::string OmpFileStageRootPolicy;
   std::string OmpFileTopologyFile;
