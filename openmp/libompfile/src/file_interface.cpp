@@ -19,6 +19,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <string>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <vector>
 
 enum class IOSchedulerTy {
   LOCAL,
@@ -641,6 +645,186 @@ static std::mutex &getClientContextInitMutex() {
   return init_mutex;
 }
 
+// Background write engine that turns async-issued writes into a producer/
+// consumer pipeline: the issuing (target-region) thread copies the payload,
+// enqueues it, and returns immediately, so it can dispatch the next write while
+// a single worker thread drains the previous one through the normal scheduler
+// path. This attacks overhead #3 ("no pipelining") — issue of write N+1 now
+// overlaps the drain of write N instead of stalling behind it.
+//
+// Safety: the proxy initializes MPI at MPI_THREAD_MULTIPLE, so the worker may
+// call MPI concurrently. Even so, we keep exactly one worker and never let the
+// issuing thread touch the scheduler while writes are queued: it only enqueues
+// during a write wave and drains the engine at every sync point (open/close/
+// read/seek). That keeps scheduler/headnode state single-threaded in practice
+// while still overlapping issue with drain. If the runtime is ever initialized
+// below MPI_THREAD_SERIALIZED, async falls back to synchronous execution.
+class AsyncWriteEngine {
+public:
+  struct Task {
+    int handle = -1;
+    long offset = 0;
+    bool has_offset = false; // pwrite when true, sequential write when false
+    bool has_hint = false;
+    ompfile::OmpFileIOHint hint{};
+    std::vector<char> data;
+  };
+
+  // Executes one queued task synchronously; returns the backend rc.
+  using Executor = std::function<int(const Task &)>;
+
+  AsyncWriteEngine() = default;
+  ~AsyncWriteEngine() { shutdown(); }
+
+  AsyncWriteEngine(const AsyncWriteEngine &) = delete;
+  AsyncWriteEngine &operator=(const AsyncWriteEngine &) = delete;
+
+  void configure(Executor exec) {
+    executor_ = std::move(exec);
+    max_depth_ = resolveDepth();
+  }
+
+  // Lazily decides (once) whether the async worker path is usable. When it
+  // returns false the caller must run the write synchronously.
+  bool available() {
+    std::call_once(available_once_, [this] { enabled_ = resolveEnabled(); });
+    return enabled_;
+  }
+
+  // Copies and queues a write. Returns 0 on accept, or -1 if a previously
+  // queued async write already failed (sticky) so the caller can stop early.
+  int enqueue(Task &&task) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    if (sticky_error_ != 0)
+      return sticky_error_;
+    startWorkerLocked();
+    not_full_.wait(lock,
+                   [&] { return queue_.size() < max_depth_ || stop_; });
+    if (stop_)
+      return -1;
+    pending_[task.handle]++;
+    queue_.push_back(std::move(task));
+    has_work_.notify_one();
+    return 0;
+  }
+
+  bool active() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return worker_started_ && (!queue_.empty() || busy_);
+  }
+
+  // Waits until every queued write for `handle` has drained.
+  int flushHandle(int handle) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    if (!worker_started_)
+      return sticky_error_;
+    handle_done_.wait(lock, [&] {
+      auto it = pending_.find(handle);
+      return it == pending_.end() || it->second == 0;
+    });
+    return sticky_error_;
+  }
+
+  // Waits until the whole queue has drained and the worker is idle.
+  int drain() {
+    std::unique_lock<std::mutex> lock(mtx_);
+    if (!worker_started_)
+      return sticky_error_;
+    idle_.wait(lock, [&] { return queue_.empty() && !busy_; });
+    return sticky_error_;
+  }
+
+  void shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      stop_ = true;
+      has_work_.notify_all();
+      not_full_.notify_all();
+    }
+    if (worker_.joinable())
+      worker_.join();
+  }
+
+private:
+  static size_t resolveDepth() {
+    const char *env = std::getenv("LIBOMPFILE_ASYNC_QUEUE_DEPTH");
+    if (env && env[0]) {
+      char *end = nullptr;
+      long v = std::strtol(env, &end, 10);
+      if (end != env && v > 0)
+        return static_cast<size_t>(v);
+    }
+    return 2; // double-buffer: one draining, one queued ahead
+  }
+
+  static bool resolveEnabled() {
+    if (envFlagEnabled("LIBOMPFILE_ASYNC_DISABLE"))
+      return false;
+    int initialized = 0;
+    MPI_Initialized(&initialized);
+    if (!initialized)
+      return true; // no MPI in flight => local backend, a worker is always safe
+    int level = MPI_THREAD_SINGLE;
+    MPI_Query_thread(&level);
+    if (level >= MPI_THREAD_SERIALIZED)
+      return true;
+    io_log("Async IO worker disabled: MPI thread level below SERIALIZED; "
+           "async writes run synchronously.\n");
+    return false;
+  }
+
+  void startWorkerLocked() {
+    if (worker_started_)
+      return;
+    worker_started_ = true;
+    worker_ = std::thread([this] { workerLoop(); });
+  }
+
+  void workerLoop() {
+    std::unique_lock<std::mutex> lock(mtx_);
+    for (;;) {
+      has_work_.wait(lock, [&] { return !queue_.empty() || stop_; });
+      if (queue_.empty()) {
+        if (stop_)
+          return;
+        continue;
+      }
+      Task task = std::move(queue_.front());
+      queue_.pop_front();
+      busy_ = true;
+      not_full_.notify_one();
+      lock.unlock();
+      const int rc = executor_ ? executor_(task) : -1;
+      lock.lock();
+      busy_ = false;
+      auto it = pending_.find(task.handle);
+      if (it != pending_.end() && --it->second == 0)
+        pending_.erase(it);
+      if (rc != 0 && sticky_error_ == 0)
+        sticky_error_ = rc;
+      handle_done_.notify_all();
+      idle_.notify_all();
+    }
+  }
+
+  Executor executor_;
+  std::mutex mtx_;
+  std::condition_variable has_work_;
+  std::condition_variable not_full_;
+  std::condition_variable handle_done_;
+  std::condition_variable idle_;
+  std::deque<Task> queue_;
+  std::unordered_map<int, uint64_t> pending_;
+  std::thread worker_;
+  std::once_flag available_once_;
+  size_t max_depth_ = 2;
+  bool enabled_ = false;
+  bool worker_started_ = false;
+  bool busy_ = false;
+  bool stop_ = false;
+  int sticky_error_ = 0;
+};
+
 class OmpFileClientContext {
 
 private:
@@ -649,6 +833,7 @@ private:
   std::unique_ptr<IOScheduler> io_scheduler;
   std::atomic<int> io_resource_token;
   std::atomic<uint64_t> api_call_id{1};
+  AsyncWriteEngine async_engine;
 
   // RAII guard for IO resource token
   class IOResourceGuard {
@@ -717,6 +902,22 @@ public:
       io_scheduler = std::make_unique<LocalScheduler>(*io_backend);
     }
 
+    // Wire the async engine to drain queued writes through the same scheduler
+    // path (and token semaphore) a synchronous write would take.
+    async_engine.configure([this](const AsyncWriteEngine::Task &task) -> int {
+      IOResourceGuard guard(io_resource_token);
+      if (task.has_offset) {
+        if (task.has_hint)
+          return io_scheduler->writeAtHint(task.handle, task.offset,
+                                           task.data.data(), task.data.size(),
+                                           &task.hint);
+        return io_scheduler->writeAt(task.handle, task.offset,
+                                     task.data.data(), task.data.size());
+      }
+      return io_scheduler->write(task.handle, task.data.data(),
+                                 task.data.size());
+    });
+
     io_log("OmpFileClientContext constructor called\n");
     io_trace("OmpFileClientContext ctor done this=%p io_backend=%p "
              "io_scheduler=%p\n",
@@ -728,6 +929,9 @@ public:
     io_trace("OmpFileClientContext dtor this=%p io_backend=%p io_scheduler=%p\n",
              static_cast<void *>(this), static_cast<void *>(io_backend.get()),
              static_cast<void *>(io_scheduler.get()));
+    // Queue must already be drained by the last close/read; join the idle
+    // worker before tearing down the scheduler it calls into.
+    async_engine.shutdown();
     io_log("Destroying OmpFileClientContext\n");
   }
 
@@ -779,6 +983,8 @@ public:
              static_cast<void *>(this),
              static_cast<unsigned long long>(call_id),
              filename ? filename : "(null)", io_resource_token.load());
+    if (async_engine.active())
+      async_engine.drain();
     IOResourceGuard guard(io_resource_token);
     const int rc = io_scheduler->open(filename);
     io_trace("ctx=%p call=%llu openFile exit rc=%d tokens=%d\n",
@@ -794,6 +1000,8 @@ public:
   }
 
   int readFile(int file_handle, void *data, size_t size) {
+    if (async_engine.active())
+      async_engine.drain();
     IOResourceGuard guard(io_resource_token);
     return io_scheduler->read(file_handle, data, size);
   }
@@ -805,16 +1013,30 @@ public:
              static_cast<void *>(this),
              static_cast<unsigned long long>(call_id), file_handle,
              io_resource_token.load());
+    // Every queued async write must physically complete before the file is
+    // closed; this is the pipeline's join point. Draining all (not just this
+    // handle) also keeps scheduler/headnode state single-threaded. Always drain
+    // (even if the queue already emptied) so a sticky async-write failure is
+    // surfaced here rather than silently swallowed.
+    const int async_rc = async_engine.drain();
+    if (async_rc != 0)
+      io_log("closeFile: a queued async write failed (rc=%d) before close of "
+             "handle %d\n",
+             async_rc, file_handle);
     IOResourceGuard guard(io_resource_token);
     const int rc = io_scheduler->close(file_handle);
     io_trace("ctx=%p call=%llu closeFile exit rc=%d tokens=%d\n",
              static_cast<void *>(this),
              static_cast<unsigned long long>(call_id), rc,
              io_resource_token.load());
+    if (rc == 0 && async_rc != 0)
+      return -1; // surface the async write failure the close would otherwise hide
     return rc;
   }
 
   int seekFile(int file_handle, long offset) {
+    if (async_engine.active())
+      async_engine.drain();
     IOResourceGuard guard(io_resource_token);
     return io_scheduler->seek(file_handle, offset);
   }
@@ -833,6 +1055,37 @@ public:
                                      hint ? &internal_hint : nullptr);
   }
 
+  // Unified write entry for the C API. When async is requested and the worker
+  // path is available, the payload is copied and queued so the caller can
+  // pipeline the next issue; otherwise it runs synchronously after draining any
+  // in-flight async writes (preserving program order and single-threaded
+  // scheduler access). Returns 0/queued-accept or a negative error.
+  int submitWrite(int file_handle, long offset, bool has_offset,
+                  const void *data, size_t size,
+                  const omp_file_io_hint_v1 *hint, bool async) {
+    if (async && async_engine.available()) {
+      AsyncWriteEngine::Task task;
+      task.handle = file_handle;
+      task.offset = offset;
+      task.has_offset = has_offset;
+      if (hint) {
+        task.has_hint = true;
+        applyIoHint(task.hint, hint);
+      }
+      const char *bytes = static_cast<const char *>(data);
+      task.data.assign(bytes, bytes + size);
+      return async_engine.enqueue(std::move(task));
+    }
+    if (async_engine.active())
+      async_engine.drain();
+    if (has_offset) {
+      if (hint)
+        return writeFileAtHint(file_handle, data, size, offset, hint);
+      return writeFileAt(file_handle, data, size, offset);
+    }
+    return writeFile(file_handle, data, size);
+  }
+
   int readFileAt(int file_handle, void *data, size_t size, long offset) {
     const uint64_t call_id =
         api_call_id.fetch_add(1, std::memory_order_relaxed);
@@ -841,6 +1094,8 @@ public:
              static_cast<void *>(this),
              static_cast<unsigned long long>(call_id), file_handle, offset,
              size, io_resource_token.load());
+    if (async_engine.active())
+      async_engine.drain();
     IOResourceGuard guard(io_resource_token);
     const int rc = io_scheduler->readAt(file_handle, offset, data, size);
     io_trace("ctx=%p call=%llu readFileAt exit rc=%d tokens=%d\n",
@@ -861,6 +1116,8 @@ public:
              size, io_resource_token.load());
     ompfile::OmpFileIOHint internal_hint{};
     applyIoHint(internal_hint, hint);
+    if (async_engine.active())
+      async_engine.drain();
     IOResourceGuard guard(io_resource_token);
     const int rc = io_scheduler->readAtHint(file_handle, offset, data, size,
                                             hint ? &internal_hint : nullptr);
@@ -890,12 +1147,18 @@ OmpFileClientContext *OmpFileClientContext::instance = nullptr;
 
 extern "C" {
 
-inline int acquire_async_not_supported(int async) {
-  if (async) {
-    io_log("Error: Asynchronous IO not supported yet\n");
-    return -1;
-  }
-  return 0;
+// Reads cannot be fire-and-forget through the fixed C ABI (there is no
+// completion handle to return the buffer through later), so an async-requested
+// read is served synchronously. The read paths already drain any in-flight
+// async writes first, so the data is coherent. Log the downgrade once.
+static void note_async_read_synchronous(int async) {
+  if (!async)
+    return;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    io_log("Async read requested; served synchronously (no async-read "
+           "completion handle in the ABI).\n");
+  });
 }
 
 int omp_file_open(const char *filename) {
@@ -908,29 +1171,29 @@ int omp_file_open(const char *filename) {
 }
 
 int omp_file_write(int file_handle, const void *data, size_t size, int async) {
-  if (acquire_async_not_supported(async)) return -1;
   auto &ctx = OmpFileClientContext::getInstance();
-  return ctx.writeFile(file_handle, data, size);
+  return ctx.submitWrite(file_handle, /*offset=*/0, /*has_offset=*/false, data,
+                         size, /*hint=*/nullptr, async != 0);
 }
 
 int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size,
                     int async) {
-  if (acquire_async_not_supported(async)) return -1;
   auto &ctx = OmpFileClientContext::getInstance();
-  return ctx.writeFileAt(file_handle, data, size, offset);
+  return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
+                         /*hint=*/nullptr, async != 0);
 }
 
 int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
                          size_t size, int async,
                          const omp_file_io_hint_v1 *hint) {
-  if (acquire_async_not_supported(async)) return -1;
   auto &ctx = OmpFileClientContext::getInstance();
-  return ctx.writeFileAtHint(file_handle, data, size, offset, hint);
+  return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
+                         hint, async != 0);
 }
 
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,
                    int async) {
-  if (acquire_async_not_supported(async)) return -1;
+  note_async_read_synchronous(async);
   io_trace("omp_file_pread api enter file_handle=%d offset=%ld size=%zu\n",
            file_handle, offset, size);
   auto &ctx = OmpFileClientContext::getInstance();
@@ -941,13 +1204,13 @@ int omp_file_pread(int file_handle, long offset, void *data, size_t size,
 
 int omp_file_pread_hint(int file_handle, long offset, void *data, size_t size,
                         int async, const omp_file_io_hint_v1 *hint) {
-  if (acquire_async_not_supported(async)) return -1;
+  note_async_read_synchronous(async);
   auto &ctx = OmpFileClientContext::getInstance();
   return ctx.readFileAtHint(file_handle, data, size, offset, hint);
 }
 
 int omp_file_read(int file_handle, void *data, size_t size, int async) {
-  if (acquire_async_not_supported(async)) return -1;
+  note_async_read_synchronous(async);
   auto &ctx = OmpFileClientContext::getInstance();
   return ctx.readFile(file_handle, data, size);
 }

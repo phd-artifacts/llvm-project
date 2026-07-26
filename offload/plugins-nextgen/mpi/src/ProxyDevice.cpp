@@ -653,6 +653,12 @@ struct ProxyDevice {
   struct OmpFileHandleEntry {
     int Rank = -1;
     int RemoteHandle = -1;
+    // Source path + open flags, retained so the issuing proxy can take the
+    // local disjoint-write bypass (LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE): write
+    // known-disjoint ranges straight to the shared PFS from this node instead
+    // of forwarding every byte to the file's single aggregator/owner rank.
+    std::string Path;
+    int Flags = 0;
   };
 
   struct OmpFileTrackedFdEntry {
@@ -801,6 +807,8 @@ struct ProxyDevice {
         OmpFileOpenEioBackoffUs("OMPTARGET_OMPFILE_OPEN_EIO_BACKOFF_US",
                                  200000),
         OmpFileMPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6),
+        OmpFileLocalDisjointWrite(envBoolOrDefault(
+            "LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE", false)),
         OmpFileHeadnodeScheduler(
             envStringOrDefault("LIBOMPFILE_SCHEDULER", "LOCAL") ==
             "HEADNODE"),
@@ -962,6 +970,7 @@ struct ProxyDevice {
   ~ProxyDevice() {
     drainOmpFileOpenCache();
     drainOmpFileStageCache();
+    closeLocalWriteFds();
     reportOmpFileStats("proxy-dtor");
     {
       const std::lock_guard<std::mutex> Lock(ActiveProxyDeviceMutex);
@@ -3800,6 +3809,25 @@ struct ProxyDevice {
       return -1;
     }
 
+    // Fresh write-open create semantics. A writable open of a not-yet-existing
+    // file must create it, exactly as native POSIX/MPI-IO checkpoint writers do
+    // (open(O_CREAT|O_WRONLY, ...)). Without O_CREAT the proxy open returns
+    // ENOENT, which ompfileOpen's transient-retry loop treats as retryable and
+    // backs off on synchronously (std::this_thread::sleep_for) — monopolizing
+    // the rank's single data-event handler for up to MaxEioRetries. A wave of
+    // concurrent fresh opens (the file-per-rank checkpoint pattern) then starves
+    // cross-rank OmpFile servicing until the case timeout: the "concurrent
+    // fresh-open deadlock". Adding O_CREAT for writable opens removes the ENOENT
+    // entirely, which is both the O_CREAT retry-storm fix and the deadlock fix,
+    // and lets the driver drop its sequential pre-open workaround. Read-only
+    // opens keep ENOENT (with the transient retry that legitimately rides out
+    // NFS metadata propagation for files another rank is still creating).
+    if ((Flags & O_ACCMODE) != O_RDONLY && !(Flags & O_CREAT)) {
+      Flags |= O_CREAT;
+      if (Mode == 0)
+        Mode = 0666;
+    }
+
     if (!canUseOmpFileOpenCache(Flags)) {
       OmpFileStatsOpenSyscalls.fetch_add(1, std::memory_order_relaxed);
       int Fd = ::open(Path, Flags, static_cast<mode_t>(Mode));
@@ -4110,6 +4138,12 @@ struct ProxyDevice {
         OmpFileStatsDirtyOwnerForwardBytes.load(std::memory_order_relaxed);
     uint64_t DirtyOwnerForwardFailures =
         OmpFileStatsDirtyOwnerForwardFailures.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointWrites =
+        OmpFileStatsLocalDisjointWrites.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointBytes =
+        OmpFileStatsLocalDisjointBytes.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointFallbacks =
+        OmpFileStatsLocalDisjointFallbacks.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
 
     {
@@ -4156,7 +4190,8 @@ struct ProxyDevice {
             "coherent_read_refresh_failures=%llu "
             "coherent_read_refresh_us_total=%llu "
             "staging_evictions=%llu "
-            "stage_freshness_guard_bypasses=%llu dirty_owner_forward_reads=%llu dirty_owner_forward_bytes=%llu dirty_owner_forward_failures=%llu\n",
+            "stage_freshness_guard_bypasses=%llu dirty_owner_forward_reads=%llu dirty_owner_forward_bytes=%llu dirty_owner_forward_failures=%llu "
+            "local_disjoint_writes=%llu local_disjoint_bytes=%llu local_disjoint_fallbacks=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
             static_cast<unsigned long long>(OpenSys),
@@ -4232,7 +4267,10 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StageFreshnessGuardBypasses),
             static_cast<unsigned long long>(DirtyOwnerForwardReads),
             static_cast<unsigned long long>(DirtyOwnerForwardBytes),
-            static_cast<unsigned long long>(DirtyOwnerForwardFailures));
+            static_cast<unsigned long long>(DirtyOwnerForwardFailures),
+            static_cast<unsigned long long>(LocalDisjointWrites),
+            static_cast<unsigned long long>(LocalDisjointBytes),
+            static_cast<unsigned long long>(LocalDisjointFallbacks));
 
     fprintf(stderr,
             "MPIProxyDevice --> OMPFile writeback stats [%s] rank=%d "
@@ -5056,11 +5094,18 @@ struct ProxyDevice {
     return true;
   }
 
-  int registerRemoteHandle(int Rank, int RemoteHandle) {
+  int registerRemoteHandle(int Rank, int RemoteHandle, const char *Path = nullptr,
+                           int Flags = 0) {
     const int LocalHandle =
         NextOmpFileHandle.fetch_add(1, std::memory_order_relaxed);
     const std::lock_guard<std::mutex> Lock(OmpFileHandleMutex);
-    OmpFileHandles[LocalHandle] = {Rank, RemoteHandle};
+    OmpFileHandleEntry Entry{};
+    Entry.Rank = Rank;
+    Entry.RemoteHandle = RemoteHandle;
+    if (Path)
+      Entry.Path = Path;
+    Entry.Flags = Flags;
+    OmpFileHandles[LocalHandle] = std::move(Entry);
     traceOmpFile("registerRemoteHandle local=%d rank=%d remote=%d map_size=%zu\n",
                  LocalHandle, Rank, RemoteHandle, OmpFileHandles.size());
     return LocalHandle;
@@ -5592,7 +5637,7 @@ struct ProxyDevice {
     if (!openOnRank(Rank, Path, Flags, Mode, RemoteHandle))
       return OFFLOAD_FAIL;
 
-    *Handle = registerRemoteHandle(Rank, RemoteHandle);
+    *Handle = registerRemoteHandle(Rank, RemoteHandle, Path, Flags);
     traceOmpFile("mppOpen exit local=%d rank=%d remote=%d\n", *Handle, Rank,
                  RemoteHandle);
     return OFFLOAD_SUCCESS;
@@ -5613,7 +5658,7 @@ struct ProxyDevice {
     if (!openOnRank(Rank, Path, Flags, Mode, RemoteHandle))
       return OFFLOAD_FAIL;
 
-    *Handle = registerRemoteHandle(Rank, RemoteHandle);
+    *Handle = registerRemoteHandle(Rank, RemoteHandle, Path, Flags);
     traceOmpFile("mppOpenOnRank exit local=%d rank=%d remote=%d\n", *Handle,
                  Rank, RemoteHandle);
     return OFFLOAD_SUCCESS;
@@ -5624,6 +5669,11 @@ struct ProxyDevice {
     OmpFileHandleEntry Entry{};
     if (!eraseRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
+    // Owner-bypass durability: if any writes for this file were serviced
+    // locally, flush the local write fds at the logical close (covers the
+    // "close" fsync policy, which defers per-write fdatasync).
+    if (OmpFileLocalDisjointWrite && (Entry.Flags & O_ACCMODE) != O_RDONLY)
+      syncLocalWriteFds();
     if (!closeOnRank(Entry.Rank, Entry.RemoteHandle))
       return OFFLOAD_FAIL;
     traceOmpFile("mppClose exit local=%d rank=%d remote=%d\n", Handle,
@@ -5869,6 +5919,78 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
+  // Owner-bypass: get (or lazily open) a process-local O_WRONLY fd to a shared
+  // file path, so the issuing proxy can pwrite disjoint ranges to the parallel
+  // FS directly instead of forwarding to the file's aggregator rank. Returns
+  // -1 on failure (caller then falls back to the forward path).
+  int getLocalWriteFd(const std::string &Path) {
+    if (Path.empty())
+      return -1;
+    const std::lock_guard<std::mutex> Lock(OmpFileLocalWriteFdMutex);
+    auto It = OmpFileLocalWriteFds.find(Path);
+    if (It != OmpFileLocalWriteFds.end())
+      return It->second;
+    const int Fd = ::open(Path.c_str(), O_WRONLY);
+    if (Fd >= 0)
+      OmpFileLocalWriteFds[Path] = Fd;
+    return Fd;
+  }
+
+  // fdatasync every local write fd (durability at logical close for the
+  // "close" fsync policy) without closing — fds are reused across the run and
+  // reaped in shutdown.
+  void syncLocalWriteFds() {
+    const std::lock_guard<std::mutex> Lock(OmpFileLocalWriteFdMutex);
+    for (auto &KV : OmpFileLocalWriteFds)
+      if (KV.second >= 0)
+        ::fdatasync(KV.second);
+  }
+
+  void closeLocalWriteFds() {
+    const std::lock_guard<std::mutex> Lock(OmpFileLocalWriteFdMutex);
+    for (auto &KV : OmpFileLocalWriteFds)
+      if (KV.second >= 0) {
+        ::fdatasync(KV.second);
+        ::close(KV.second);
+      }
+    OmpFileLocalWriteFds.clear();
+  }
+
+  // Attempt the owner-bypass for one pwrite. Returns true if the write was
+  // fully serviced locally; false means the caller should use the forward path.
+  bool tryLocalDisjointPwrite(const OmpFileHandleEntry &Entry, int64_t Offset,
+                              const void *Buffer, uint64_t Size,
+                              uint64_t *BytesWritten) {
+    if (!OmpFileLocalDisjointWrite || Entry.Path.empty())
+      return false;
+    if ((Entry.Flags & O_ACCMODE) == O_RDONLY)
+      return false;
+    const int Fd = getLocalWriteFd(Entry.Path);
+    if (Fd < 0) {
+      OmpFileStatsLocalDisjointFallbacks.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    uint64_t Written = 0, ElapsedUs = 0;
+    int WriteErrno = 0;
+    if (!pwriteFully(Fd, Offset, Buffer, Size, &Written, &ElapsedUs,
+                     WriteErrno)) {
+      errno = WriteErrno;
+      OmpFileStatsLocalDisjointFallbacks.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    if (writethroughFsyncEachEnabled())
+      ::fdatasync(Fd);
+    if (BytesWritten)
+      *BytesWritten = Written;
+    OmpFileStatsLocalDisjointWrites.fetch_add(1, std::memory_order_relaxed);
+    OmpFileStatsLocalDisjointBytes.fetch_add(Size, std::memory_order_relaxed);
+    traceOmpFile("localDisjointPwrite offset=%lld size=%llu bytes=%llu\n",
+                 static_cast<long long>(Offset),
+                 static_cast<unsigned long long>(Size),
+                 static_cast<unsigned long long>(Written));
+    return true;
+  }
+
   int mppPwriteEx(int Handle, int64_t Offset, const void *Buffer, uint64_t Size,
                   uint64_t *BytesWritten) {
     if (!BytesWritten)
@@ -5877,6 +5999,8 @@ struct ProxyDevice {
     OmpFileHandleEntry Entry{};
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
+    if (tryLocalDisjointPwrite(Entry, Offset, Buffer, Size, BytesWritten))
+      return OFFLOAD_SUCCESS;
     if (!pwriteOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
                       BytesWritten)) {
       traceOmpFile("mppPwriteEx fail local=%d rank=%d remote=%d offset=%lld "
@@ -6607,6 +6731,17 @@ private:
   BoolEnvar OmpFileOptStats;
   BoolEnvar OmpFileForceBlockingPwrite;
   Int64Envar OmpFileMPIFragmentSize;
+  // Owner-bypass: when set, an issuing proxy writes known-disjoint ranges of a
+  // shared file directly to the local PFS mount instead of forwarding every
+  // pwrite to the file's single aggregator/owner rank. The runtime exposes the
+  // byte ranges; the app asserts disjointness by enabling this. Safe on a
+  // parallel FS (POSIX permits concurrent disjoint pwrite); do not use on NFS.
+  bool OmpFileLocalDisjointWrite = false;
+  std::mutex OmpFileLocalWriteFdMutex;
+  std::unordered_map<std::string, int> OmpFileLocalWriteFds; // path -> O_WRONLY fd
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointWrites{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointBytes{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointFallbacks{0};
   bool OmpFileHeadnodeScheduler = false;
   std::string OmpFileStageMode;
   std::string OmpFileStageWriteMode;
