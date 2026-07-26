@@ -801,6 +801,7 @@ struct ProxyDevice {
         OmpFileOpenCacheEnable("LIBOMPFILE_OPT_OPEN_CACHE", false),
         OmpFileOpenCacheKeepOpen("LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN", true),
         OmpFileOptStats("LIBOMPFILE_OPT_STATS", false),
+        OmpFileOpenCreateOnWrite("LIBOMPFILE_OPEN_CREATE_ON_WRITE", true),
         OmpFileForceBlockingPwrite("LIBOMPFILE_MPP_FORCE_BLOCKING_PWRITE",
                                    false),
         OmpFileOpenEioRetries("OMPTARGET_OMPFILE_OPEN_EIO_RETRIES", 16),
@@ -3822,7 +3823,8 @@ struct ProxyDevice {
     // and lets the driver drop its sequential pre-open workaround. Read-only
     // opens keep ENOENT (with the transient retry that legitimately rides out
     // NFS metadata propagation for files another rank is still creating).
-    if ((Flags & O_ACCMODE) != O_RDONLY && !(Flags & O_CREAT)) {
+    if (OmpFileOpenCreateOnWrite && (Flags & O_ACCMODE) != O_RDONLY &&
+        !(Flags & O_CREAT)) {
       Flags |= O_CREAT;
       if (Mode == 0)
         Mode = 0666;
@@ -6729,6 +6731,12 @@ private:
   BoolEnvar OmpFileOpenCacheEnable;
   BoolEnvar OmpFileOpenCacheKeepOpen;
   BoolEnvar OmpFileOptStats;
+  // Create-on-write open semantics (default on): writable proxy opens add
+  // O_CREAT so a fresh checkpoint write creates its file, removing the ENOENT
+  // retry storm that deadlocked concurrent fresh opens. Set
+  // LIBOMPFILE_OPEN_CREATE_ON_WRITE=0 to restore the pre-fix behavior (e.g. for
+  // an A/B or if a workload needs a writable open to fail on a missing file).
+  BoolEnvar OmpFileOpenCreateOnWrite;
   BoolEnvar OmpFileForceBlockingPwrite;
   Int64Envar OmpFileMPIFragmentSize;
   // Owner-bypass: when set, an issuing proxy writes known-disjoint ranges of a
