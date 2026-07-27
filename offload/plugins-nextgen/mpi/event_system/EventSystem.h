@@ -958,11 +958,20 @@ private:
   int createNewEventTag();
 
   /// Maps a logical event id to the physical MPI tag used on its event
-  /// communicator.
-  int getEventMPITag(int EventId) const;
+  /// communicator. The ORIGIN rank is folded into the mapping because every
+  /// process draws event ids from its own local counter: two processes running
+  /// similar event sequences otherwise derive identical tags, and concurrent
+  /// events between the same rank pair in opposite roles (i->j and j->i) then
+  /// share a (source, tag, comm) stream, letting MPI match a large payload
+  /// frame into a small header Irecv ("Message truncated", see the two-phase
+  /// concurrent-read flake). Origin = the event creator's rank: the creator
+  /// passes its own LocalRank; the destination passes the notification's
+  /// MPI_SOURCE, so both sides agree.
+  int getEventMPITag(int EventId, int OriginRank) const;
 
-  /// Gets a comm for a new event from the comm pool.
-  MPI_Comm &getNewEventComm(int EventId);
+  /// Gets a comm for a new event from the comm pool. Must use the same
+  /// (EventId, OriginRank) mapping as getEventMPITag.
+  MPI_Comm &getNewEventComm(int EventId, int OriginRank);
 
   /// Creates a local MPI context containing a exclusive comm for the gate
   /// thread, and a comm pool to be used internally by the events. It also
@@ -1031,8 +1040,8 @@ EventTy EventSystemTy::NotificationEvent(EventFuncTy EventFunc, EventTypeTy Even
                                    int DstDeviceID, ArgsTy... Args) {
   // Create event MPI request manager.
   const int EventTag = createNewEventTag();
-  auto &EventComm = getNewEventComm(EventTag);
-  const int MPITag = getEventMPITag(EventTag);
+  auto &EventComm = getNewEventComm(EventTag, LocalRank);
+  const int MPITag = getEventMPITag(EventTag, LocalRank);
 
   int32_t RemoteRank = DstDeviceID, RemoteDeviceId = -1;
 

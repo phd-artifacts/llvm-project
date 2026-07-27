@@ -875,6 +875,14 @@ EventTy ompfilePread(MPIRequestManagerTy RequestManager, int RemoteHandle,
   if (auto Error = co_await RequestManager; Error)
     co_return Error;
 
+  // Fail closed if the announced payload exceeds the caller's buffer (mirrors
+  // the dirty-owner pread guard): posting a recv larger than Buffer turns a
+  // corrupted/aliased size into memory corruption or an MPI truncation abort.
+  if (*Bytes > Size)
+    co_return createError("Pread reply payload too large: %llu > %llu",
+                          static_cast<unsigned long long>(*Bytes),
+                          static_cast<unsigned long long>(Size));
+
   if (*Bytes > 0) {
     RequestManager.receiveInBatchs(Buffer, *Bytes);
     if (auto Error = co_await RequestManager; Error)
@@ -974,6 +982,7 @@ EventTy ompfileDirtyOwnerPreadBatch(
   if (auto Error = co_await RequestManager; Error)
     co_return Error;
 
+  std::vector<bool> SeenSegment(SegmentCount, false);
   for (uint64_t I = 0; I < SegmentCount; ++I) {
     const auto &Reply = Replies[I];
     if (Reply.ClientSegmentId >= SegmentCount)
@@ -981,6 +990,11 @@ EventTy ompfileDirtyOwnerPreadBatch(
                             static_cast<unsigned long long>(
                                 Reply.ClientSegmentId),
                             static_cast<unsigned long long>(SegmentCount));
+    if (SeenSegment[Reply.ClientSegmentId])
+      co_return createError("Duplicate dirty-owner batch segment id: %llu",
+                            static_cast<unsigned long long>(
+                                Reply.ClientSegmentId));
+    SeenSegment[Reply.ClientSegmentId] = true;
     const auto &Segment = Segments[Reply.ClientSegmentId];
     if (Reply.Offset != static_cast<uint64_t>(Segment.Offset) ||
         Reply.ExpectedVersion != Segment.ExpectedVersion ||
@@ -1003,10 +1017,16 @@ EventTy ompfileDirtyOwnerPreadBatch(
     Bytes[Reply.ClientSegmentId] = Reply.Bytes;
   }
 
+  // Payloads share TagOffset 3 and are matched purely by send/receive order,
+  // so consume them in the proxy's REPLY order (which is how it sends them),
+  // not in ascending client segment order — the two differ whenever the proxy
+  // reorders segments, and a mismatch desyncs sizes vs buffers on the shared
+  // tag stream (MPI truncation or silent corruption).
   for (uint64_t I = 0; I < SegmentCount; ++I) {
-    if (Bytes[I] == 0)
+    const uint64_t SegId = Replies[I].ClientSegmentId;
+    if (Bytes[SegId] == 0)
       continue;
-    RequestManager.receiveInBatchsTagged(Buffers[I], Bytes[I],
+    RequestManager.receiveInBatchsTagged(Buffers[SegId], Bytes[SegId],
                                          /*TagOffset=*/3);
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
@@ -1523,8 +1543,8 @@ EventTy EventSystemTy::createExchangeEvent(int SrcDevice, const void *SrcBuffer,
                                            int64_t Size,
                                            __tgt_async_info *AsyncInfo) {
   const int EventTag = createNewEventTag();
-  auto &EventComm = getNewEventComm(EventTag);
-  const int MPITag = getEventMPITag(EventTag);
+  auto &EventComm = getNewEventComm(EventTag, LocalRank);
+  const int MPITag = getEventMPITag(EventTag, LocalRank);
 
   int32_t SrcRank, SrcDeviceId, DstRank, DstDeviceId;
 
@@ -1570,7 +1590,20 @@ int EventSystemTy::createNewEventTag() {
   return EventCounter.fetch_add(1);
 }
 
-int EventSystemTy::getEventMPITag(int EventId) const {
+// Disambiguate events created by different processes: every process draws
+// event ids from its own local counter, so the raw id sequences coincide.
+// Interleaving the origin rank spreads each origin onto a disjoint logical id
+// sequence, which keeps concurrent i->j and j->i events on different MPI tags.
+static uint64_t logicalEventId(int EventId, int OriginRank, int WorldSize) {
+  const uint64_t Span =
+      WorldSize > 0 ? static_cast<uint64_t>(WorldSize) : uint64_t{1};
+  const uint64_t Origin =
+      OriginRank >= 0 ? static_cast<uint64_t>(OriginRank) % Span : uint64_t{0};
+  return static_cast<uint64_t>(static_cast<unsigned int>(EventId)) * Span +
+         Origin;
+}
+
+int EventSystemTy::getEventMPITag(int EventId, int OriginRank) const {
   constexpr int EventTagStride = 8;
   const int FirstEventTag = static_cast<int>(ControlTagsTy::FIRST_EVENT);
   if (MPITagMaxValue < FirstEventTag + EventTagStride) {
@@ -1582,13 +1615,12 @@ int EventSystemTy::getEventMPITag(int EventId) const {
   const int TagSpan = MPITagMaxValue - FirstEventTag + 1;
   const int BaseSpan = std::max(1, TagSpan - EventTagStride + 1);
   const int Offset = static_cast<int>(
-      (static_cast<uint64_t>(static_cast<unsigned int>(EventId)) *
-       EventTagStride) %
+      (logicalEventId(EventId, OriginRank, WorldSize) * EventTagStride) %
       static_cast<uint64_t>(BaseSpan));
   return FirstEventTag + Offset;
 }
 
-MPI_Comm &EventSystemTy::getNewEventComm(int EventId) {
+MPI_Comm &EventSystemTy::getNewEventComm(int EventId, int OriginRank) {
   if (EventCommPool.empty()) {
     REPORT("Event communicator pool is empty; falling back to GateThreadComm.\n");
     assert(GateThreadComm != MPI_COMM_NULL &&
@@ -1603,8 +1635,7 @@ MPI_Comm &EventSystemTy::getNewEventComm(int EventId) {
                           : 1;
   const int BaseSpan = std::max(1, TagSpan - EventTagStride + 1);
   const uint64_t LogicalTagOffset =
-      static_cast<uint64_t>(static_cast<unsigned int>(EventId)) *
-      EventTagStride;
+      logicalEventId(EventId, OriginRank, WorldSize) * EventTagStride;
   const size_t CommIndex =
       (LogicalTagOffset / static_cast<uint64_t>(BaseSpan)) %
       EventCommPool.size();

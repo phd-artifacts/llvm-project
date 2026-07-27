@@ -4983,8 +4983,8 @@ struct ProxyDevice {
     }
 
     const int EventTag = EventSystem.createNewEventTag();
-    auto &EventComm = EventSystem.getNewEventComm(EventTag);
-    const int MPITag = EventSystem.getEventMPITag(EventTag);
+    auto &EventComm = EventSystem.getNewEventComm(EventTag, EventSystem.LocalRank);
+    const int MPITag = EventSystem.getEventMPITag(EventTag, EventSystem.LocalRank);
     int EventNotificationInfo[] = {static_cast<int>(EventType), EventTag,
                                    TargetDeviceId};
     MPI_Request NotificationRequest = MPI_REQUEST_NULL;
@@ -6553,10 +6553,12 @@ struct ProxyDevice {
         return MPI_Mrecv(EventInfo, 3, MPI_INT, &EventReqMsg, &EventStatus);
       });
       const auto NewEventType = static_cast<EventTypeTy>(EventInfo[0]);
+      // Origin = the creator of the event = the notification's source rank;
+      // must match the (EventId, OriginRank) mapping the origin side used.
       MPIRequestManagerTy RequestManager(
-          EventSystem.getNewEventComm(EventInfo[1]),
-          EventSystem.getEventMPITag(EventInfo[1]), EventStatus.MPI_SOURCE,
-          EventInfo[2]);
+          EventSystem.getNewEventComm(EventInfo[1], EventStatus.MPI_SOURCE),
+          EventSystem.getEventMPITag(EventInfo[1], EventStatus.MPI_SOURCE),
+          EventStatus.MPI_SOURCE, EventInfo[2]);
 
       // Creates a new receive event of 'event_type' type.
       using enum EventTypeTy;
