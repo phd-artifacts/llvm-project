@@ -810,6 +810,8 @@ struct ProxyDevice {
         OmpFileMPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6),
         OmpFileLocalDisjointWrite(envBoolOrDefault(
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE", false)),
+        OmpFileLocalDisjointRead(envBoolOrDefault(
+            "LIBOMPFILE_OPT_LOCAL_DISJOINT_READ", false)),
         OmpFileHeadnodeScheduler(
             envStringOrDefault("LIBOMPFILE_SCHEDULER", "LOCAL") ==
             "HEADNODE"),
@@ -972,6 +974,7 @@ struct ProxyDevice {
     drainOmpFileOpenCache();
     drainOmpFileStageCache();
     closeLocalWriteFds();
+    closeLocalReadFds();
     reportOmpFileStats("proxy-dtor");
     {
       const std::lock_guard<std::mutex> Lock(ActiveProxyDeviceMutex);
@@ -4146,6 +4149,12 @@ struct ProxyDevice {
         OmpFileStatsLocalDisjointBytes.load(std::memory_order_relaxed);
     uint64_t LocalDisjointFallbacks =
         OmpFileStatsLocalDisjointFallbacks.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointReads =
+        OmpFileStatsLocalDisjointReads.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointReadBytes =
+        OmpFileStatsLocalDisjointReadBytes.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointReadFallbacks =
+        OmpFileStatsLocalDisjointReadFallbacks.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
 
     {
@@ -4193,7 +4202,8 @@ struct ProxyDevice {
             "coherent_read_refresh_us_total=%llu "
             "staging_evictions=%llu "
             "stage_freshness_guard_bypasses=%llu dirty_owner_forward_reads=%llu dirty_owner_forward_bytes=%llu dirty_owner_forward_failures=%llu "
-            "local_disjoint_writes=%llu local_disjoint_bytes=%llu local_disjoint_fallbacks=%llu\n",
+            "local_disjoint_writes=%llu local_disjoint_bytes=%llu local_disjoint_fallbacks=%llu "
+            "local_disjoint_reads=%llu local_disjoint_read_bytes=%llu local_disjoint_read_fallbacks=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
             static_cast<unsigned long long>(OpenSys),
@@ -4272,7 +4282,10 @@ struct ProxyDevice {
             static_cast<unsigned long long>(DirtyOwnerForwardFailures),
             static_cast<unsigned long long>(LocalDisjointWrites),
             static_cast<unsigned long long>(LocalDisjointBytes),
-            static_cast<unsigned long long>(LocalDisjointFallbacks));
+            static_cast<unsigned long long>(LocalDisjointFallbacks),
+            static_cast<unsigned long long>(LocalDisjointReads),
+            static_cast<unsigned long long>(LocalDisjointReadBytes),
+            static_cast<unsigned long long>(LocalDisjointReadFallbacks));
 
     fprintf(stderr,
             "MPIProxyDevice --> OMPFile writeback stats [%s] rank=%d "
@@ -5702,6 +5715,11 @@ struct ProxyDevice {
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
     uint64_t BytesRead = 0;
+    if (tryLocalDisjointPread(Entry, Offset, Buffer, Size, &BytesRead)) {
+      traceOmpFile("mppPread exit local=%d (disjoint-read bypass) bytes=%llu\n",
+                   Handle, static_cast<unsigned long long>(BytesRead));
+      return OFFLOAD_SUCCESS;
+    }
     if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
                      &BytesRead)) {
       return OFFLOAD_FAIL;
@@ -5720,6 +5738,8 @@ struct ProxyDevice {
     OmpFileHandleEntry Entry{};
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
+    if (tryLocalDisjointPread(Entry, Offset, Buffer, Size, BytesRead))
+      return OFFLOAD_SUCCESS;
     if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
                       BytesRead))
       return OFFLOAD_FAIL;
@@ -5734,6 +5754,8 @@ struct ProxyDevice {
     OmpFileHandleEntry Entry{};
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
+    if (tryLocalDisjointPread(Entry, Offset, Buffer, Size, BytesRead))
+      return OFFLOAD_SUCCESS;
     if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
                      BytesRead, /*AllowStage=*/false))
       return OFFLOAD_FAIL;
@@ -5936,6 +5958,73 @@ struct ProxyDevice {
     if (Fd >= 0)
       OmpFileLocalWriteFds[Path] = Fd;
     return Fd;
+  }
+
+  // Owner-bypass read counterpart: get (or lazily open) a process-local
+  // O_RDONLY fd so the issuing proxy can pread directly from the parallel FS
+  // instead of funneling through the file's aggregator rank. Same app
+  // contract as the write bypass (LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE):
+  // accesses are disjoint and the data being read is visible in the PFS
+  // (flushed / written-through). -1 on failure -> caller uses forward path.
+  int getLocalReadFd(const std::string &Path) {
+    if (Path.empty())
+      return -1;
+    const std::lock_guard<std::mutex> Lock(OmpFileLocalReadFdMutex);
+    auto It = OmpFileLocalReadFds.find(Path);
+    if (It != OmpFileLocalReadFds.end())
+      return It->second;
+    const int Fd = ::open(Path.c_str(), O_RDONLY);
+    if (Fd >= 0)
+      OmpFileLocalReadFds[Path] = Fd;
+    return Fd;
+  }
+
+  void closeLocalReadFds() {
+    const std::lock_guard<std::mutex> Lock(OmpFileLocalReadFdMutex);
+    for (auto &KV : OmpFileLocalReadFds)
+      if (KV.second >= 0)
+        ::close(KV.second);
+    OmpFileLocalReadFds.clear();
+  }
+
+  // Attempt the owner-bypass for one pread. Returns true only if the full
+  // requested range was read locally; any failure or short read falls back to
+  // the forward path (the owner's authoritative handle), fail-closed.
+  bool tryLocalDisjointPread(const OmpFileHandleEntry &Entry, int64_t Offset,
+                             void *Buffer, uint64_t Size,
+                             uint64_t *BytesRead) {
+    if (!OmpFileLocalDisjointRead || Entry.Path.empty())
+      return false;
+    const int Fd = getLocalReadFd(Entry.Path);
+    if (Fd < 0) {
+      OmpFileStatsLocalDisjointReadFallbacks.fetch_add(
+          1, std::memory_order_relaxed);
+      return false;
+    }
+    uint64_t TotalRead = 0;
+    while (TotalRead < Size) {
+      const ssize_t Bytes =
+          ::pread(Fd, static_cast<char *>(Buffer) + TotalRead,
+                  static_cast<size_t>(Size - TotalRead),
+                  static_cast<off_t>(Offset + static_cast<int64_t>(TotalRead)));
+      if (Bytes <= 0) {
+        // Error or EOF-short: the owner's handle is authoritative (it sees
+        // in-flight forwarded writes and the true size) — fall back.
+        OmpFileStatsLocalDisjointReadFallbacks.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+      }
+      TotalRead += static_cast<uint64_t>(Bytes);
+    }
+    if (BytesRead)
+      *BytesRead = TotalRead;
+    OmpFileStatsLocalDisjointReads.fetch_add(1, std::memory_order_relaxed);
+    OmpFileStatsLocalDisjointReadBytes.fetch_add(Size,
+                                                 std::memory_order_relaxed);
+    traceOmpFile("localDisjointPread offset=%lld size=%llu\n",
+                 static_cast<long long>(Offset),
+                 static_cast<unsigned long long>(Size));
+    return true;
   }
 
   // fdatasync every local write fd (durability at logical close for the
@@ -6752,6 +6841,16 @@ private:
   std::atomic<uint64_t> OmpFileStatsLocalDisjointWrites{0};
   std::atomic<uint64_t> OmpFileStatsLocalDisjointBytes{0};
   std::atomic<uint64_t> OmpFileStatsLocalDisjointFallbacks{0};
+  // Read counterpart (LIBOMPFILE_OPT_LOCAL_DISJOINT_READ): serve preads from a
+  // process-local O_RDONLY fd instead of the owner funnel. Same app contract
+  // (disjoint accesses, data visible in the PFS); fail-closed to the forward
+  // path on open failure, error, or short read.
+  bool OmpFileLocalDisjointRead = false;
+  std::mutex OmpFileLocalReadFdMutex;
+  std::unordered_map<std::string, int> OmpFileLocalReadFds; // path -> O_RDONLY fd
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointReads{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointReadBytes{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointReadFallbacks{0};
   bool OmpFileHeadnodeScheduler = false;
   std::string OmpFileStageMode;
   std::string OmpFileStageWriteMode;
