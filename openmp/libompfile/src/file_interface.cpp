@@ -149,6 +149,23 @@ private:
   IOBackend &backend;
 };
 
+// Express lane for the owner-bypass contract: when the app asserts disjoint
+// accesses (LIBOMPFILE_OPT_LOCAL_DISJOINT_*), the headnode's per-op
+// scheduling round trip (scheduleWrite / read planning, one MPI event each,
+// serialized on sched_request_mutex) only computes owner/aggregator routing
+// that the bypass then ignores — a pure ~2 ms fixed tax per op (AMD job
+// 359359). With express on, per-op writeAt/readAt skip scheduling and go
+// straight to the backend; open/close scheduling stays (handles and owner
+// state still need it), and the proxy-side bypass keeps its fail-closed
+// owner-forward fallback.
+static bool localDisjointExpressEnabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("LIBOMPFILE_OPT_LOCAL_DISJOINT_EXPRESS");
+    return env && env[0] == '1' && env[1] == '\0';
+  }();
+  return enabled;
+}
+
 class HeadnodeScheduler final : public IOScheduler {
 public:
   explicit HeadnodeScheduler(IOBackend &backend)
@@ -239,6 +256,8 @@ public:
         return -1;
       return backend.readAt(file_handle, offset, data, size);
     }
+    if (localDisjointExpressEnabled())
+      return backend.readAt(file_handle, offset, data, size);
     ompfile::OmpFileReadRequestContext context{};
     if (!buildReadContext(file_handle, offset, size, nullptr, context))
       return failStrict("readAt");
@@ -260,7 +279,8 @@ public:
         return -1;
       return backend.writeAt(file_handle, offset, data, size);
     }
-    if (!scheduleWrite(file_handle, offset, size, nullptr))
+    if (!localDisjointExpressEnabled() &&
+        !scheduleWrite(file_handle, offset, size, nullptr))
       return failStrict("writeAt");
     return backend.writeAt(file_handle, offset, data, size);
   }
@@ -275,7 +295,8 @@ public:
         return -1;
       return backend.writeAtWithContext(context, data, size);
     }
-    if (mpp_sched_active && !scheduleWrite(file_handle, offset, size, hint))
+    if (mpp_sched_active && !localDisjointExpressEnabled() &&
+        !scheduleWrite(file_handle, offset, size, hint))
       return failStrict("writeAtHint");
     return backend.writeAtWithContext(context, data, size);
   }
@@ -521,7 +542,7 @@ private:
                  0,
              static_cast<unsigned long long>(context.PathKey));
 
-    if (two_phase_batch_preferred) {
+    if (two_phase_batch_preferred || localDisjointExpressEnabled()) {
       io_trace("HeadnodeScheduler::buildReadContext skip-scalar req_id=%llu "
                "file=%d offset=%lld size=%llu\n",
                static_cast<unsigned long long>(context.RequestId), file_handle,
