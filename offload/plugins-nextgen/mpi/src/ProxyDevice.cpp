@@ -6103,8 +6103,11 @@ struct ProxyDevice {
     // so small sequential preads are served from a per-path window filled
     // cap-bytes at a time. Same disjointness contract as the bypass; the
     // window is invalidated on local bypass writes and at close.
+    // Strict '<': an op exactly at cap gains nothing from the window (the
+    // fill IS the op) and would pay an extra full-size memcpy — measured 12%
+    // read loss at 16 MiB transfers with a 16 MiB cap (job 359377).
     if (OmpFileLocalDisjointReadahead != 0 &&
-        Size <= OmpFileLocalDisjointReadahead) {
+        Size < OmpFileLocalDisjointReadahead) {
       // Coherence with our own write-combine buffer: pending combined bytes
       // must reach the PFS before we read through the read fd.
       if (OmpFileLocalDisjointWriteCombine != 0) {
