@@ -812,6 +812,10 @@ struct ProxyDevice {
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE", false)),
         OmpFileLocalDisjointRead(envBoolOrDefault(
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_READ", false)),
+        OmpFileLocalDisjointWriteCombine(envUint64OrDefault(
+            "LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_COMBINE", 0)),
+        OmpFileLocalDisjointReadahead(envUint64OrDefault(
+            "LIBOMPFILE_OPT_LOCAL_DISJOINT_READAHEAD", 0)),
         OmpFileHeadnodeScheduler(
             envStringOrDefault("LIBOMPFILE_SCHEDULER", "LOCAL") ==
             "HEADNODE"),
@@ -4155,6 +4159,14 @@ struct ProxyDevice {
         OmpFileStatsLocalDisjointReadBytes.load(std::memory_order_relaxed);
     uint64_t LocalDisjointReadFallbacks =
         OmpFileStatsLocalDisjointReadFallbacks.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointCombinedWrites =
+        OmpFileStatsLocalDisjointCombinedWrites.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointCombineFlushes =
+        OmpFileStatsLocalDisjointCombineFlushes.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointReadaheadHits =
+        OmpFileStatsLocalDisjointReadaheadHits.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointReadaheadFills =
+        OmpFileStatsLocalDisjointReadaheadFills.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
 
     {
@@ -4203,7 +4215,9 @@ struct ProxyDevice {
             "staging_evictions=%llu "
             "stage_freshness_guard_bypasses=%llu dirty_owner_forward_reads=%llu dirty_owner_forward_bytes=%llu dirty_owner_forward_failures=%llu "
             "local_disjoint_writes=%llu local_disjoint_bytes=%llu local_disjoint_fallbacks=%llu "
-            "local_disjoint_reads=%llu local_disjoint_read_bytes=%llu local_disjoint_read_fallbacks=%llu\n",
+            "local_disjoint_reads=%llu local_disjoint_read_bytes=%llu local_disjoint_read_fallbacks=%llu "
+            "local_disjoint_combined_writes=%llu local_disjoint_combine_flushes=%llu "
+            "local_disjoint_readahead_hits=%llu local_disjoint_readahead_fills=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
             static_cast<unsigned long long>(OpenSys),
@@ -4285,7 +4299,11 @@ struct ProxyDevice {
             static_cast<unsigned long long>(LocalDisjointFallbacks),
             static_cast<unsigned long long>(LocalDisjointReads),
             static_cast<unsigned long long>(LocalDisjointReadBytes),
-            static_cast<unsigned long long>(LocalDisjointReadFallbacks));
+            static_cast<unsigned long long>(LocalDisjointReadFallbacks),
+            static_cast<unsigned long long>(LocalDisjointCombinedWrites),
+            static_cast<unsigned long long>(LocalDisjointCombineFlushes),
+            static_cast<unsigned long long>(LocalDisjointReadaheadHits),
+            static_cast<unsigned long long>(LocalDisjointReadaheadFills));
 
     fprintf(stderr,
             "MPIProxyDevice --> OMPFile writeback stats [%s] rank=%d "
@@ -5687,8 +5705,17 @@ struct ProxyDevice {
     // Owner-bypass durability: if any writes for this file were serviced
     // locally, flush the local write fds at the logical close (covers the
     // "close" fsync policy, which defers per-write fdatasync).
-    if (OmpFileLocalDisjointWrite && (Entry.Flags & O_ACCMODE) != O_RDONLY)
+    if (OmpFileLocalDisjointWrite && (Entry.Flags & O_ACCMODE) != O_RDONLY) {
+      // Deferred write-combine errors surface here, like page-cache
+      // write-back at close.
+      if (!flushLocalWriteBufs())
+        return OFFLOAD_FAIL;
       syncLocalWriteFds();
+    }
+    // Close is a phase boundary: other ranks may rewrite this path next, so
+    // drop any readahead windows.
+    if (OmpFileLocalDisjointRead)
+      invalidateLocalReadCaches();
     if (!closeOnRank(Entry.Rank, Entry.RemoteHandle))
       return OFFLOAD_FAIL;
     traceOmpFile("mppClose exit local=%d rank=%d remote=%d\n", Handle,
@@ -5980,11 +6007,82 @@ struct ProxyDevice {
   }
 
   void closeLocalReadFds() {
+    invalidateLocalReadCaches();
     const std::lock_guard<std::mutex> Lock(OmpFileLocalReadFdMutex);
     for (auto &KV : OmpFileLocalReadFds)
       if (KV.second >= 0)
         ::close(KV.second);
     OmpFileLocalReadFds.clear();
+  }
+
+  // One coalescing window: a write-combine buffer or a readahead cache for a
+  // single path (declared here, before the helpers that take it by
+  // reference; the backing maps live with the other OmpFileLocal* members).
+  struct LocalCoalesceBuf {
+    std::unique_ptr<char[]> Data;
+    int64_t Base = -1; // file offset of Data[0]; -1 = empty/invalid
+    uint64_t Len = 0;
+    uint64_t Cap = 0;
+  };
+
+  // Readahead cache invalidation: a bypass write to the path, a close (phase
+  // boundary), or shutdown makes any cached window untrustworthy.
+  void invalidateLocalReadCache(const std::string &Path) {
+    const std::lock_guard<std::mutex> Lock(OmpFileLocalReadCacheMutex);
+    auto It = OmpFileLocalReadCaches.find(Path);
+    if (It != OmpFileLocalReadCaches.end()) {
+      It->second.Base = -1;
+      It->second.Len = 0;
+    }
+  }
+
+  void invalidateLocalReadCaches() {
+    const std::lock_guard<std::mutex> Lock(OmpFileLocalReadCacheMutex);
+    for (auto &KV : OmpFileLocalReadCaches) {
+      KV.second.Base = -1;
+      KV.second.Len = 0;
+    }
+  }
+
+  // Flush one write-combine buffer to its fd. Caller holds
+  // OmpFileLocalWriteBufMutex. False = flush failed (ErrnoOut set) and the
+  // buffered bytes are still pending — the caller must surface a hard error,
+  // never silently drop already-acked writes.
+  bool flushLocalWriteBufLocked(int Fd, LocalCoalesceBuf &Buf, int &ErrnoOut) {
+    if (Buf.Base < 0 || Buf.Len == 0) {
+      Buf.Base = -1;
+      Buf.Len = 0;
+      return true;
+    }
+    uint64_t Written = 0, ElapsedUs = 0;
+    if (!pwriteFully(Fd, Buf.Base, Buf.Data.get(), Buf.Len, &Written,
+                     &ElapsedUs, ErrnoOut))
+      return false;
+    if (writethroughFsyncEachEnabled())
+      ::fdatasync(Fd);
+    OmpFileStatsLocalDisjointCombineFlushes.fetch_add(
+        1, std::memory_order_relaxed);
+    traceOmpFile("localDisjointCombineFlush base=%lld len=%llu\n",
+                 static_cast<long long>(Buf.Base),
+                 static_cast<unsigned long long>(Buf.Len));
+    Buf.Base = -1;
+    Buf.Len = 0;
+    return true;
+  }
+
+  // Flush every pending write-combine buffer (logical close, sync, shutdown).
+  // Returns false if any flush failed; deferred write errors surface to the
+  // caller like page-cache write-back errors surface at fsync/close.
+  bool flushLocalWriteBufs() {
+    const std::lock_guard<std::mutex> Lock(OmpFileLocalWriteBufMutex);
+    bool Ok = true;
+    for (auto &KV : OmpFileLocalWriteBufs) {
+      const int Fd = getLocalWriteFd(KV.first);
+      int FlushErrno = 0;
+      if (Fd < 0 || !flushLocalWriteBufLocked(Fd, KV.second, FlushErrno))
+        Ok = false;
+    }
+    return Ok;
   }
 
   // Attempt the owner-bypass for one pread. Returns true only if the full
@@ -6000,6 +6098,89 @@ struct ProxyDevice {
       OmpFileStatsLocalDisjointReadFallbacks.fetch_add(
           1, std::memory_order_relaxed);
       return false;
+    }
+    // Readahead: wekafs charges a ~fixed latency per op regardless of size,
+    // so small sequential preads are served from a per-path window filled
+    // cap-bytes at a time. Same disjointness contract as the bypass; the
+    // window is invalidated on local bypass writes and at close.
+    if (OmpFileLocalDisjointReadahead != 0 &&
+        Size <= OmpFileLocalDisjointReadahead) {
+      // Coherence with our own write-combine buffer: pending combined bytes
+      // must reach the PFS before we read through the read fd.
+      if (OmpFileLocalDisjointWriteCombine != 0) {
+        const std::lock_guard<std::mutex> BufLock(OmpFileLocalWriteBufMutex);
+        auto BufIt = OmpFileLocalWriteBufs.find(Entry.Path);
+        if (BufIt != OmpFileLocalWriteBufs.end() && BufIt->second.Base >= 0) {
+          const int WriteFd = getLocalWriteFd(Entry.Path);
+          int FlushErrno = 0;
+          if (WriteFd < 0 ||
+              !flushLocalWriteBufLocked(WriteFd, BufIt->second, FlushErrno)) {
+            OmpFileStatsLocalDisjointReadFallbacks.fetch_add(
+                1, std::memory_order_relaxed);
+            return false;
+          }
+        }
+      }
+      const std::lock_guard<std::mutex> Lock(OmpFileLocalReadCacheMutex);
+      LocalCoalesceBuf &Cache = OmpFileLocalReadCaches[Entry.Path];
+      if (!Cache.Data) {
+        Cache.Cap = OmpFileLocalDisjointReadahead;
+        Cache.Data.reset(new (std::nothrow) char[Cache.Cap]);
+      }
+      if (Cache.Data) {
+        const bool Hit =
+            Cache.Base >= 0 && Offset >= Cache.Base &&
+            Offset + static_cast<int64_t>(Size) <=
+                Cache.Base + static_cast<int64_t>(Cache.Len);
+        if (!Hit) {
+          uint64_t Filled = 0;
+          while (Filled < Cache.Cap) {
+            const ssize_t Bytes = ::pread(
+                Fd, Cache.Data.get() + Filled,
+                static_cast<size_t>(Cache.Cap - Filled),
+                static_cast<off_t>(Offset + static_cast<int64_t>(Filled)));
+            if (Bytes < 0) {
+              Cache.Base = -1;
+              Cache.Len = 0;
+              OmpFileStatsLocalDisjointReadFallbacks.fetch_add(
+                  1, std::memory_order_relaxed);
+              return false;
+            }
+            if (Bytes == 0)
+              break; // EOF: partial window is fine if it covers the request
+            Filled += static_cast<uint64_t>(Bytes);
+          }
+          if (Filled < Size) {
+            // Short of the requested range: the owner's handle is
+            // authoritative (in-flight forwarded writes, true size).
+            Cache.Base = -1;
+            Cache.Len = 0;
+            OmpFileStatsLocalDisjointReadFallbacks.fetch_add(
+                1, std::memory_order_relaxed);
+            return false;
+          }
+          Cache.Base = Offset;
+          Cache.Len = Filled;
+          OmpFileStatsLocalDisjointReadaheadFills.fetch_add(
+              1, std::memory_order_relaxed);
+        } else {
+          OmpFileStatsLocalDisjointReadaheadHits.fetch_add(
+              1, std::memory_order_relaxed);
+        }
+        std::memcpy(Buffer,
+                    Cache.Data.get() + (Offset - Cache.Base),
+                    static_cast<size_t>(Size));
+        if (BytesRead)
+          *BytesRead = Size;
+        OmpFileStatsLocalDisjointReads.fetch_add(1, std::memory_order_relaxed);
+        OmpFileStatsLocalDisjointReadBytes.fetch_add(
+            Size, std::memory_order_relaxed);
+        traceOmpFile("localDisjointPread offset=%lld size=%llu (readahead)\n",
+                     static_cast<long long>(Offset),
+                     static_cast<unsigned long long>(Size));
+        return true;
+      }
+      // Window allocation failed: fall through to the direct pread loop.
     }
     uint64_t TotalRead = 0;
     while (TotalRead < Size) {
@@ -6038,6 +6219,7 @@ struct ProxyDevice {
   }
 
   void closeLocalWriteFds() {
+    flushLocalWriteBufs();
     const std::lock_guard<std::mutex> Lock(OmpFileLocalWriteFdMutex);
     for (auto &KV : OmpFileLocalWriteFds)
       if (KV.second >= 0) {
@@ -6048,10 +6230,16 @@ struct ProxyDevice {
   }
 
   // Attempt the owner-bypass for one pwrite. Returns true if the write was
-  // fully serviced locally; false means the caller should use the forward path.
+  // fully serviced locally; false means the caller should use the forward
+  // path — unless *HardFail was set, in which case a deferred combine flush
+  // failed (already-acked bytes could not reach the PFS) and the caller must
+  // fail the operation instead of forwarding.
   bool tryLocalDisjointPwrite(const OmpFileHandleEntry &Entry, int64_t Offset,
                               const void *Buffer, uint64_t Size,
-                              uint64_t *BytesWritten) {
+                              uint64_t *BytesWritten,
+                              bool *HardFail = nullptr) {
+    if (HardFail)
+      *HardFail = false;
     if (!OmpFileLocalDisjointWrite || Entry.Path.empty())
       return false;
     if ((Entry.Flags & O_ACCMODE) == O_RDONLY)
@@ -6060,6 +6248,66 @@ struct ProxyDevice {
     if (Fd < 0) {
       OmpFileStatsLocalDisjointFallbacks.fetch_add(1, std::memory_order_relaxed);
       return false;
+    }
+    if (OmpFileLocalDisjointReadahead != 0)
+      invalidateLocalReadCache(Entry.Path);
+    // Write-combine: contiguous small bypass writes append into a per-path
+    // buffer and hit the PFS as one large pwrite (wekafs pays ~fixed latency
+    // per op). Flushed on discontinuity, capacity, reads, sync, and close.
+    if (OmpFileLocalDisjointWriteCombine != 0) {
+      const std::lock_guard<std::mutex> Lock(OmpFileLocalWriteBufMutex);
+      if (Size < OmpFileLocalDisjointWriteCombine) {
+        LocalCoalesceBuf &Buf = OmpFileLocalWriteBufs[Entry.Path];
+        if (!Buf.Data) {
+          Buf.Cap = OmpFileLocalDisjointWriteCombine;
+          Buf.Data.reset(new (std::nothrow) char[Buf.Cap]);
+        }
+        if (Buf.Data) {
+          const bool Contiguous =
+              Buf.Base >= 0 &&
+              Offset == Buf.Base + static_cast<int64_t>(Buf.Len);
+          if (!Contiguous || Buf.Len + Size > Buf.Cap) {
+            int FlushErrno = 0;
+            if (!flushLocalWriteBufLocked(Fd, Buf, FlushErrno)) {
+              errno = FlushErrno != 0 ? FlushErrno : EIO;
+              if (HardFail)
+                *HardFail = true;
+              return false;
+            }
+          }
+          if (Buf.Base < 0)
+            Buf.Base = Offset;
+          std::memcpy(Buf.Data.get() + Buf.Len, Buffer,
+                      static_cast<size_t>(Size));
+          Buf.Len += Size;
+          if (BytesWritten)
+            *BytesWritten = Size;
+          OmpFileStatsLocalDisjointWrites.fetch_add(1,
+                                                    std::memory_order_relaxed);
+          OmpFileStatsLocalDisjointBytes.fetch_add(Size,
+                                                   std::memory_order_relaxed);
+          OmpFileStatsLocalDisjointCombinedWrites.fetch_add(
+              1, std::memory_order_relaxed);
+          traceOmpFile("localDisjointPwrite offset=%lld size=%llu (combined)\n",
+                       static_cast<long long>(Offset),
+                       static_cast<unsigned long long>(Size));
+          return true;
+        }
+        // Buffer allocation failed: fall through to the direct pwrite.
+      } else {
+        // Large op: flush any pending buffer first so per-path ordering of
+        // this proxy's own writes is preserved.
+        auto It = OmpFileLocalWriteBufs.find(Entry.Path);
+        if (It != OmpFileLocalWriteBufs.end()) {
+          int FlushErrno = 0;
+          if (!flushLocalWriteBufLocked(Fd, It->second, FlushErrno)) {
+            errno = FlushErrno != 0 ? FlushErrno : EIO;
+            if (HardFail)
+              *HardFail = true;
+            return false;
+          }
+        }
+      }
     }
     uint64_t Written = 0, ElapsedUs = 0;
     int WriteErrno = 0;
@@ -6090,8 +6338,12 @@ struct ProxyDevice {
     OmpFileHandleEntry Entry{};
     if (!findRemoteHandle(Handle, Entry))
       return OFFLOAD_FAIL;
-    if (tryLocalDisjointPwrite(Entry, Offset, Buffer, Size, BytesWritten))
+    bool HardFail = false;
+    if (tryLocalDisjointPwrite(Entry, Offset, Buffer, Size, BytesWritten,
+                               &HardFail))
       return OFFLOAD_SUCCESS;
+    if (HardFail)
+      return OFFLOAD_FAIL;
     if (!pwriteOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
                       BytesWritten)) {
       traceOmpFile("mppPwriteEx fail local=%d rank=%d remote=%d offset=%lld "
@@ -6851,6 +7103,25 @@ private:
   std::atomic<uint64_t> OmpFileStatsLocalDisjointReads{0};
   std::atomic<uint64_t> OmpFileStatsLocalDisjointReadBytes{0};
   std::atomic<uint64_t> OmpFileStatsLocalDisjointReadFallbacks{0};
+  // Coalescing layer for the owner-bypass (opt-in, bytes; 0 = off). The PFS
+  // charges a ~fixed per-op latency (wekafs: ~3.5 ms) regardless of size, so
+  // small sequential disjoint ops must be merged into large PFS ops to
+  // compete with MPI-IO collective buffering. WRITE_COMBINE appends
+  // contiguous bypass pwrites into a per-path buffer flushed on
+  // discontinuity/capacity/read/sync/close; READAHEAD serves bypass preads
+  // from a per-path window filled cap-bytes at a time. Same disjointness
+  // contract as the bypass itself; deferred write errors surface at the
+  // flush point (close/sync), like page-cache write-back.
+  uint64_t OmpFileLocalDisjointWriteCombine = 0;
+  uint64_t OmpFileLocalDisjointReadahead = 0;
+  std::mutex OmpFileLocalWriteBufMutex;
+  std::unordered_map<std::string, LocalCoalesceBuf> OmpFileLocalWriteBufs;
+  std::mutex OmpFileLocalReadCacheMutex;
+  std::unordered_map<std::string, LocalCoalesceBuf> OmpFileLocalReadCaches;
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointCombinedWrites{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointCombineFlushes{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointReadaheadHits{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointReadaheadFills{0};
   bool OmpFileHeadnodeScheduler = false;
   std::string OmpFileStageMode;
   std::string OmpFileStageWriteMode;
