@@ -70,8 +70,7 @@ int MPIIOBackend::readAtTwoPhase(
 
       if (two_phase_window_us > 0) {
         const auto window_wait_begin = std::chrono::steady_clock::now();
-        two_phase_queue_cv.wait_for(
-            lock, std::chrono::microseconds(two_phase_window_us));
+        waitForTwoPhaseCollectionWindow(lock, two_phase_window_us);
         const auto window_wait_end = std::chrono::steady_clock::now();
         const auto window_wait_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -154,6 +153,17 @@ int MPIIOBackend::readAtTwoPhase(
            static_cast<unsigned long long>(request.DebugRequestId),
            static_cast<long long>(wait_us));
   return 0;
+}
+
+void MPIIOBackend::waitForTwoPhaseCollectionWindow(
+    std::unique_lock<std::mutex> &lock, uint64_t window_us) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::microseconds(window_us);
+  // Enqueue and completion notifications serve followers, but they must not
+  // shorten the leader's configured collection window. The predicate remains
+  // false so wait_until resumes waiting after both notifications and spurious
+  // wakeups, returning only when the absolute deadline is reached.
+  two_phase_queue_cv.wait_until(lock, deadline, [] { return false; });
 }
 
 void MPIIOBackend::processTwoPhaseBatch(

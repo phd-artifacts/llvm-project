@@ -405,6 +405,11 @@ public:
     return computeTwoPhaseTargetReadSize(start, end, request_count, remote_only,
                                          sieve_bytes, max_batch_bytes);
   }
+  void waitForTwoPhaseCollectionWindowForTesting(uint64_t window_us) {
+    std::unique_lock<std::mutex> lock(two_phase_mutex);
+    waitForTwoPhaseCollectionWindow(lock, window_us);
+  }
+  void notifyTwoPhaseQueueForTesting() { two_phase_queue_cv.notify_all(); }
   size_t computeForecastTargetReadSizeForTesting(
       const ompfile::OmpFileIOHint &hint, long start, long end,
       size_t request_count, bool remote_only, uint64_t sieve_bytes,
@@ -738,6 +743,8 @@ private:
                                bool force_no_stage = false);
   int readAtTwoPhase(const ompfile::OmpFileReadRequestContext &context,
                      void *data, size_t size);
+  void waitForTwoPhaseCollectionWindow(std::unique_lock<std::mutex> &lock,
+                                       uint64_t window_us);
   void processTwoPhaseBatch(std::vector<TwoPhaseReadRequest *> &batch);
   void processTwoPhaseGroup(std::vector<TwoPhaseReadRequest *> &group);
   void processWriteBatch(std::vector<WriteBatchRequest *> &batch);
