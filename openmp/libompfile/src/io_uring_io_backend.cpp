@@ -26,9 +26,10 @@ IoUringIOBackend::IoUringIOBackend() {
 }
 
 IoUringIOBackend::~IoUringIOBackend() {
-  // Teardown the ring
-  io_uring_queue_exit(&ring);
-  is_initialized = false;
+  if (is_initialized) {
+    io_uring_queue_exit(&ring);
+    is_initialized = false;
+  }
   io_log("IoUringIOBackend destroyed\n");
 }
 
