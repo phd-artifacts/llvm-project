@@ -76,10 +76,6 @@ public:
     return computePathKey(Path);
   }
 
-  static uint64_t computePathKeyForTesting(std::string_view Path) {
-    return computePathKey(Path);
-  }
-
   void initialize(int WorldSize, int HeadnodeRank);
 
   OmpFileIOPlan planRequest(const OmpFileIORequest &Request, const char *Path,
@@ -90,10 +86,6 @@ public:
                         OmpFileIOBatchPlan &Plan,
                         std::vector<OmpFileIOBatchPlanEntry> &Entries,
                         int LocalRank);
-
-  bool classifyRebalanceConflictForTesting(const OmpFileIOBatchSegment &Segment,
-                                           const char *&Reason,
-                                           int &ReasonErrno);
 
   bool commitTileFreshnessWrite(uint64_t PathKey, int WriterRank,
                                 bool WriteThroughMode,
@@ -107,27 +99,25 @@ public:
   bool completeDirtyFlush(uint64_t PathKey, int SourceRank, uint64_t Version,
                          bool Success);
 
-  bool commitTileFreshnessWriteForTesting(uint64_t PathKey, int WriterRank,
-                                          bool WriteThroughMode,
-                                          uint64_t &CommittedVersionOut);
-  bool markTileFreshForTesting(uint64_t PathKey, int Rank, uint64_t Version);
+  bool handleFreshnessQueryRequest(
+      const OmpFileFreshnessQueryRequest &Request,
+      OmpFileFreshnessQueryReply &Reply);
+
+  void completeRequest(const OmpFileIOPlan &Plan);
+
+#if defined(OMPFILE_ENABLE_TEST_ACCESS)
+  // Direct-linked regression seam; omitted from production plugin builds.
+  bool classifyRebalanceConflictForTesting(const OmpFileIOBatchSegment &Segment,
+                                           const char *&Reason,
+                                           int &ReasonErrno);
   bool evaluateTileFreshnessQueryForTesting(
       uint64_t PathKey, uint64_t LocalVersion, int RequesterRank,
       OmpFileFreshnessDecision &DecisionOut, int &SourceRankOut,
       uint64_t &SelectedVersionOut);
-  bool handleFreshnessQueryRequest(
-      const OmpFileFreshnessQueryRequest &Request,
-      OmpFileFreshnessQueryReply &Reply);
-  bool handleFreshnessQueryRequestForTesting(
-      const OmpFileFreshnessQueryRequest &Request,
-      OmpFileFreshnessQueryReply &Reply) {
-    return handleFreshnessQueryRequest(Request, Reply);
-  }
   bool clearTileFreshRanksForTesting(uint64_t PathKey);
-
-  void completeRequest(const OmpFileIOPlan &Plan);
   std::vector<HandlerInfo> snapshotHandlersForTesting();
   void resetForTesting();
+#endif // OMPFILE_ENABLE_TEST_ACCESS
 
   bool isFreshnessTraceEnabled() const;
   void emitFreshnessTrace(const char *Event, const std::string &PathKey,

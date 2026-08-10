@@ -59,6 +59,7 @@ void MPIIOBackend::recordWriteEpochForContext(
   }
 }
 
+#if defined(OMPFILE_ENABLE_TEST_ACCESS)
 bool MPIIOBackend::hasCompletedStageInvalidationForTesting(int file_id) const {
   const auto lock = instrumentedHandleLock();
   auto it = writable_stage_coherence.find(file_id);
@@ -68,6 +69,7 @@ bool MPIIOBackend::hasCompletedStageInvalidationForTesting(int file_id) const {
   return coherence.WriteGeneration != 0 && !coherence.InvalidationFailed &&
          coherence.InvalidatedGeneration >= coherence.WriteGeneration;
 }
+#endif // OMPFILE_ENABLE_TEST_ACCESS
 
 bool MPIIOBackend::globallyInvalidateStageForFile(int file_id) {
   uint64_t path_key = 0;

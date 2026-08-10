@@ -18,8 +18,8 @@ extern "C" int ompfile_mpp_freshness_query_proxy_test(
     OmpFileFreshnessQueryReply *Reply) {
   if (!Request || !Reply)
     return EINVAL;
-  if (!OmpFileHeadnodeManager::instance().handleFreshnessQueryRequestForTesting(
-          *Request, *Reply)) {
+  if (!OmpFileHeadnodeManager::instance().handleFreshnessQueryRequest(*Request,
+                                                                      *Reply)) {
     return errno != 0 ? errno : EIO;
   }
   return 0;
@@ -34,7 +34,7 @@ extern "C" int ompfile_mpp_freshness_write_commit(uint64_t PathKey,
   if (!CommittedVersion)
     return EINVAL;
   uint64_t committed = 0;
-  if (!OmpFileHeadnodeManager::instance().commitTileFreshnessWriteForTesting(
+  if (!OmpFileHeadnodeManager::instance().commitTileFreshnessWrite(
           PathKey, WriterRank, WriteThroughMode != 0, committed)) {
     return errno != 0 ? errno : EIO;
   }

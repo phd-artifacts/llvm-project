@@ -234,6 +234,7 @@ void OmpFileHeadnodeManager::initialize(int NewWorldSize, int NewHeadnodeRank) {
   Initialized = true;
 }
 
+#if defined(OMPFILE_ENABLE_TEST_ACCESS)
 void OmpFileHeadnodeManager::resetForTesting() {
   const std::lock_guard<std::mutex> Lock(Mutex);
   Initialized = false;
@@ -256,13 +257,7 @@ void OmpFileHeadnodeManager::resetForTesting() {
   NextHandlerTieBreaker = 0;
   NextWriteSequence = 1;
 }
-
-bool OmpFileHeadnodeManager::commitTileFreshnessWriteForTesting(
-    uint64_t PathKey, int WriterRank, bool WriteThroughMode,
-    uint64_t &CommittedVersionOut) {
-  return commitTileFreshnessWrite(PathKey, WriterRank, WriteThroughMode,
-                                  CommittedVersionOut);
-}
+#endif
 
 bool OmpFileHeadnodeManager::commitTileFreshnessWrite(
     uint64_t PathKey, int WriterRank, bool WriteThroughMode,
@@ -305,12 +300,7 @@ bool OmpFileHeadnodeManager::completeDirtyFlush(uint64_t PathKey,
   return completeDirtyFlushUnlocked(PathKey, SourceRank, Version, Success);
 }
 
-bool OmpFileHeadnodeManager::markTileFreshForTesting(uint64_t PathKey, int Rank,
-                                                     uint64_t Version) {
-  const std::lock_guard<std::mutex> Lock(Mutex);
-  return markTileFreshUnlocked(PathKey, Rank, Version);
-}
-
+#if defined(OMPFILE_ENABLE_TEST_ACCESS)
 bool OmpFileHeadnodeManager::evaluateTileFreshnessQueryForTesting(
     uint64_t PathKey, uint64_t LocalVersion, int RequesterRank,
     OmpFileFreshnessDecision &DecisionOut, int &SourceRankOut,
@@ -320,6 +310,7 @@ bool OmpFileHeadnodeManager::evaluateTileFreshnessQueryForTesting(
                                             DecisionOut, SourceRankOut,
                                              SelectedVersionOut);
 }
+#endif
 
 bool OmpFileHeadnodeManager::handleFreshnessQueryRequest(
     const OmpFileFreshnessQueryRequest &Request,
@@ -335,9 +326,14 @@ bool OmpFileHeadnodeManager::handleFreshnessQueryRequest(
   OmpFileFreshnessDecision Decision = OmpFileFreshnessDecision::WAIT_OR_FAIL;
   int SourceRank = -1;
   uint64_t SelectedVersion = 0;
-  if (!evaluateTileFreshnessQueryForTesting(Request.PathKey, Request.LocalVersion,
-                                            Request.RequesterRank, Decision,
-                                            SourceRank, SelectedVersion)) {
+  bool QueryOk = false;
+  {
+    const std::lock_guard<std::mutex> Lock(Mutex);
+    QueryOk = evaluateTileFreshnessQueryUnlocked(
+        Request.PathKey, Request.LocalVersion, Request.RequesterRank, Decision,
+        SourceRank, SelectedVersion);
+  }
+  if (!QueryOk) {
     Reply.Status = -1;
     Reply.Errno = errno != 0 ? errno : EIO;
     return true;
@@ -351,6 +347,7 @@ bool OmpFileHeadnodeManager::handleFreshnessQueryRequest(
   return true;
 }
 
+#if defined(OMPFILE_ENABLE_TEST_ACCESS)
 bool OmpFileHeadnodeManager::clearTileFreshRanksForTesting(uint64_t PathKey) {
   const std::lock_guard<std::mutex> Lock(Mutex);
   if (PathKey == 0) {
@@ -365,6 +362,7 @@ bool OmpFileHeadnodeManager::clearTileFreshRanksForTesting(uint64_t PathKey) {
   It->second.FreshRanks.clear();
   return true;
 }
+#endif
 
 bool OmpFileHeadnodeManager::commitTileFreshnessWriteUnlocked(
     uint64_t PathKey, int WriterRank, bool WriteThroughMode,
@@ -716,12 +714,14 @@ bool OmpFileHeadnodeManager::evaluateTileFreshnessQueryUnlocked(
   return true;
 }
 
+#if defined(OMPFILE_ENABLE_TEST_ACCESS)
 bool OmpFileHeadnodeManager::classifyRebalanceConflictForTesting(
     const OmpFileIOBatchSegment &Segment, const char *&Reason,
     int &ReasonErrno) {
   const std::lock_guard<std::mutex> Lock(Mutex);
   return hasRebalanceConflictUnlocked(Segment, Reason, ReasonErrno);
 }
+#endif
 
 bool OmpFileHeadnodeManager::isWorkerRankUnlocked(int Rank) const {
   const int WorkerCount = std::max(WorldSize - 1, 0);
@@ -1168,12 +1168,14 @@ bool OmpFileHeadnodeManager::planBatchRequest(
   return true;
 }
 
+#if defined(OMPFILE_ENABLE_TEST_ACCESS)
 std::vector<OmpFileHeadnodeManager::HandlerInfo>
 OmpFileHeadnodeManager::snapshotHandlersForTesting() {
   const std::lock_guard<std::mutex> Lock(Mutex);
   ensureHandlersUnlocked();
   return Handlers;
 }
+#endif
 
 void OmpFileHeadnodeManager::maybeReportBatchStatsUnlocked() {
   if (BatchStatsReportEvery == 0 ||

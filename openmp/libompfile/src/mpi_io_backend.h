@@ -379,6 +379,10 @@ public:
   MPIIOBackend();
   ~MPIIOBackend();
 
+#if defined(OMPFILE_ENABLE_TEST_ACCESS)
+  // Direct-linked regression seam. Production libompfile builds do not define
+  // OMPFILE_ENABLE_TEST_ACCESS, so these helpers are absent from the runtime
+  // class interface.
   void recordWriteEpochForTesting(int file_id, long offset, size_t size,
                                   const ompfile::OmpFileIOHint &hint) {
     recordWriteEpochForContext(file_id, offset, size, hint);
@@ -715,6 +719,7 @@ public:
             stage_affinity_source_fallback_count.load(
                 std::memory_order_relaxed)};
   }
+#endif // OMPFILE_ENABLE_TEST_ACCESS
 
   int open(const char *filename) override;
   int openWithPlan(const char *filename,
