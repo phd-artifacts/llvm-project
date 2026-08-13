@@ -3218,7 +3218,6 @@ struct ProxyDevice {
       ReadFd = Fd;
     }
 
-    const auto PreadStart = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> StageReadLock;
     if (ReadFd != Fd && HeldStageEntry) {
       StageReadLock = std::unique_lock<std::mutex>(HeldStageEntry->Mutex);
@@ -3237,15 +3236,11 @@ struct ProxyDevice {
       }
     }
 
-    const ssize_t BytesRead =
-        ::pread(ReadFd, Buffer, Size, static_cast<off_t>(Offset));
-    const auto PreadEnd = std::chrono::steady_clock::now();
-    if (BytesRead < 0) {
-      ErrnoOut = errno;
+    uint64_t Bytes = 0;
+    uint64_t PreadUs = 0;
+    if (!preadFully(ReadFd, Offset, Buffer, Size, &Bytes, &PreadUs, ErrnoOut))
       return false;
-    }
 
-    const uint64_t Bytes = static_cast<uint64_t>(BytesRead);
     if (BytesReadOut)
       *BytesReadOut = Bytes;
     if (!AllowStage && Bytes > 0) {
@@ -3255,12 +3250,10 @@ struct ProxyDevice {
     if (ReadFd != Fd && Bytes > 0) {
       OmpFileStatsStagedReadHits.fetch_add(1, std::memory_order_relaxed);
       OmpFileStatsStagedReadBytes.fetch_add(Bytes, std::memory_order_relaxed);
-      OmpFileStatsStagedPreadUs.fetch_add(elapsedMicros(PreadStart, PreadEnd),
-                                          std::memory_order_relaxed);
+      OmpFileStatsStagedPreadUs.fetch_add(PreadUs, std::memory_order_relaxed);
     } else if (Bytes > 0) {
       OmpFileStatsSourcePreadBytes.fetch_add(Bytes, std::memory_order_relaxed);
-      OmpFileStatsSourcePreadUs.fetch_add(elapsedMicros(PreadStart, PreadEnd),
-                                          std::memory_order_relaxed);
+      OmpFileStatsSourcePreadUs.fetch_add(PreadUs, std::memory_order_relaxed);
     }
     return true;
   }
@@ -3337,14 +3330,10 @@ struct ProxyDevice {
       return false;
     }
     const int StageFd = Entry->StageFd;
-    const ssize_t BytesRead =
-        ::pread(StageFd, Buffer, static_cast<size_t>(Size),
-                static_cast<off_t>(Offset));
-    if (BytesRead < 0) {
-      ErrnoOut = errno;
+    uint64_t Bytes = 0;
+    if (!preadFully(StageFd, Offset, Buffer, Size, &Bytes,
+                    /*ElapsedUsOut=*/nullptr, ErrnoOut))
       return false;
-    }
-    const uint64_t Bytes = static_cast<uint64_t>(BytesRead);
     if (BytesReadOut)
       *BytesReadOut = Bytes;
     if (Bytes > 0) {
@@ -3428,6 +3417,46 @@ struct ProxyDevice {
       return false;
     }
     StateOut = 1;
+    return true;
+  }
+
+  // A single ::pread transfers at most 2,147,479,552 bytes (2 GiB minus one
+  // page) on Linux, so any request above that returns short without being an
+  // error or EOF. Loop until the request is satisfied; a zero return is real
+  // EOF and legitimately ends the read early (the caller sees the partial
+  // count). Repro: 7.6 GB/rank HACC checkpoints, AMD job 370693.
+  bool preadFully(int Fd, int64_t Offset, void *Buffer, uint64_t Size,
+                  uint64_t *BytesReadOut, uint64_t *ElapsedUsOut,
+                  int &ErrnoOut) {
+    ErrnoOut = 0;
+    if (BytesReadOut)
+      *BytesReadOut = 0;
+    if (ElapsedUsOut)
+      *ElapsedUsOut = 0;
+
+    uint64_t TotalRead = 0;
+    while (TotalRead < Size) {
+      const auto ReadStart = std::chrono::steady_clock::now();
+      const ssize_t BytesRead =
+          ::pread(Fd, static_cast<char *>(Buffer) + TotalRead,
+                  static_cast<size_t>(Size - TotalRead),
+                  static_cast<off_t>(Offset + static_cast<int64_t>(TotalRead)));
+      const auto ReadEnd = std::chrono::steady_clock::now();
+      if (ElapsedUsOut)
+        *ElapsedUsOut += elapsedMicros(ReadStart, ReadEnd);
+      if (BytesRead < 0) {
+        ErrnoOut = errno;
+        if (BytesReadOut)
+          *BytesReadOut = TotalRead;
+        return false;
+      }
+      if (BytesRead == 0)
+        break;
+      TotalRead += static_cast<uint64_t>(BytesRead);
+    }
+
+    if (BytesReadOut)
+      *BytesReadOut = TotalRead;
     return true;
   }
 
