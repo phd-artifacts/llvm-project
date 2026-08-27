@@ -2380,6 +2380,7 @@ struct ProxyDevice {
 
       const auto FlushStart = std::chrono::steady_clock::now();
       uint64_t FlushedBytes = 0;
+      uint64_t FlushStageReadUs = 0;
       std::vector<char> Buffer;
       for (const OmpFileStageExtent &Extent : Extents) {
         assert(Extent.End > Extent.Begin && "empty dirty extent in vector");
@@ -2388,9 +2389,12 @@ struct ProxyDevice {
           Buffer.resize(Len);
         uint64_t ReadTotal = 0;
         while (ReadTotal < Len) {
+          const auto ReadStart = std::chrono::steady_clock::now();
           const ssize_t N = ::pread(Entry.StageFd, Buffer.data() + ReadTotal,
                                     static_cast<size_t>(Len - ReadTotal),
                                     static_cast<off_t>(Extent.Begin + ReadTotal));
+          FlushStageReadUs +=
+              elapsedMicros(ReadStart, std::chrono::steady_clock::now());
           if (N <= 0) {
             const int ReadErrno = N < 0 ? errno : EIO;
             closeFlushFd();
@@ -2401,13 +2405,21 @@ struct ProxyDevice {
           ReadTotal += static_cast<uint64_t>(N);
         }
         uint64_t WriteTotal = 0;
+        uint64_t ExtentWriteUs = 0;
         while (WriteTotal < Len) {
+          const auto WriteStart = std::chrono::steady_clock::now();
           const ssize_t N = ::pwrite(
               FlushSourceFd, Buffer.data() + WriteTotal,
               static_cast<size_t>(Len - WriteTotal),
               static_cast<off_t>(Extent.Begin + WriteTotal));
+          ExtentWriteUs +=
+              elapsedMicros(WriteStart, std::chrono::steady_clock::now());
           if (N <= 0) {
             const int WriteErrno = N < 0 ? errno : EIO;
+            // The write-back flush writes the source too; without this the
+            // staged arm reports no source write time at all and the two arms
+            // are not comparable term by term.
+            recordSourcePwrite(Len, WriteTotal, ExtentWriteUs);
             closeFlushFd();
             invalidateStageForPath(SourcePath);
             return failDirtyFlush("pwrite-source", WriteErrno, Extent.Begin,
@@ -2415,10 +2427,11 @@ struct ProxyDevice {
           }
           WriteTotal += static_cast<uint64_t>(N);
         }
+        recordSourcePwrite(Len, WriteTotal, ExtentWriteUs);
         FlushedBytes += Len;
       }
 
-      if (::fdatasync(FlushSourceFd) != 0) {
+      if (!fdatasyncSourceTimed(FlushSourceFd)) {
         const int SyncErrno = errno;
         closeFlushFd();
         invalidateStageForPath(SourcePath);
@@ -2498,7 +2511,14 @@ struct ProxyDevice {
       OmpFileStatsStageDirtyFlushes.fetch_add(1, std::memory_order_relaxed);
       OmpFileStatsStageDirtyFlushBytes.fetch_add(FlushedBytes,
                                                   std::memory_order_relaxed);
-      OmpFileStatsStageWriteUs.fetch_add(
+      // The whole flush window used to be charged to stage_write_us_total,
+      // which made that counter report stage device writes plus stage reads
+      // plus source writes plus the headnode completion round trip under one
+      // name. Keep it as its own term; its components are now separable as
+      // window - flush_read - the source counters above.
+      OmpFileStatsStageDirtyFlushReadUs.fetch_add(FlushStageReadUs,
+                                                  std::memory_order_relaxed);
+      OmpFileStatsStageDirtyFlushUs.fetch_add(
           elapsedMicros(FlushStart, std::chrono::steady_clock::now()),
           std::memory_order_relaxed);
       closeFlushFd();
@@ -3460,6 +3480,49 @@ struct ProxyDevice {
     return true;
   }
 
+  // The stage-side durability barrier, kept out of OmpFileStatsStageWriteUs so
+  // that counter means the stage device pwrite and nothing else.
+  void recordStageWriteFsync(std::chrono::steady_clock::time_point Start) {
+    OmpFileStatsStageWriteFsyncOps.fetch_add(1, std::memory_order_relaxed);
+    OmpFileStatsStageWriteFsyncUs.fetch_add(
+        elapsedMicros(Start, std::chrono::steady_clock::now()),
+        std::memory_order_relaxed);
+  }
+
+  // Source-side write accounting. The read path has had
+  // `source_pread_us_total` since the staging work landed; the write path had
+  // no timer at all, so the ~31% of stage-off time it costs could only be
+  // inferred by solving the two arm equations. Device service and the
+  // durability barrier are recorded separately because the cost model charges
+  // them as distinct terms. Zero-length requests issue no syscall and are
+  // skipped, so the op count stays usable as a per-op divisor.
+  void recordSourcePwrite(uint64_t RequestedBytes, uint64_t BytesWritten,
+                          uint64_t ElapsedUs) {
+    if (RequestedBytes == 0)
+      return;
+    OmpFileStatsSourcePwriteOps.fetch_add(1, std::memory_order_relaxed);
+    OmpFileStatsSourcePwriteBytes.fetch_add(BytesWritten,
+                                            std::memory_order_relaxed);
+    OmpFileStatsSourcePwriteUs.fetch_add(ElapsedUs, std::memory_order_relaxed);
+  }
+
+  // fdatasync on an authoritative (source) fd, timed. Returns false with errno
+  // preserved, exactly like ::fdatasync, so call sites keep their error paths.
+  bool fdatasyncSourceTimed(int Fd) {
+    const auto Start = std::chrono::steady_clock::now();
+    const int Ret = ::fdatasync(Fd);
+    const int SyncErrno = Ret != 0 ? errno : 0;
+    OmpFileStatsSourceFsyncOps.fetch_add(1, std::memory_order_relaxed);
+    OmpFileStatsSourceFsyncUs.fetch_add(
+        elapsedMicros(Start, std::chrono::steady_clock::now()),
+        std::memory_order_relaxed);
+    if (Ret != 0) {
+      errno = SyncErrno;
+      return false;
+    }
+    return true;
+  }
+
   bool pwriteFully(int Fd, int64_t Offset, const void *Buffer, uint64_t Size,
                    uint64_t *BytesWrittenOut, uint64_t *ElapsedUsOut,
                    int &ErrnoOut) {
@@ -3540,8 +3603,14 @@ struct ProxyDevice {
         [&](bool CountBypassOnFailure, bool InvalidateOnFailure) -> bool {
       uint64_t SourceBytesWritten = 0;
       uint64_t SourceWriteUs = 0;
-      if (!pwriteFully(Fd, Offset, Buffer, Size, &SourceBytesWritten,
-                       &SourceWriteUs, ErrnoOut)) {
+      const bool SourceWriteOk =
+          pwriteFully(Fd, Offset, Buffer, Size, &SourceBytesWritten,
+                      &SourceWriteUs, ErrnoOut);
+      // Recorded before the failure branch: a partial write still consumed
+      // device time, and dropping it would bias the fitted constant downward
+      // exactly on the runs that went wrong.
+      recordSourcePwrite(Size, SourceBytesWritten, SourceWriteUs);
+      if (!SourceWriteOk) {
         if (HasTrackedSource && OmpFileStageMode != "off") {
           if (CountBypassOnFailure) {
             OmpFileStatsStagingWriteBypassCount.fetch_add(
@@ -3554,7 +3623,7 @@ struct ProxyDevice {
       }
       if (Size > 0) {
         if (writethroughFsyncEachEnabled()) {
-          if (::fdatasync(Fd) != 0) {
+          if (!fdatasyncSourceTimed(Fd)) {
             ErrnoOut = errno;
             return false;
           }
@@ -3619,8 +3688,11 @@ struct ProxyDevice {
           const auto FsyncStart = std::chrono::steady_clock::now();
           if (::fdatasync(StageFd) != 0)
             CaptureOk = false;
-          StageWriteUs +=
-              elapsedMicros(FsyncStart, std::chrono::steady_clock::now());
+          // Charged to the stage fsync counter rather than folded into
+          // StageWriteUs: the durability barrier is its own model term, and
+          // hiding it here is what made stage_write_us_total read as ~35 ms
+          // for a 1 MiB local write.
+          recordStageWriteFsync(FsyncStart);
         }
         if (!CaptureOk) {
           CaptureLock.unlock();
@@ -3751,15 +3823,13 @@ struct ProxyDevice {
         OmpFileStatsStageWriteFailures.fetch_add(1, std::memory_order_relaxed);
         OmpFileStatsStagingWriteBypassCount.fetch_add(
             1, std::memory_order_relaxed);
-        OmpFileStatsStageWriteUs.fetch_add(
-            StageWriteUs +
-                elapsedMicros(FsyncStart, std::chrono::steady_clock::now()),
-            std::memory_order_relaxed);
+        OmpFileStatsStageWriteUs.fetch_add(StageWriteUs,
+                                           std::memory_order_relaxed);
+        recordStageWriteFsync(FsyncStart);
         invalidateStageForPath(SourcePath);
         return true;
       }
-      StageWriteUs +=
-          elapsedMicros(FsyncStart, std::chrono::steady_clock::now());
+      recordStageWriteFsync(FsyncStart);
     }
 
     uint64_t SourceSize = 0;
@@ -3956,7 +4026,7 @@ struct ProxyDevice {
             OmpFileUnsyncedWriteFdMutex);
         NeedDeferredSync = OmpFileUnsyncedWriteFds.erase(Fd) > 0;
       }
-      if (NeedDeferredSync && ::fdatasync(Fd) != 0) {
+      if (NeedDeferredSync && !fdatasyncSourceTimed(Fd)) {
         ErrnoOut = errno;
         traceOmpFile("closeWithOptionalCache deferred fdatasync failed "
                      "fd=%d errno=%d\n",
@@ -4130,6 +4200,16 @@ struct ProxyDevice {
         OmpFileStatsSourcePreadUs.load(std::memory_order_relaxed);
     uint64_t StagedPreadUs =
         OmpFileStatsStagedPreadUs.load(std::memory_order_relaxed);
+    uint64_t SourcePwriteBytes =
+        OmpFileStatsSourcePwriteBytes.load(std::memory_order_relaxed);
+    uint64_t SourcePwriteOps =
+        OmpFileStatsSourcePwriteOps.load(std::memory_order_relaxed);
+    uint64_t SourcePwriteUs =
+        OmpFileStatsSourcePwriteUs.load(std::memory_order_relaxed);
+    uint64_t SourceFsyncOps =
+        OmpFileStatsSourceFsyncOps.load(std::memory_order_relaxed);
+    uint64_t SourceFsyncUs =
+        OmpFileStatsSourceFsyncUs.load(std::memory_order_relaxed);
     uint64_t StagingInvalidations =
         OmpFileStatsStagingInvalidations.load(std::memory_order_relaxed);
     uint64_t StagingRangeInvalidations =
@@ -4148,6 +4228,14 @@ struct ProxyDevice {
         OmpFileStatsStageWriteFailures.load(std::memory_order_relaxed);
     uint64_t StageWriteUs =
         OmpFileStatsStageWriteUs.load(std::memory_order_relaxed);
+    uint64_t StageWriteFsyncOps =
+        OmpFileStatsStageWriteFsyncOps.load(std::memory_order_relaxed);
+    uint64_t StageWriteFsyncUs =
+        OmpFileStatsStageWriteFsyncUs.load(std::memory_order_relaxed);
+    uint64_t StageDirtyFlushUs =
+        OmpFileStatsStageDirtyFlushUs.load(std::memory_order_relaxed);
+    uint64_t StageDirtyFlushReadUs =
+        OmpFileStatsStageDirtyFlushReadUs.load(std::memory_order_relaxed);
     uint64_t StageWritebackCaptures =
         OmpFileStatsStageWritebackCaptures.load(std::memory_order_relaxed);
     uint64_t StageWritebackCaptureBytes =
@@ -4204,7 +4292,7 @@ struct ProxyDevice {
     }
 
     fprintf(stderr,
-            "MPIProxyDevice --> OMPFile stats [%s] rank=%d "
+            "MPIProxyDevice --> OMPFile stats [%s] rank=%d stats_schema=2 "
             "open_req=%llu open_sys=%llu open_hits=%llu "
             "open_eio_retries=%llu open_eio_failures=%llu "
             "close_req=%llu close_sys=%llu close_deferred=%llu "
@@ -4224,7 +4312,10 @@ struct ProxyDevice {
             "stage_dirty_bytes=%llu stage_dirty_flushes=%llu "
             "stage_dirty_flush_bytes=%llu stage_dirty_flush_failures=%llu "
             "staging_write_bypass_count=%llu stage_write_failures=%llu "
-            "stage_write_us_total=%llu "
+            "stage_write_us_total=%llu stage_write_fsync_ops=%llu "
+            "stage_write_fsync_us_total=%llu "
+            "stage_dirty_flush_us_total=%llu "
+            "stage_dirty_flush_read_us_total=%llu "
             "stage_lookup_hits=%llu stage_lookup_misses=%llu "
             "stage_populate_count=%llu stage_populate_failures=%llu "
             "stage_populate_bytes=%llu stage_populate_us_total=%llu "
@@ -4235,6 +4326,9 @@ struct ProxyDevice {
             "stage_global_invalidations_completed=%llu "
             "stage_global_invalidations_failed=%llu source_pread_bytes=%llu "
             "source_pread_us_total=%llu staged_pread_us_total=%llu "
+            "source_pwrite_bytes=%llu source_pwrite_ops=%llu "
+            "source_pwrite_us_total=%llu "
+            "source_fsync_ops=%llu source_fsync_us_total=%llu "
             "staging_invalidations=%llu staging_range_invalidations=%llu "
             "staging_full_invalidations=%llu "
             "staging_invalidated_bytes=%llu "
@@ -4294,6 +4388,10 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StagingWriteBypass),
             static_cast<unsigned long long>(StageWriteFailures),
             static_cast<unsigned long long>(StageWriteUs),
+            static_cast<unsigned long long>(StageWriteFsyncOps),
+            static_cast<unsigned long long>(StageWriteFsyncUs),
+            static_cast<unsigned long long>(StageDirtyFlushUs),
+            static_cast<unsigned long long>(StageDirtyFlushReadUs),
             static_cast<unsigned long long>(StageLookupHits),
             static_cast<unsigned long long>(StageLookupMisses),
             static_cast<unsigned long long>(StagePopulateCount),
@@ -4311,6 +4409,11 @@ struct ProxyDevice {
             static_cast<unsigned long long>(SourcePreadBytes),
             static_cast<unsigned long long>(SourcePreadUs),
             static_cast<unsigned long long>(StagedPreadUs),
+            static_cast<unsigned long long>(SourcePwriteBytes),
+            static_cast<unsigned long long>(SourcePwriteOps),
+            static_cast<unsigned long long>(SourcePwriteUs),
+            static_cast<unsigned long long>(SourceFsyncOps),
+            static_cast<unsigned long long>(SourceFsyncUs),
             static_cast<unsigned long long>(StagingInvalidations),
             static_cast<unsigned long long>(StagingRangeInvalidations),
             static_cast<unsigned long long>(StagingFullInvalidations),
@@ -6084,11 +6187,13 @@ struct ProxyDevice {
       return true;
     }
     uint64_t Written = 0, ElapsedUs = 0;
-    if (!pwriteFully(Fd, Buf.Base, Buf.Data.get(), Buf.Len, &Written,
-                     &ElapsedUs, ErrnoOut))
+    const bool WriteOk = pwriteFully(Fd, Buf.Base, Buf.Data.get(), Buf.Len,
+                                     &Written, &ElapsedUs, ErrnoOut);
+    recordSourcePwrite(Buf.Len, Written, ElapsedUs);
+    if (!WriteOk)
       return false;
     if (writethroughFsyncEachEnabled())
-      ::fdatasync(Fd);
+      (void)fdatasyncSourceTimed(Fd);
     OmpFileStatsLocalDisjointCombineFlushes.fetch_add(
         1, std::memory_order_relaxed);
     traceOmpFile("localDisjointCombineFlush base=%lld len=%llu\n",
@@ -6343,14 +6448,16 @@ struct ProxyDevice {
     }
     uint64_t Written = 0, ElapsedUs = 0;
     int WriteErrno = 0;
-    if (!pwriteFully(Fd, Offset, Buffer, Size, &Written, &ElapsedUs,
-                     WriteErrno)) {
+    const bool WriteOk =
+        pwriteFully(Fd, Offset, Buffer, Size, &Written, &ElapsedUs, WriteErrno);
+    recordSourcePwrite(Size, Written, ElapsedUs);
+    if (!WriteOk) {
       errno = WriteErrno;
       OmpFileStatsLocalDisjointFallbacks.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
     if (writethroughFsyncEachEnabled())
-      ::fdatasync(Fd);
+      (void)fdatasyncSourceTimed(Fd);
     if (BytesWritten)
       *BytesWritten = Written;
     OmpFileStatsLocalDisjointWrites.fetch_add(1, std::memory_order_relaxed);
@@ -7242,13 +7349,30 @@ private:
   std::atomic<uint64_t> OmpFileStatsSourcePreadBytes{0};
   std::atomic<uint64_t> OmpFileStatsSourcePreadUs{0};
   std::atomic<uint64_t> OmpFileStatsStagedPreadUs{0};
+  // Source-side write service, the mirror of the pread counters above. Covers
+  // the write-through path, the write-back flush to source, and the
+  // owner-bypass (express) writes, so every byte the runtime puts on the
+  // shared filesystem is timed exactly once.
+  std::atomic<uint64_t> OmpFileStatsSourcePwriteBytes{0};
+  std::atomic<uint64_t> OmpFileStatsSourcePwriteOps{0};
+  std::atomic<uint64_t> OmpFileStatsSourcePwriteUs{0};
+  std::atomic<uint64_t> OmpFileStatsSourceFsyncOps{0};
+  std::atomic<uint64_t> OmpFileStatsSourceFsyncUs{0};
   std::atomic<uint64_t> OmpFileStatsStagingInvalidations{0};
   std::atomic<uint64_t> OmpFileStatsStagingRangeInvalidations{0};
   std::atomic<uint64_t> OmpFileStatsStagingFullInvalidations{0};
   std::atomic<uint64_t> OmpFileStatsStagingInvalidatedBytes{0};
   std::atomic<uint64_t> OmpFileStatsStagingWriteBypassCount{0};
   std::atomic<uint64_t> OmpFileStatsStageWriteFailures{0};
+  // stats_schema=2: OmpFileStatsStageWriteUs is now the stage device pwrite
+  // alone. The stage-side fdatasync and the write-back flush window used to be
+  // folded into it and are separate terms below, so a schema-1 bundle's
+  // stage_write_us_total is not comparable with a schema-2 one.
   std::atomic<uint64_t> OmpFileStatsStageWriteUs{0};
+  std::atomic<uint64_t> OmpFileStatsStageWriteFsyncOps{0};
+  std::atomic<uint64_t> OmpFileStatsStageWriteFsyncUs{0};
+  std::atomic<uint64_t> OmpFileStatsStageDirtyFlushUs{0};
+  std::atomic<uint64_t> OmpFileStatsStageDirtyFlushReadUs{0};
   // Write-back staging counters. DirtyBytes is a gauge snapshot at stats
   // print time; the rest are monotonic. Flush counters track write-back
   // flush-to-source events (Task 4 wires the real flush).
