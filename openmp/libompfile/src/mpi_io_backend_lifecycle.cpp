@@ -55,6 +55,18 @@ MPIIOBackend::MPIIOBackend() {
   }
   mpi_provided_thread_level = provided;
   lock_stats_enabled = parseBoolEnv("LIBOMPFILE_OPT_STATS", false);
+  // Fail-safe: the opt-in only engages when MPI actually granted
+  // MPI_THREAD_MULTIPLE. At any lower level concurrent outbound MPI calls from
+  // multiple client threads are illegal and mpp_call_mutex is load-bearing, so
+  // the request is ignored rather than honoured unsafely.
+  mpp_call_lock_bypass =
+      parseBoolEnv("LIBOMPFILE_OPT_MPP_CALL_LOCK_FREE", false) &&
+      provided == MPI_THREAD_MULTIPLE;
+  io_log("libompfile mpp_call_lock_bypass=%d (requested=%d thread_level=%d "
+         "multiple=%d)\n",
+         static_cast<int>(mpp_call_lock_bypass),
+         static_cast<int>(parseBoolEnv("LIBOMPFILE_OPT_MPP_CALL_LOCK_FREE", false)),
+         provided, MPI_THREAD_MULTIPLE);
   io_log("libompfile MPI thread level: provided=%d (SINGLE=%d FUNNELED=%d "
          "SERIALIZED=%d MULTIPLE=%d) externally_initialized=%d "
          "lock_stats_enabled=%d\n",

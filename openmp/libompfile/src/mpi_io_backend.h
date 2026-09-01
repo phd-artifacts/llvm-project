@@ -253,8 +253,17 @@ private:
                      std::atomic<uint64_t> &acquires,
                      std::atomic<uint64_t> &contended,
                      std::atomic<uint64_t> &wait_us,
-                     std::atomic<uint64_t> &hold_us)
-        : mutex_(m), enabled_(enabled), hold_us_(hold_us) {
+                     std::atomic<uint64_t> &hold_us, bool bypass = false)
+        : mutex_(m), enabled_(enabled), bypass_(bypass), hold_us_(hold_us) {
+      // bypass_ still records acquires and hold time, so a bypassed run stays
+      // directly comparable with a locked one; only the mutex is skipped.
+      if (bypass_) {
+        if (enabled_) {
+          acquires.fetch_add(1, std::memory_order_relaxed);
+          hold_start_ = std::chrono::steady_clock::now();
+        }
+        return;
+      }
       if (!enabled_) {
         mutex_.lock();
         return;
@@ -279,7 +288,8 @@ private:
                 std::chrono::steady_clock::now() - hold_start_)
                 .count(),
             std::memory_order_relaxed);
-      mutex_.unlock();
+      if (!bypass_)
+        mutex_.unlock();
     }
     InstrumentedLock(const InstrumentedLock &) = delete;
     InstrumentedLock &operator=(const InstrumentedLock &) = delete;
@@ -287,6 +297,7 @@ private:
   private:
     std::mutex &mutex_;
     bool enabled_;
+    bool bypass_ = false;
     std::atomic<uint64_t> &hold_us_;
     std::chrono::steady_clock::time_point hold_start_;
   };
@@ -298,13 +309,25 @@ private:
                             handle_mutex_wait_us_total,
                             handle_mutex_hold_us_total);
   }
+  // The global outbound-call lock exists because concurrent MPI calls from
+  // several client threads are only legal at MPI_THREAD_MULTIPLE. Measured on
+  // sorgan it is the reason host execution is slower than target execution: the
+  // lanes serialize on it (wait 0 -> 2.15 s once both issue from one rank).
+  // LIBOMPFILE_OPT_MPP_CALL_LOCK_FREE=1 drops it, and only ever takes effect
+  // when MPI actually granted MPI_THREAD_MULTIPLE - otherwise the bypass stays
+  // off no matter what the environment asks for.
   InstrumentedLock instrumentedMppCallLock() const {
     return InstrumentedLock(mpp_call_mutex, lock_stats_enabled,
                             mpp_call_mutex_acquire_count,
                             mpp_call_mutex_contended_count,
                             mpp_call_mutex_wait_us_total,
-                            mpp_call_mutex_hold_us_total);
+                            mpp_call_mutex_hold_us_total,
+                            mpp_call_lock_bypass);
   }
+
+  // Set once at init from LIBOMPFILE_OPT_MPP_CALL_LOCK_FREE and the granted MPI
+  // thread level; never flipped afterwards, so it needs no synchronisation.
+  bool mpp_call_lock_bypass = false;
 
   bool two_phase_batch_in_progress = false;
   bool write_batch_in_progress = false;
