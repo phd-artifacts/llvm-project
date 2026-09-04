@@ -687,6 +687,8 @@ struct ProxyDevice {
     bool FullyPopulated = false;
     bool PopulateInProgress = false;
     bool Invalidated = false;
+    // One watermark flush per entry at a time (LIBOMPFILE_STAGE_FLUSH_COALESCE).
+    bool FlushInProgress = false;
     uint64_t SourceSize = 0;
     bool SourceSizeKnown = false;
     // Write-back dirty-region tracking. DirtyExtents are byte ranges in the
@@ -847,6 +849,8 @@ struct ProxyDevice {
             "LIBOMPFILE_STAGE_DIRTY_WATERMARK_BYTES", 0)),
         OmpFileStageFreshnessGuard(envBoolOrDefault(
             "LIBOMPFILE_STAGE_FRESHNESS_GUARD", true)),
+        OmpFileStageFlushCoalesce(envBoolOrDefault(
+            "LIBOMPFILE_STAGE_FLUSH_COALESCE", false)),
         OmpFileStageLocalHost(getLocalShortHostname()) {
 #ifdef OMPT_SUPPORT
     // Initialize OMPT first
@@ -905,7 +909,8 @@ struct ProxyDevice {
               "stage_root=%s stage_class=%s shared_storage_path=%s "
               "shared_storage_class=%s storage_environment=%s "
               "stage_sync_policy=%s stage_write_mode=%s "
-              "stage_freshness_guard=%d stage_populate_mode=%s "
+              "stage_freshness_guard=%d stage_flush_coalesce=%d "
+              "stage_populate_mode=%s "
               "stage_window_bytes=%llu stage_window_scale=%.3f "
               "stage_effective_window_bytes=%llu "
               "stage_dirty_watermark_bytes=%llu "
@@ -932,6 +937,7 @@ struct ProxyDevice {
                OmpFileStageSyncPolicy.c_str(),
                OmpFileStageWriteMode.c_str(),
                static_cast<int>(OmpFileStageFreshnessGuard),
+               static_cast<int>(OmpFileStageFlushCoalesce),
                OmpFileStagePopulateMode.c_str(),
                static_cast<unsigned long long>(OmpFileStageWindowBytes),
                OmpFileStageWindowScale,
@@ -3770,9 +3776,38 @@ struct ProxyDevice {
 
       if (OmpFileStageDirtyWatermarkBytes > 0 &&
           DirtyBytes >= OmpFileStageDirtyWatermarkBytes) {
-        if (!flushDirtyRangesToSource(*HeldStageEntry, Fd, SourcePath)) {
-          ErrnoOut = EIO;
-          return false;
+        // LIBOMPFILE_STAGE_FLUSH_COALESCE=1: one watermark flush per entry
+        // at a time. flushDirtyRangesToSource flushes every dirty range of
+        // the entry, so when several writers cross the watermark together
+        // (concurrent kernels on one proxy) the second and later flushes
+        // re-read the same ranges and queue behind the source fdatasync for
+        // nothing: sorgan 91 shows 30 flushes and 9.0 s of flush time at
+        // P=8 with four handler threads where one thread needs 15 and
+        // 2.0 s. A writer that finds a flush in progress leaves its bytes
+        // dirty for the next watermark crossing or for close, which flushes
+        // everything, so durability at close is unchanged.
+        bool RunFlush = true;
+        if (OmpFileStageFlushCoalesce) {
+          std::lock_guard<std::mutex> EntryLock(HeldStageEntry->Mutex);
+          if (HeldStageEntry->FlushInProgress) {
+            RunFlush = false;
+            OmpFileStatsStageDirtyFlushCoalesced.fetch_add(
+                1, std::memory_order_relaxed);
+          } else {
+            HeldStageEntry->FlushInProgress = true;
+          }
+        }
+        if (RunFlush) {
+          const bool FlushOk =
+              flushDirtyRangesToSource(*HeldStageEntry, Fd, SourcePath);
+          if (OmpFileStageFlushCoalesce) {
+            std::lock_guard<std::mutex> EntryLock(HeldStageEntry->Mutex);
+            HeldStageEntry->FlushInProgress = false;
+          }
+          if (!FlushOk) {
+            ErrnoOut = EIO;
+            return false;
+          }
         }
       }
       return true;
@@ -4248,6 +4283,8 @@ struct ProxyDevice {
         OmpFileStatsStageDirtyFlushBytes.load(std::memory_order_relaxed);
     uint64_t StageDirtyFlushFailures =
         OmpFileStatsStageDirtyFlushFailures.load(std::memory_order_relaxed);
+    uint64_t StageDirtyFlushCoalesced =
+        OmpFileStatsStageDirtyFlushCoalesced.load(std::memory_order_relaxed);
     uint64_t StagingEvictions =
         OmpFileStatsStagingEvictions.load(std::memory_order_relaxed);
     uint64_t CoherentReadRefreshes =
@@ -4311,6 +4348,7 @@ struct ProxyDevice {
             "stage_writeback_captures=%llu stage_writeback_capture_bytes=%llu "
             "stage_dirty_bytes=%llu stage_dirty_flushes=%llu "
             "stage_dirty_flush_bytes=%llu stage_dirty_flush_failures=%llu "
+            "stage_dirty_flush_coalesced=%llu "
             "staging_write_bypass_count=%llu stage_write_failures=%llu "
             "stage_write_us_total=%llu stage_write_fsync_ops=%llu "
             "stage_write_fsync_us_total=%llu "
@@ -4385,6 +4423,7 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StageDirtyFlushes),
             static_cast<unsigned long long>(StageDirtyFlushBytes),
             static_cast<unsigned long long>(StageDirtyFlushFailures),
+            static_cast<unsigned long long>(StageDirtyFlushCoalesced),
             static_cast<unsigned long long>(StagingWriteBypass),
             static_cast<unsigned long long>(StageWriteFailures),
             static_cast<unsigned long long>(StageWriteUs),
@@ -4452,6 +4491,7 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StageDirtyFlushes),
             static_cast<unsigned long long>(StageDirtyFlushBytes),
             static_cast<unsigned long long>(StageDirtyFlushFailures),
+            static_cast<unsigned long long>(StageDirtyFlushCoalesced),
             static_cast<unsigned long long>(StagedWriteUpdates),
             static_cast<unsigned long long>(StagedWriteBytes),
             static_cast<unsigned long long>(StagingWriteBypass),
@@ -7285,6 +7325,7 @@ private:
   uint64_t OmpFileStageEffectiveWindowBytes = 0;
   uint64_t OmpFileStageDirtyWatermarkBytes = 0;
   bool OmpFileStageFreshnessGuard = true;
+  bool OmpFileStageFlushCoalesce = false;
   bool OmpFileTopologyLoaded = false;
   uint64_t OmpFileTopologyEntries = 0;
   std::string OmpFileStageRoot;
@@ -7382,6 +7423,7 @@ private:
   std::atomic<uint64_t> OmpFileStatsStageDirtyFlushes{0};
   std::atomic<uint64_t> OmpFileStatsStageDirtyFlushBytes{0};
   std::atomic<uint64_t> OmpFileStatsStageDirtyFlushFailures{0};
+  std::atomic<uint64_t> OmpFileStatsStageDirtyFlushCoalesced{0};
   std::atomic<uint64_t> OmpFileStatsStagingEvictions{0};
   std::atomic<uint64_t> OmpFileStatsStageFreshnessGuardBypasses{0};
   std::atomic<uint64_t> OmpFileStatsDirtyOwnerForwardReads{0};
