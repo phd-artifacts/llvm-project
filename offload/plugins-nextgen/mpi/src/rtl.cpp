@@ -182,6 +182,25 @@ static MPIOriginEventStatsTy &originEventStats() {
   return *Stats;
 }
 
+// OMPTARGET_MPI_MERGE_SATISFIED_SYNC=1: let a SYNC event that is already
+// satisfied join the range synchronize() is progressing instead of ending
+// it. libomptarget records an event on every new mapping after its submit
+// and, at region end, waits on that event (wait_event -> a SYNC entry)
+// right before the variable's retrieve, so a region's queue reads
+// SYNC, RETRIEVE, SYNC, RETRIEVE, ... and each retrieve is progressed alone,
+// one proxy round trip at a time (AMD 404114: 804 retrieves in 804 ranges
+// at 5 ms each, the largest term of a legacy record). Ranges complete in
+// order, so by the time such a SYNC is reached its recorded event has
+// completed; a SYNC that is not satisfied after one step still ends the
+// range, which keeps the ordering it exists for.
+static bool mpiMergeSatisfiedSyncEnabled() {
+  static const bool Enabled = [] {
+    const char *Raw = std::getenv("OMPTARGET_MPI_MERGE_SATISFIED_SYNC");
+    return Raw && Raw[0] == '1' && Raw[1] == '\0';
+  }();
+  return Enabled;
+}
+
 static std::mutex &getOmpfileMppMutex() {
   static std::mutex *Mutex = new std::mutex();
   return *Mutex;
@@ -1344,15 +1363,39 @@ struct MPIPluginTy : public GenericPluginTy {
     while (EventIt != Queue->end()) {
       CurrentEventType = EventIt->getEventType();
 
-      // Find the first event that differs in type from the current Event
-      auto EventRangeEnd = std::find_if(
-          EventIt, Queue->end(), [CurrentEventType](const EventTy &Event) {
-            return Event.getEventType() != CurrentEventType;
-          });
+      // Find the first event that differs in type from the current Event.
+      // With OMPTARGET_MPI_MERGE_SATISFIED_SYNC a SYNC whose recorded event
+      // has already completed is stepped once here and, once done, skipped
+      // over so the range continues with the next event of the same type.
+      auto EventRangeEnd = EventIt;
+      const bool MergeSync = mpiMergeSatisfiedSyncEnabled() &&
+                             CurrentEventType != EventTypeTy::SYNC;
+      while (EventRangeEnd != Queue->end()) {
+        const EventTypeTy Type = EventRangeEnd->getEventType();
+        if (Type == CurrentEventType) {
+          ++EventRangeEnd;
+          continue;
+        }
+        if (MergeSync && Type == EventTypeTy::SYNC) {
+          if (!EventRangeEnd->done())
+            EventRangeEnd->resume();
+          if (EventRangeEnd->done()) {
+            if (auto Error = EventRangeEnd->getError(); Error) {
+              REPORT("Event failed during synchronization. %s\n",
+                     toString(std::move(Error)).c_str());
+              return OFFLOAD_FAIL;
+            }
+            ++EventRangeEnd;
+            continue;
+          }
+        }
+        break;
+      }
 
       std::list<MPIEventQueue::iterator> PendingEvents;
       for (auto It = EventIt; It != EventRangeEnd; ++It) {
-        PendingEvents.push_back(It);
+        if (!It->done())
+          PendingEvents.push_back(It);
       }
       const uint64_t RangeEvents = PendingEvents.size();
       const uint64_t RangeT0 = mpiEventStatsEnabled() ? mpiNowUs() : 0;
