@@ -132,6 +132,67 @@ double envDoubleOrDefault(const char *Name, double DefaultValue) {
   return Parsed;
 }
 
+// OMPTARGET_MPI_PROXY_EVENT_STATS=1: per-event-type wall time on the proxy,
+// from the gate thread creating an event to the handler thread seeing it
+// done, split into the wait for the first resume (queue time) and the rest
+// (service time), with the number of handler resumes it took. Printed with
+// the OMPFile stats as "proxy_event_stats" lines. The origin-side twin is
+// OMPTARGET_MPI_EVENT_STATS in rtl.cpp.
+static bool proxyEventStatsEnabled() {
+  static const bool Enabled = [] {
+    const char *Raw = std::getenv("OMPTARGET_MPI_PROXY_EVENT_STATS");
+    return Raw && Raw[0] == '1' && Raw[1] == '\0';
+  }();
+  return Enabled;
+}
+
+static inline uint64_t proxyNowUs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+struct ProxyEventStatsTy {
+  static constexpr size_t kTypes = 96;
+  std::atomic<uint64_t> Count[kTypes];
+  std::atomic<uint64_t> QueueUs[kTypes];
+  std::atomic<uint64_t> ServiceUs[kTypes];
+  std::atomic<uint64_t> MaxTotalUs[kTypes];
+  std::atomic<uint64_t> Resumes[kTypes];
+
+  ProxyEventStatsTy() {
+    for (size_t I = 0; I < kTypes; ++I) {
+      Count[I] = 0;
+      QueueUs[I] = 0;
+      ServiceUs[I] = 0;
+      MaxTotalUs[I] = 0;
+      Resumes[I] = 0;
+    }
+  }
+
+  void add(EventTypeTy Type, uint64_t Queue, uint64_t Service,
+           uint32_t ResumeCount) {
+    const size_t I = static_cast<size_t>(Type);
+    if (I >= kTypes)
+      return;
+    Count[I].fetch_add(1, std::memory_order_relaxed);
+    QueueUs[I].fetch_add(Queue, std::memory_order_relaxed);
+    ServiceUs[I].fetch_add(Service, std::memory_order_relaxed);
+    Resumes[I].fetch_add(ResumeCount, std::memory_order_relaxed);
+    const uint64_t Total = Queue + Service;
+    uint64_t Prev = MaxTotalUs[I].load(std::memory_order_relaxed);
+    while (Total > Prev && !MaxTotalUs[I].compare_exchange_weak(
+                               Prev, Total, std::memory_order_relaxed))
+      ;
+  }
+};
+
+static ProxyEventStatsTy &proxyEventStats() {
+  static ProxyEventStatsTy *Stats = new ProxyEventStatsTy();
+  return *Stats;
+}
+
 bool envBoolOrDefault(const char *Name, bool DefaultValue) {
   const char *Value = std::getenv(Name);
   if (!Value || Value[0] == '\0')
@@ -4162,7 +4223,35 @@ struct ProxyDevice {
     OmpFileStageEntries.clear();
   }
 
+  void reportProxyEventStats(const char *Scope) {
+    if (!proxyEventStatsEnabled())
+      return;
+    ProxyEventStatsTy &S = proxyEventStats();
+    for (size_t I = 0; I < ProxyEventStatsTy::kTypes; ++I) {
+      const uint64_t N = S.Count[I].load(std::memory_order_relaxed);
+      if (N == 0)
+        continue;
+      const uint64_t Q = S.QueueUs[I].load(std::memory_order_relaxed);
+      const uint64_t V = S.ServiceUs[I].load(std::memory_order_relaxed);
+      REPORT("MPIProxyDevice --> proxy_event_stats rank=%d scope=%s type=%s "
+             "events=%llu queue_us=%llu service_us=%llu max_total_us=%llu "
+             "resumes=%llu avg_queue_us=%.1f avg_service_us=%.1f\n",
+             EventSystem.LocalRank, Scope,
+             EventTypeToString(static_cast<EventTypeTy>(I)).c_str(),
+             static_cast<unsigned long long>(N),
+             static_cast<unsigned long long>(Q),
+             static_cast<unsigned long long>(V),
+             static_cast<unsigned long long>(
+                 S.MaxTotalUs[I].load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(
+                 S.Resumes[I].load(std::memory_order_relaxed)),
+             static_cast<double>(Q) / static_cast<double>(N),
+             static_cast<double>(V) / static_cast<double>(N));
+    }
+  }
+
   void reportOmpFileStats(const char *Scope) {
+    reportProxyEventStats(Scope);
     if (!OmpFileOptStats)
       return;
 
@@ -7004,11 +7093,32 @@ struct ProxyDevice {
         continue;
       }
 
+      const bool Stats = proxyEventStatsEnabled();
+      if (Stats) {
+        auto &Promise = Event.getHandle().promise();
+        if (Promise.StatFirstResumeUs == 0)
+          Promise.StatFirstResumeUs = proxyNowUs();
+        ++Promise.StatResumes;
+      }
+
       Event.resume();
 
       if (!Event.done()) {
         Queue.push(std::move(Event));
         continue;
+      }
+
+      if (Stats) {
+        auto &Promise = Event.getHandle().promise();
+        if (Promise.StatCreatedUs != 0) {
+          const uint64_t Now = proxyNowUs();
+          const uint64_t First = Promise.StatFirstResumeUs
+                                     ? Promise.StatFirstResumeUs
+                                     : Promise.StatCreatedUs;
+          proxyEventStats().add(Event.getEventType(),
+                                First - Promise.StatCreatedUs, Now - First,
+                                Promise.StatResumes);
+        }
       }
 
       auto Error = Event.getError();
@@ -7224,6 +7334,17 @@ struct ProxyDevice {
       case SYNC:
         assert(false && "Trying to create a local event on a remote node");
       }
+
+      // Label the event with the type it was created from. The coroutine
+      // promise defaults every event to SYNC (that default is meant for the
+      // origin's locally created sync events), and the gate thread never
+      // overrode it, so on the proxy getEventType() always answered SYNC.
+      // Nothing depended on it before the per-type timing below.
+      if (!NewEvent.empty())
+        NewEvent.setEventType(NewEventType);
+
+      if (proxyEventStatsEnabled() && !NewEvent.empty())
+        NewEvent.getHandle().promise().StatCreatedUs = proxyNowUs();
 
       if (NewEventType == LAUNCH_KERNEL) {
         EventSystem.ExecEventQueue.push(std::move(NewEvent));

@@ -503,6 +503,12 @@ struct EventTy {
     /// Indicates if the coroutine was completed successfully. Contains the
     /// appropriate error otherwise.
     std::optional<llvm::Error> CoroutineError;
+    /// Proxy-side timing (OMPTARGET_MPI_PROXY_EVENT_STATS): when the gate
+    /// thread created the event, when a handler first resumed it, and how
+    /// many resumes it took. Zero and unused unless the proxy fills them.
+    uint64_t StatCreatedUs = 0;
+    uint64_t StatFirstResumeUs = 0;
+    uint32_t StatResumes = 0;
 
     promise_type() : CoroutineError(std::nullopt) {
       PrevHandle = RootHandle = CoHandleTy::from_promise(*this);
