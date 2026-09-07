@@ -291,6 +291,19 @@ struct OmpFileDirtyOwnerPreadBatchReplySegment {
 
 std::string EventTypeToString(EventTypeTy eventType);
 
+// Aggregate local-clock phase durations, never cross-process timestamps.
+// Disabled unless OMPTARGET_MPI_TRANSFER_STATS=1. No MPI in destruction.
+struct RetrieveTimingTy {
+  bool Enabled;
+  bool Proxy;
+  uint64_t PreviousUs = 0;
+  uint64_t Durations[3] = {};
+  unsigned Phases = 0;
+  explicit RetrieveTimingTy(bool IsProxy);
+  void mark(unsigned Phase);
+  ~RetrieveTimingTy();
+};
+
 enum class OmpFileIOOp : uint32_t {
   OPEN = 0,
   CLOSE = 1,

@@ -146,6 +146,29 @@ static bool proxyEventStatsEnabled() {
   return Enabled;
 }
 
+// OMPTARGET_MPI_PROXY_EVENT_SPIN=<n>: how many extra times a handler thread
+// may resume an unfinished event in place before returning it to the queue.
+// 0 (default) is the historical behaviour: one resume per queue rotation.
+// Each rotation costs a mutex, a condition-variable notify and a pop, and a
+// small RETRIEVE needs hundreds of them (AMD 405038: 428 resumes per event
+// against 18 for a SUBMIT of the same size, because the proxy's sends
+// complete only once the origin posts the matching receives). Spinning in
+// place trades fairness between concurrent events for that per-poll cost,
+// which is why it is bounded and opt-in.
+static unsigned proxyEventSpin() {
+  static const unsigned Spin = [] {
+    const char *Raw = std::getenv("OMPTARGET_MPI_PROXY_EVENT_SPIN");
+    if (!Raw || !Raw[0])
+      return 0u;
+    char *End = nullptr;
+    const long Value = std::strtol(Raw, &End, 10);
+    if (!End || *End != '\0' || Value <= 0)
+      return 0u;
+    return static_cast<unsigned>(Value > 4096 ? 4096 : Value);
+  }();
+  return Spin;
+}
+
 static inline uint64_t proxyNowUs() {
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
@@ -910,6 +933,14 @@ struct ProxyDevice {
             "LIBOMPFILE_STAGE_DIRTY_WATERMARK_BYTES", 0)),
         OmpFileStageFreshnessGuard(envBoolOrDefault(
             "LIBOMPFILE_STAGE_FRESHNESS_GUARD", true)),
+        // Stays off by default. Coalescing concurrent watermark flushes is
+        // a large win only where the source filesystem's fdatasync is
+        // expensive: on sorgan's NFS it is a strict improvement at every
+        // measured point (119, 125: 1.05x at P=2 with one handler thread,
+        // up to 1.94x at P=8 with four, source fsyncs 12-35 -> 9 for 72
+        // tiles), while on AMD's wekafs, where those commits are nearly
+        // free, it measures 0.94x-1.01x (405094). A default that helps one
+        // cluster and costs the other is a per-lane choice, not a default.
         OmpFileStageFlushCoalesce(envBoolOrDefault(
             "LIBOMPFILE_STAGE_FLUSH_COALESCE", false)),
         OmpFileStageLocalHost(getLocalShortHostname()) {
@@ -1334,14 +1365,22 @@ struct ProxyDevice {
   }
 
   EventTy retrieve(MPIRequestManagerTy RequestManager) {
+    RetrieveTimingTy Timing(true);
     void *TgtPtr = nullptr, *HstAsyncInfoPtr = nullptr;
     int64_t Size = 0;
     bool DeviceOpStatus = true;
 
     RequestManager.receive(&HstAsyncInfoPtr, sizeof(void *), MPI_BYTE);
 
-    if (auto Error = co_await RequestManager; Error)
-      co_return Error;
+    // These fields are independent and sent in order on the same MPI tag.
+    // Posting them together removes one header-progress dependency without
+    // changing the wire format or the device-status/payload error protocol.
+    static const bool EarlyHeader = envBoolOrDefault(
+        "OMPTARGET_MPI_RETRIEVE_EARLY_HEADER", false);
+    if (!EarlyHeader) {
+      if (auto Error = co_await RequestManager; Error)
+        co_return Error;
+    }
 
     RequestManager.receive(&TgtPtr, sizeof(void *), MPI_BYTE);
     RequestManager.receive(&Size, 1, MPI_INT64_T);
@@ -1349,6 +1388,7 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
+    Timing.mark(0);
     int32_t PluginId, DeviceId;
 
     std::tie(PluginId, DeviceId) =
@@ -1376,12 +1416,16 @@ struct ProxyDevice {
     if (!DeviceOpStatus)
       co_return (co_await RequestManager);
 
+    Timing.mark(1);
     RequestManager.sendInBatchs(DataHandler.HstPtr, Size);
 
     // Event completion notification
     RequestManager.send(nullptr, 0, MPI_BYTE);
 
-    co_return (co_await RequestManager);
+    auto Error = co_await RequestManager;
+    if (!Error)
+      Timing.mark(2);
+    co_return Error;
   }
 
   EventTy exchange(MPIRequestManagerTy RequestManager) {
@@ -7102,6 +7146,11 @@ struct ProxyDevice {
       }
 
       Event.resume();
+
+      // Bounded in-place retry (OMPTARGET_MPI_PROXY_EVENT_SPIN), so an event
+      // waiting on its counterpart does not pay a queue rotation per poll.
+      for (unsigned Spin = proxyEventSpin(); Spin > 0 && !Event.done(); --Spin)
+        Event.resume();
 
       if (!Event.done()) {
         Queue.push(std::move(Event));

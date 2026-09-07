@@ -111,6 +111,37 @@ std::string EventTypeToString(EventTypeTy eventType) {
 
 namespace {
 
+uint64_t transferNowUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct RetrievePhaseStats {
+  std::atomic<uint64_t> Count[2] = {};
+  std::atomic<uint64_t> Time[2][3] = {};
+  ~RetrievePhaseStats() {
+    for (unsigned Side = 0; Side < 2; ++Side) {
+      const auto N = Count[Side].load(std::memory_order_relaxed);
+      if (!N)
+        continue;
+      fprintf(stderr, "[mpi-plugin] retrieve_phase_stats side=%s count=%llu "
+                      "%s=%llu %s=%llu %s=%llu\n",
+              Side ? "proxy" : "origin", (unsigned long long)N,
+              Side ? "header_wait_us" : "status_wait_us",
+              (unsigned long long)Time[Side][0].load(std::memory_order_relaxed),
+              Side ? "device_wait_us" : "payload_post_us",
+              (unsigned long long)Time[Side][1].load(std::memory_order_relaxed),
+              Side ? "send_wait_us" : "payload_wait_us",
+              (unsigned long long)Time[Side][2].load(std::memory_order_relaxed));
+    }
+  }
+};
+
+RetrievePhaseStats &retrievePhaseStats() {
+  static RetrievePhaseStats Stats;
+  return Stats;
+}
+
 bool ompfileTraceEnabled() {
   static const bool Enabled = []() {
     const char *Env = std::getenv("LIBOMPFILE_DEBUG_TRACE");
@@ -190,6 +221,38 @@ void configureCommErrhandlerForDebug(MPI_Comm Comm, const char *Label) {
 }
 
 } // namespace
+
+RetrieveTimingTy::RetrieveTimingTy(bool IsProxy) : Proxy(IsProxy) {
+  static const bool StatsEnabled = [] {
+    const char *Value = std::getenv("OMPTARGET_MPI_TRANSFER_STATS");
+    return Value && std::strcmp(Value, "1") == 0;
+  }();
+  Enabled = StatsEnabled;
+  if (Enabled) {
+    (void)retrievePhaseStats();
+    PreviousUs = transferNowUs();
+  }
+}
+
+void RetrieveTimingTy::mark(unsigned Phase) {
+  assert(Phase < 3);
+  if (!Enabled)
+    return;
+  const uint64_t Now = transferNowUs();
+  Durations[Phase] = Now - PreviousUs;
+  PreviousUs = Now;
+  Phases |= 1u << Phase;
+}
+
+RetrieveTimingTy::~RetrieveTimingTy() {
+  if (!Enabled || Phases != 7)
+    return;
+  auto &Stats = retrievePhaseStats();
+  Stats.Count[Proxy].fetch_add(1, std::memory_order_relaxed);
+  for (unsigned Phase = 0; Phase < 3; ++Phase)
+    Stats.Time[Proxy][Phase].fetch_add(Durations[Phase],
+                                      std::memory_order_relaxed);
+}
 
 /// Resumes the most recent incomplete coroutine in the list.
 void EventTy::resume() {
@@ -681,6 +744,7 @@ EventTy submit(MPIRequestManagerTy RequestManager, void *TgtPtr,
 
 EventTy retrieve(MPIRequestManagerTy RequestManager, int64_t Size, void *HstPtr,
                  void *TgtPtr, __tgt_async_info *AsyncInfoPtr) {
+  RetrieveTimingTy Timing(false);
   bool DeviceOpStatus = true;
 
   RequestManager.send(&AsyncInfoPtr, sizeof(void *), MPI_BYTE);
@@ -696,12 +760,17 @@ EventTy retrieve(MPIRequestManagerTy RequestManager, int64_t Size, void *HstPtr,
   if (!DeviceOpStatus)
     co_return createError("Failed to retrieve %p TgtPtr.", TgtPtr);
 
+  Timing.mark(0);
   RequestManager.receiveInBatchs(HstPtr, Size);
 
   // Event completion notification
   RequestManager.receive(nullptr, 0, MPI_BYTE);
 
-  co_return (co_await RequestManager);
+  Timing.mark(1);
+  auto Error = co_await RequestManager;
+  if (!Error)
+    Timing.mark(2);
+  co_return Error;
 }
 
 EventTy localExchange(MPIRequestManagerTy RequestManager, void *SrcPtr,
