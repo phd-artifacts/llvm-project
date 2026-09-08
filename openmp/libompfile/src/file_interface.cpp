@@ -725,6 +725,8 @@ public:
       return -1;
     pending_[task.handle]++;
     queue_.push_back(std::move(task));
+    ++enqueued_;
+    max_queue_depth_ = std::max(max_queue_depth_, queue_.size());
     has_work_.notify_one();
     return 0;
   }
@@ -748,10 +750,16 @@ public:
 
   // Waits until the whole queue has drained and the worker is idle.
   int drain() {
+    const auto start = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(mtx_);
     if (!worker_started_)
       return sticky_error_;
+    ++drain_calls_;
     idle_.wait(lock, [&] { return queue_.empty() && !busy_; });
+    drain_wait_ns_ += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
     return sticky_error_;
   }
 
@@ -764,6 +772,13 @@ public:
     }
     if (worker_.joinable())
       worker_.join();
+    if (envFlagEnabled("LIBOMPFILE_ASYNC_TRACE"))
+      io_log("Async IO stats: enqueued=%llu completed=%llu "
+             "max_queue_depth=%zu drain_calls=%llu drain_wait_ns=%llu\n",
+             static_cast<unsigned long long>(enqueued_),
+             static_cast<unsigned long long>(completed_), max_queue_depth_,
+             static_cast<unsigned long long>(drain_calls_),
+             static_cast<unsigned long long>(drain_wait_ns_));
   }
 
 private:
@@ -823,6 +838,7 @@ private:
         pending_.erase(it);
       if (rc != 0 && sticky_error_ == 0)
         sticky_error_ = rc;
+      ++completed_;
       handle_done_.notify_all();
       idle_.notify_all();
     }
@@ -844,6 +860,11 @@ private:
   bool busy_ = false;
   bool stop_ = false;
   int sticky_error_ = 0;
+  uint64_t enqueued_ = 0;
+  uint64_t completed_ = 0;
+  size_t max_queue_depth_ = 0;
+  uint64_t drain_calls_ = 0;
+  uint64_t drain_wait_ns_ = 0;
 };
 
 class OmpFileClientContext {
