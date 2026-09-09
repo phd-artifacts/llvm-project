@@ -46,6 +46,10 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
                          size_t size, int async,
                          const omp_file_io_hint_v1 *hint);
 
+// Wait for async writes queued for this handle without draining unrelated
+// handles. Returns zero when all writes for the handle have completed.
+int omp_file_flush(int file_handle);
+
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,
                    int async);
 

@@ -4613,7 +4613,8 @@ struct ProxyDevice {
             "MPIProxyDevice --> OMPFile writeback stats [%s] rank=%d "
             "stage_write_mode=%s captures=%llu capture_bytes=%llu "
             "dirty_bytes=%llu dirty_flushes=%llu dirty_flush_bytes=%llu "
-            "dirty_flush_failures=%llu staged_write_updates=%llu "
+            "dirty_flush_failures=%llu dirty_flush_coalesced=%llu "
+            "staged_write_updates=%llu "
             "staged_write_bytes=%llu write_bypass_count=%llu "
             "write_failures=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,

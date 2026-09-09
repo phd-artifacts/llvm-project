@@ -1083,6 +1083,8 @@ public:
     return io_scheduler->seek(file_handle, offset);
   }
 
+  int flushFile(int file_handle) { return async_engine.flushHandle(file_handle); }
+
   int writeFileAt(int file_handle, const void *data, size_t size, long offset) {
     IOResourceGuard guard(io_resource_token);
     return io_scheduler->writeAt(file_handle, offset, data, size);
@@ -1231,6 +1233,11 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
   auto &ctx = OmpFileClientContext::getInstance();
   return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
                          hint, async != 0);
+}
+
+int omp_file_flush(int file_handle) {
+  auto &ctx = OmpFileClientContext::getInstance();
+  return ctx.flushFile(file_handle);
 }
 
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,
