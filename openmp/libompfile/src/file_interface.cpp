@@ -11,11 +11,14 @@
 #include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <memory>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <thread>
 #include <chrono>
 #include <cstdlib>
@@ -695,6 +698,20 @@ public:
   // Executes one queued task synchronously; returns the backend rc.
   using Executor = std::function<int(const Task &)>;
 
+  // A completion unit the caller can wait on: one handle plus one epoch id
+  // taken from the write's hint. Writes issued without an epoch belong to the
+  // handle alone and are waited on by flushHandle, never by flushEpoch.
+  using EpochKey = std::pair<int, uint64_t>;
+
+  static bool taskHasEpoch(const Task &task) {
+    return task.has_hint &&
+           (task.hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_EPOCH) != 0;
+  }
+
+  static EpochKey taskEpochKey(const Task &task) {
+    return EpochKey{task.handle, task.hint.EpochId};
+  }
+
   AsyncWriteEngine() = default;
   ~AsyncWriteEngine() { shutdown(); }
 
@@ -713,18 +730,34 @@ public:
     return enabled_;
   }
 
-  // Copies and queues a write. Returns 0 on accept, or -1 if a previously
-  // queued async write already failed (sticky) so the caller can stop early.
+  // Copies and queues a write. Returns 0 on accept, or the rc of an earlier
+  // failure *within this write's own completion unit* — its epoch when the
+  // write carries one, otherwise its handle — so the caller can stop early
+  // without an unrelated branch's failure stopping it.
   int enqueue(Task &&task) {
     std::unique_lock<std::mutex> lock(mtx_);
-    if (sticky_error_ != 0)
-      return sticky_error_;
+    // Refuse only writes whose own completion unit already failed: an epoched
+    // write is blocked by its epoch, an un-epoched one by its handle (that is
+    // the scope it can be waited on at). A failure on an unrelated branch must
+    // not stop this one; `drain()` at close still reports engine-wide.
+    const bool has_epoch = taskHasEpoch(task);
+    if (has_epoch) {
+      auto it = epoch_error_.find(taskEpochKey(task));
+      if (it != epoch_error_.end() && it->second != 0)
+        return it->second;
+    } else {
+      auto it = handle_error_.find(task.handle);
+      if (it != handle_error_.end() && it->second != 0)
+        return it->second;
+    }
     startWorkerLocked();
     not_full_.wait(lock,
                    [&] { return queue_.size() < max_depth_ || stop_; });
     if (stop_)
       return -1;
     pending_[task.handle]++;
+    if (has_epoch)
+      pending_epoch_[taskEpochKey(task)]++;
     queue_.push_back(std::move(task));
     ++enqueued_;
     max_queue_depth_ = std::max(max_queue_depth_, queue_.size());
@@ -754,11 +787,32 @@ public:
     return err == handle_error_.end() ? 0 : err->second;
   }
 
-  // Drops the per-handle failure record. Called when a handle is closed so a
-  // recycled file id does not inherit the previous owner's error.
+  // Waits until every queued write tagged with `epoch` on `handle` has
+  // drained, then reports only that epoch's own first failing rc. Writes
+  // issued without an epoch hint are not waited on here — they have no epoch
+  // to belong to, so flushHandle is their boundary.
+  int flushEpoch(int handle, uint64_t epoch) {
+    assert(handle >= 0 && "flushEpoch expects a caller-validated handle");
+    const EpochKey key{handle, epoch};
+    std::unique_lock<std::mutex> lock(mtx_);
+    if (!worker_started_)
+      return 0; // nothing was ever queued, so nothing can be outstanding
+    handle_done_.wait(lock, [&] {
+      auto it = pending_epoch_.find(key);
+      return it == pending_epoch_.end() || it->second == 0;
+    });
+    auto err = epoch_error_.find(key);
+    return err == epoch_error_.end() ? 0 : err->second;
+  }
+
+  // Drops the failure records for a handle and every epoch under it. Called
+  // when a handle is closed so a recycled file id does not inherit the
+  // previous owner's errors.
   void forgetHandle(int handle) {
     std::lock_guard<std::mutex> lock(mtx_);
     handle_error_.erase(handle);
+    eraseHandleRange(pending_epoch_, handle);
+    eraseHandleRange(epoch_error_, handle);
   }
 
   // Waits until the whole queue has drained and the worker is idle.
@@ -822,6 +876,12 @@ private:
     return false;
   }
 
+  // Erases every entry belonging to `handle` from a (handle, epoch) map.
+  template <typename MapTy> static void eraseHandleRange(MapTy &m, int handle) {
+    m.erase(m.lower_bound(EpochKey{handle, 0}),
+            m.upper_bound(EpochKey{handle, UINT64_MAX}));
+  }
+
   void startWorkerLocked() {
     if (worker_started_)
       return;
@@ -849,12 +909,23 @@ private:
       auto it = pending_.find(task.handle);
       if (it != pending_.end() && --it->second == 0)
         pending_.erase(it);
+      const bool has_epoch = taskHasEpoch(task);
+      if (has_epoch) {
+        auto ep = pending_epoch_.find(taskEpochKey(task));
+        if (ep != pending_epoch_.end() && --ep->second == 0)
+          pending_epoch_.erase(ep);
+      }
       if (rc != 0) {
         if (sticky_error_ == 0)
           sticky_error_ = rc;
         int &handle_rc = handle_error_[task.handle];
         if (handle_rc == 0)
           handle_rc = rc;
+        if (has_epoch) {
+          int &epoch_rc = epoch_error_[taskEpochKey(task)];
+          if (epoch_rc == 0)
+            epoch_rc = rc;
+        }
       }
       ++completed_;
       handle_done_.notify_all();
@@ -873,6 +944,10 @@ private:
   // First failing rc per handle; entries are dropped on close (see
   // forgetHandle) so a reused file id starts clean.
   std::unordered_map<int, int> handle_error_;
+  // The same two, keyed by completion unit. Ordered so forgetHandle can erase
+  // a handle's whole epoch range in one pass; both stay small.
+  std::map<EpochKey, uint64_t> pending_epoch_;
+  std::map<EpochKey, int> epoch_error_;
   std::thread worker_;
   std::once_flag available_once_;
   size_t max_depth_ = 2;
@@ -1161,6 +1236,38 @@ public:
     return rc;
   }
 
+  // Same boundary as flushFile, narrowed to the writes tagged with `epoch`.
+  // Same contract: client-side queue completion only, no fsync, no stage
+  // flush. Writes issued without an epoch hint are not waited on here.
+  int flushFileEpoch(int file_handle, uint64_t epoch) {
+    const uint64_t call_id =
+        api_call_id.fetch_add(1, std::memory_order_relaxed);
+    io_trace("ctx=%p call=%llu flushFileEpoch enter file_handle=%d epoch=%llu "
+             "tokens=%d\n",
+             static_cast<void *>(this),
+             static_cast<unsigned long long>(call_id), file_handle,
+             static_cast<unsigned long long>(epoch),
+             io_resource_token.load());
+    if (!isOpenHandle(file_handle)) {
+      io_log("flushFileEpoch: invalid file handle %d\n", file_handle);
+      io_trace("ctx=%p call=%llu flushFileEpoch exit rc=-1 reason=bad-handle\n",
+               static_cast<void *>(this),
+               static_cast<unsigned long long>(call_id));
+      errno = EBADF;
+      return -1;
+    }
+    const int rc = async_engine.flushEpoch(file_handle, epoch);
+    if (rc != 0)
+      io_log("flushFileEpoch: a queued async write failed (rc=%d) for handle "
+             "%d epoch %llu\n",
+             rc, file_handle, static_cast<unsigned long long>(epoch));
+    io_trace("ctx=%p call=%llu flushFileEpoch exit rc=%d tokens=%d\n",
+             static_cast<void *>(this),
+             static_cast<unsigned long long>(call_id), rc,
+             io_resource_token.load());
+    return rc;
+  }
+
   int writeFileAt(int file_handle, const void *data, size_t size, long offset) {
     IOResourceGuard guard(io_resource_token);
     return io_scheduler->writeAt(file_handle, offset, data, size);
@@ -1316,6 +1423,15 @@ int omp_file_flush(int file_handle) {
   auto &ctx = OmpFileClientContext::getInstance();
   const int rc = ctx.flushFile(file_handle);
   io_trace("omp_file_flush api exit rc=%d\n", rc);
+  return rc;
+}
+
+int omp_file_flush_epoch(int file_handle, uint64_t epoch) {
+  io_trace("omp_file_flush_epoch api enter file_handle=%d epoch=%llu\n",
+           file_handle, static_cast<unsigned long long>(epoch));
+  auto &ctx = OmpFileClientContext::getInstance();
+  const int rc = ctx.flushFileEpoch(file_handle, epoch);
+  io_trace("omp_file_flush_epoch api exit rc=%d\n", rc);
   return rc;
 }
 

@@ -64,6 +64,24 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
 // the data.
 int omp_file_flush(int file_handle);
 
+// Feature macro: defined by every runtime whose libompfile exports
+// omp_file_flush_epoch.
+#define OMPFILE_HAVE_FILE_FLUSH_EPOCH 1
+
+// Same boundary as omp_file_flush, narrowed to the writes tagged with this
+// epoch id via omp_file_pwrite_hint's OMPFILE_IO_HINT_HAS_EPOCH. Lets one wave
+// of a task graph complete without waiting for the rest of the handle.
+//
+// Writes issued with no epoch hint belong to the handle alone and are never
+// waited on here; omp_file_flush is their boundary. Returns zero when this
+// epoch has no outstanding queued write and none of its own writes failed;
+// returns the failing write's rc otherwise, or -1 with errno set to EBADF when
+// the handle is not open.
+//
+// Carries the same caveat as omp_file_flush: this is queue completion, not
+// durability or visibility.
+int omp_file_flush_epoch(int file_handle, uint64_t epoch);
+
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,
                    int async);
 
