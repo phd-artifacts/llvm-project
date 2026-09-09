@@ -4609,8 +4609,15 @@ struct ProxyDevice {
             static_cast<unsigned long long>(LocalDisjointReadaheadHits),
             static_cast<unsigned long long>(LocalDisjointReadaheadFills));
 
+    // stats_schema=2 marks the corrected field alignment: the format now
+    // carries dirty_flush_coalesced, so every counter after it lines up with
+    // its own argument. A writeback line with no stats_schema token predates
+    // that fix; in those bundles staged_write_updates, staged_write_bytes and
+    // write_bypass_count are shifted by one and write_failures never printed
+    // StageWriteFailures. Do not compare the two layouts.
     fprintf(stderr,
             "MPIProxyDevice --> OMPFile writeback stats [%s] rank=%d "
+            "stats_schema=2 "
             "stage_write_mode=%s captures=%llu capture_bytes=%llu "
             "dirty_bytes=%llu dirty_flushes=%llu dirty_flush_bytes=%llu "
             "dirty_flush_failures=%llu dirty_flush_coalesced=%llu "

@@ -46,8 +46,22 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
                          size_t size, int async,
                          const omp_file_io_hint_v1 *hint);
 
-// Wait for async writes queued for this handle without draining unrelated
-// handles. Returns zero when all writes for the handle have completed.
+// Feature macro: defined by every runtime whose libompfile exports
+// omp_file_flush. Applications that must also build against older runtime
+// roots should guard their calls with #ifdef OMPFILE_HAVE_FILE_FLUSH.
+#define OMPFILE_HAVE_FILE_FLUSH 1
+
+// Wait for the async writes queued for this handle to leave the client-side
+// queue, without draining unrelated handles. Returns zero when this handle has
+// no outstanding queued write and none of its own writes failed; returns the
+// failing write's rc otherwise, or -1 with errno set to EBADF when the handle
+// is not open.
+//
+// This is a queue-completion boundary, not a durability or visibility
+// boundary: it issues no fsync, and under proxy write-back staging the bytes
+// may still be held in the proxy stage when it returns. Use close (which
+// drains every handle and flushes the stage) when another reader must observe
+// the data.
 int omp_file_flush(int file_handle);
 
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,

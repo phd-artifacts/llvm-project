@@ -15,6 +15,7 @@
 #include <mutex>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 #include <chrono>
 #include <cstdlib>
@@ -736,16 +737,28 @@ public:
     return worker_started_ && (!queue_.empty() || busy_);
   }
 
-  // Waits until every queued write for `handle` has drained.
+  // Waits until every queued write for `handle` has drained, then reports
+  // only that handle's own first failing rc. A failure queued on an unrelated
+  // handle must not be charged here; `drain()` (the close/read/seek join point)
+  // still reports the engine-wide sticky rc.
   int flushHandle(int handle) {
+    assert(handle >= 0 && "flushHandle expects a caller-validated handle");
     std::unique_lock<std::mutex> lock(mtx_);
     if (!worker_started_)
-      return sticky_error_;
+      return 0; // nothing was ever queued, so nothing can be outstanding
     handle_done_.wait(lock, [&] {
       auto it = pending_.find(handle);
       return it == pending_.end() || it->second == 0;
     });
-    return sticky_error_;
+    auto err = handle_error_.find(handle);
+    return err == handle_error_.end() ? 0 : err->second;
+  }
+
+  // Drops the per-handle failure record. Called when a handle is closed so a
+  // recycled file id does not inherit the previous owner's error.
+  void forgetHandle(int handle) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    handle_error_.erase(handle);
   }
 
   // Waits until the whole queue has drained and the worker is idle.
@@ -836,8 +849,13 @@ private:
       auto it = pending_.find(task.handle);
       if (it != pending_.end() && --it->second == 0)
         pending_.erase(it);
-      if (rc != 0 && sticky_error_ == 0)
-        sticky_error_ = rc;
+      if (rc != 0) {
+        if (sticky_error_ == 0)
+          sticky_error_ = rc;
+        int &handle_rc = handle_error_[task.handle];
+        if (handle_rc == 0)
+          handle_rc = rc;
+      }
       ++completed_;
       handle_done_.notify_all();
       idle_.notify_all();
@@ -852,6 +870,9 @@ private:
   std::condition_variable idle_;
   std::deque<Task> queue_;
   std::unordered_map<int, uint64_t> pending_;
+  // First failing rc per handle; entries are dropped on close (see
+  // forgetHandle) so a reused file id starts clean.
+  std::unordered_map<int, int> handle_error_;
   std::thread worker_;
   std::once_flag available_once_;
   size_t max_depth_ = 2;
@@ -876,6 +897,12 @@ private:
   std::atomic<int> io_resource_token;
   std::atomic<uint64_t> api_call_id{1};
   AsyncWriteEngine async_engine;
+  // Handles handed out by a successful open and not yet closed. The scheduler
+  // owns handle lifetime, but flush has no scheduler round trip of its own, so
+  // the client keeps this set to reject unknown/stale ids instead of reporting
+  // "all writes completed" for a file that was never open.
+  std::mutex open_handles_mutex;
+  std::unordered_set<int> open_handles;
 
   // RAII guard for IO resource token
   class IOResourceGuard {
@@ -1029,6 +1056,14 @@ public:
       async_engine.drain();
     IOResourceGuard guard(io_resource_token);
     const int rc = io_scheduler->open(filename);
+    if (rc >= 0) {
+      {
+        std::lock_guard<std::mutex> lock(open_handles_mutex);
+        open_handles.insert(rc);
+      }
+      // A recycled file id must not inherit the previous owner's async rc.
+      async_engine.forgetHandle(rc);
+    }
     io_trace("ctx=%p call=%llu openFile exit rc=%d tokens=%d\n",
              static_cast<void *>(this),
              static_cast<unsigned long long>(call_id), rc,
@@ -1067,6 +1102,13 @@ public:
              async_rc, file_handle);
     IOResourceGuard guard(io_resource_token);
     const int rc = io_scheduler->close(file_handle);
+    if (rc == 0) {
+      {
+        std::lock_guard<std::mutex> lock(open_handles_mutex);
+        open_handles.erase(file_handle);
+      }
+      async_engine.forgetHandle(file_handle);
+    }
     io_trace("ctx=%p call=%llu closeFile exit rc=%d tokens=%d\n",
              static_cast<void *>(this),
              static_cast<unsigned long long>(call_id), rc,
@@ -1083,7 +1125,41 @@ public:
     return io_scheduler->seek(file_handle, offset);
   }
 
-  int flushFile(int file_handle) { return async_engine.flushHandle(file_handle); }
+  bool isOpenHandle(int file_handle) {
+    if (file_handle < 0)
+      return false;
+    std::lock_guard<std::mutex> lock(open_handles_mutex);
+    return open_handles.count(file_handle) != 0;
+  }
+
+  // Completion boundary for async writes queued on one handle. This drains the
+  // client-side queue only: it does not fsync, and under proxy write-back
+  // staging the bytes may still sit in the proxy stage when it returns.
+  int flushFile(int file_handle) {
+    const uint64_t call_id =
+        api_call_id.fetch_add(1, std::memory_order_relaxed);
+    io_trace("ctx=%p call=%llu flushFile enter file_handle=%d tokens=%d\n",
+             static_cast<void *>(this),
+             static_cast<unsigned long long>(call_id), file_handle,
+             io_resource_token.load());
+    if (!isOpenHandle(file_handle)) {
+      io_log("flushFile: invalid file handle %d\n", file_handle);
+      io_trace("ctx=%p call=%llu flushFile exit rc=-1 reason=bad-handle\n",
+               static_cast<void *>(this),
+               static_cast<unsigned long long>(call_id));
+      errno = EBADF;
+      return -1;
+    }
+    const int rc = async_engine.flushHandle(file_handle);
+    if (rc != 0)
+      io_log("flushFile: a queued async write failed (rc=%d) for handle %d\n",
+             rc, file_handle);
+    io_trace("ctx=%p call=%llu flushFile exit rc=%d tokens=%d\n",
+             static_cast<void *>(this),
+             static_cast<unsigned long long>(call_id), rc,
+             io_resource_token.load());
+    return rc;
+  }
 
   int writeFileAt(int file_handle, const void *data, size_t size, long offset) {
     IOResourceGuard guard(io_resource_token);
@@ -1236,8 +1312,11 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
 }
 
 int omp_file_flush(int file_handle) {
+  io_trace("omp_file_flush api enter file_handle=%d\n", file_handle);
   auto &ctx = OmpFileClientContext::getInstance();
-  return ctx.flushFile(file_handle);
+  const int rc = ctx.flushFile(file_handle);
+  io_trace("omp_file_flush api exit rc=%d\n", rc);
+  return rc;
 }
 
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,
