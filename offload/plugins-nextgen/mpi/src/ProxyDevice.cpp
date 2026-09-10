@@ -2285,6 +2285,65 @@ struct ProxyDevice {
     return Entry.DirtyBytes;
   }
 
+  // File-scoped counterpart to flushLocalDirtyTileToSource below: push every
+  // dirty stage range of this file to the source, with no freshness-version
+  // gate and no tile matching.
+  //
+  // The tile-scoped variant exists for the close-time freshness protocol,
+  // which can only act once a write has been freshness-committed and a version
+  // assigned. A commit issued mid-wave has no version yet, so that path
+  // rejects it with EINVAL before it ever looks at the stage - which is what
+  // made omp_file_commit unusable under write-back staging.
+  bool flushLocalDirtyStageForPathKey(uint64_t BasePathKey) {
+    if (BasePathKey == 0) {
+      errno = EINVAL;
+      return false;
+    }
+
+    std::vector<std::shared_ptr<OmpFileStageEntry>> Entries;
+    {
+      const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
+      Entries.reserve(OmpFileStageEntries.size());
+      for (auto &It : OmpFileStageEntries)
+        Entries.push_back(It.second);
+    }
+
+    bool AllOk = true;
+    for (const std::shared_ptr<OmpFileStageEntry> &Entry : Entries) {
+      if (!Entry || Entry->SourcePath.empty())
+        continue;
+      if (OmpFileHeadnodeManager::computePathKeyForPath(Entry->SourcePath) !=
+          BasePathKey)
+        continue;
+
+      // Checked without holding the entry lock across the flush itself, which
+      // takes that lock of its own.
+      bool HasDirty = false;
+      {
+        const std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
+        for (const OmpFileStageExtent &Extent : Entry->DirtyExtents) {
+          if (Extent.End > Extent.Begin) {
+            HasDirty = true;
+            break;
+          }
+        }
+      }
+      if (!HasDirty)
+        continue; // nothing staged for this file; not an error
+
+      const int SourceFd = ::open(Entry->SourcePath.c_str(), O_RDWR);
+      if (SourceFd < 0) {
+        AllOk = false;
+        continue;
+      }
+      if (!flushDirtyRangesToSource(*Entry, SourceFd, Entry->SourcePath))
+        AllOk = false;
+      ::close(SourceFd);
+    }
+
+    return AllOk;
+  }
+
   bool flushLocalDirtyTileToSource(uint64_t TilePathKey, uint64_t Version) {
     if (TilePathKey == 0 || Version == 0) {
       errno = EINVAL;
@@ -5204,6 +5263,14 @@ struct ProxyDevice {
         Reply.SourceRank = EventSystem.LocalRank;
         Reply.FlushedVersion = Request.Version;
       }
+    } else if (Request.Action == 3) {
+      // Commit: flush this rank's dirty stage for the file, version-free.
+      if (!flushLocalDirtyStageForPathKey(Request.PathKey)) {
+        Reply.Status = -1;
+        Reply.Errno = errno != 0 ? errno : EIO;
+      } else {
+        Reply.SourceRank = EventSystem.LocalRank;
+      }
     } else {
       Reply.Status = -1;
       Reply.Errno = EINVAL;
@@ -7807,6 +7874,26 @@ int ompfile_mpp_flush_dirty_tile(uint64_t PathKey, int *SourceRank,
   if (!PD)
     return EHOSTDOWN;
   return PD->mppFlushDirtyTile(PathKey, SourceRank, FlushedVersion);
+}
+
+// Proxy-side counterpart of the origin export in rtl.cpp. libompfile resolves
+// whichever definition its own process provides, and inside a proxy there is no
+// origin plugin to broadcast Action 3 with - nor any need for one, since this
+// process is the one holding the dirty stage. So commit here means "flush my
+// own stage", directly and without the event system.
+//
+// This is the path a commit issued from inside a target region takes, because
+// that region executes on the proxy.
+int ompfile_mpp_commit_stage_path_key(uint64_t PathKey) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return EHOSTDOWN;
+  if (PathKey == 0)
+    return EINVAL;
+  errno = 0;
+  if (!PD->flushLocalDirtyStageForPathKey(PathKey))
+    return errno != 0 ? errno : EIO;
+  return 0;
 }
 
 int ompfile_mpp_poll(uint64_t Token, int *Done) {

@@ -1,6 +1,7 @@
 #include "posix_backend.h"
 
 #include <cassert>
+#include <cerrno>
 #include <fcntl.h>    // O_RDWR, etc.
 #include <mutex>
 #include <sys/stat.h> // S_IRUSR, etc. if needed
@@ -103,6 +104,26 @@ int POSIXIOBackend::close(int file_id) {
 
   io_log("Close completed\n");
 
+  return 0;
+}
+
+int POSIXIOBackend::commit(int file_id) {
+  const std::lock_guard<std::mutex> lock(file_handle_mutex);
+  auto it = file_handle_map.find(file_id);
+  if (it == file_handle_map.end()) {
+    io_log("Error: Invalid file handle %d\n", file_id);
+    errno = EBADF;
+    return -1;
+  }
+
+  // fdatasync rather than fsync: the data and the size metadata needed to read
+  // it back are what a reader needs; timestamps are not.
+  if (::fdatasync(it->second) != 0) {
+    io_log("Error: fdatasync failed for file %d\n", file_id);
+    return -1;
+  }
+
+  io_log("Commit completed for file %d\n", file_id);
   return 0;
 }
 

@@ -24,6 +24,7 @@ public:
   int write(int file_id, const void *data, size_t size) override;
   int read(int file_id, void *data, size_t size) override;
   int close(int file_id) override;
+  int commit(int file_id) override;
   int seek(int file_id, long offset) override;
   int readAt(int file_id, long offset, void *data, size_t size) override;
   int writeAt(int file_id, long offset, const void *data, size_t size) override;

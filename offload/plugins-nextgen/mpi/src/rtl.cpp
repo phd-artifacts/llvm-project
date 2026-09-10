@@ -2394,6 +2394,63 @@ int ompfile_mpp_stage_invalidate_path_key(uint64_t PathKey,
   return FirstErrno;
 }
 
+// Commit: push every proxy's dirty stage for this file to the source now.
+//
+// Deliberately not the flush_dirty_tile protocol above. That one asks the
+// headnode which rank holds the freshest tile and carries a freshness version,
+// which only exists once a write has been freshness-committed - so it cannot
+// serve a commit issued in the middle of a write wave. This broadcasts a
+// version-free stage flush to every worker instead; a rank holding nothing for
+// the file reports success without work.
+int ompfile_mpp_commit_stage_path_key(uint64_t PathKey) {
+  using namespace llvm::omp::target::plugin;
+  if (PathKey == 0)
+    return EINVAL;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return EHOSTDOWN;
+  if (auto Err = Plugin->init())
+    return EHOSTDOWN;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return EHOSTDOWN;
+
+  OmpFileFlushDirtyTileRequest Request{};
+  Request.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
+  Request.Action = 3;
+  Request.PathKey = PathKey;
+
+  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
+  int FirstErrno = 0;
+  for (int Rank = 0; Rank < EventSystem.getNumWorkers(); ++Rank) {
+    OmpFileFlushDirtyTileReply Reply{};
+    EventTy Event = EventSystem.createEvent(
+        OriginEvents::ompfileFlushDirtyTile,
+        EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE, /*DstDeviceID=*/Rank, &Request,
+        &Reply);
+    if (Event.empty()) {
+      if (FirstErrno == 0)
+        FirstErrno = EIO;
+      continue;
+    }
+    Event.wait();
+    if (auto Error = Event.getError()) {
+      if (FirstErrno == 0)
+        FirstErrno = EIO;
+      continue;
+    }
+    if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+      if (FirstErrno == 0)
+        FirstErrno = EPROTO;
+      continue;
+    }
+    if (Reply.Status != 0 && FirstErrno == 0)
+      FirstErrno = Reply.Errno != 0 ? Reply.Errno : EIO;
+  }
+
+  return FirstErrno;
+}
+
 int ompfile_mpp_freshness_query(const OmpFileFreshnessQueryRequest *Request,
                                 OmpFileFreshnessQueryReply *Reply) {
   using namespace llvm::omp::target::plugin;

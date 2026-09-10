@@ -82,6 +82,25 @@ int omp_file_flush(int file_handle);
 // durability or visibility.
 int omp_file_flush_epoch(int file_handle, uint64_t epoch);
 
+// Feature macro: defined by every runtime whose libompfile exports
+// omp_file_commit.
+#define OMPFILE_HAVE_FILE_COMMIT 1
+
+// Visibility boundary, as opposed to the queue boundary above. When this
+// returns zero, everything written on this handle has reached the source
+// filesystem and another rank, handle or process can observe it: queued async
+// writes are drained, a proxy write-back stage holding the bytes is pushed to
+// the source, and a local backend fdatasyncs the descriptor.
+//
+// Use omp_file_flush when you only need the caller's buffer back, and this
+// when a consumer must read what was written. This one is the expensive call
+// of the pair - it belongs at a phase boundary, not inside a write wave.
+//
+// Returns zero on success, the failing queued write's rc if one of this
+// handle's async writes failed, or -1 with errno set to EBADF when the handle
+// is not open.
+int omp_file_commit(int file_handle);
+
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,
                    int async);
 

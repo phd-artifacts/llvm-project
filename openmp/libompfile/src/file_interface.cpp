@@ -95,6 +95,7 @@ public:
   virtual int write(int file_handle, const void *data, size_t size) = 0;
   virtual int read(int file_handle, void *data, size_t size) = 0;
   virtual int close(int file_handle) = 0;
+  virtual int commit(int file_handle) = 0;
   virtual int seek(int file_handle, long offset) = 0;
   virtual int readAt(int file_handle, long offset, void *data, size_t size) = 0;
   virtual int readAtHint(int file_handle, long offset, void *data, size_t size,
@@ -118,6 +119,7 @@ public:
     return backend.read(file_handle, data, size);
   }
   int close(int file_handle) override { return backend.close(file_handle); }
+  int commit(int file_handle) override { return backend.commit(file_handle); }
   int seek(int file_handle, long offset) override {
     return backend.seek(file_handle, offset);
   }
@@ -233,6 +235,10 @@ public:
       return failStrict("read");
     return backend.read(file_handle, data, size);
   }
+
+  // Commit needs no scheduler round trip: it changes no open/close state and
+  // the backend owns the headnode dirty-tile flush protocol it delegates to.
+  int commit(int file_handle) override { return backend.commit(file_handle); }
 
   int close(int file_handle) override {
     bool schedule_ok = true;
@@ -1268,6 +1274,47 @@ public:
     return rc;
   }
 
+  // Visibility boundary, as opposed to flushFile's queue boundary: when this
+  // returns 0, everything written on this handle has reached the source
+  // filesystem and another reader can observe it. It is deliberately the
+  // expensive one - it drains the handle's queue *and* pushes the proxy stage
+  // to the source - so it belongs at a phase boundary, not inside a write wave.
+  int commitFile(int file_handle) {
+    const uint64_t call_id =
+        api_call_id.fetch_add(1, std::memory_order_relaxed);
+    io_trace("ctx=%p call=%llu commitFile enter file_handle=%d tokens=%d\n",
+             static_cast<void *>(this),
+             static_cast<unsigned long long>(call_id), file_handle,
+             io_resource_token.load());
+    if (!isOpenHandle(file_handle)) {
+      io_log("commitFile: invalid file handle %d\n", file_handle);
+      io_trace("ctx=%p call=%llu commitFile exit rc=-1 reason=bad-handle\n",
+               static_cast<void *>(this),
+               static_cast<unsigned long long>(call_id));
+      errno = EBADF;
+      return -1;
+    }
+    // Queued async writes are part of what the caller means by "what I wrote",
+    // so they have to land before the stage is pushed to the source. A failure
+    // here means the data is incomplete, and committing it would be a lie.
+    const int flush_rc = async_engine.flushHandle(file_handle);
+    if (flush_rc != 0) {
+      io_log("commitFile: a queued async write failed (rc=%d) for handle %d\n",
+             flush_rc, file_handle);
+      io_trace("ctx=%p call=%llu commitFile exit rc=%d reason=queued-write\n",
+               static_cast<void *>(this),
+               static_cast<unsigned long long>(call_id), flush_rc);
+      return flush_rc;
+    }
+    IOResourceGuard guard(io_resource_token);
+    const int rc = io_scheduler->commit(file_handle);
+    io_trace("ctx=%p call=%llu commitFile exit rc=%d tokens=%d\n",
+             static_cast<void *>(this),
+             static_cast<unsigned long long>(call_id), rc,
+             io_resource_token.load());
+    return rc;
+  }
+
   int writeFileAt(int file_handle, const void *data, size_t size, long offset) {
     IOResourceGuard guard(io_resource_token);
     return io_scheduler->writeAt(file_handle, offset, data, size);
@@ -1432,6 +1479,14 @@ int omp_file_flush_epoch(int file_handle, uint64_t epoch) {
   auto &ctx = OmpFileClientContext::getInstance();
   const int rc = ctx.flushFileEpoch(file_handle, epoch);
   io_trace("omp_file_flush_epoch api exit rc=%d\n", rc);
+  return rc;
+}
+
+int omp_file_commit(int file_handle) {
+  io_trace("omp_file_commit api enter file_handle=%d\n", file_handle);
+  auto &ctx = OmpFileClientContext::getInstance();
+  const int rc = ctx.commitFile(file_handle);
+  io_trace("omp_file_commit api exit rc=%d\n", rc);
   return rc;
 }
 

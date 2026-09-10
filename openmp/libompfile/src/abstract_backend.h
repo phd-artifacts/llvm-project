@@ -35,6 +35,12 @@ public:
   }
   virtual int writeAt(int file_id, long offset, const void *data,
                       size_t size) = 0;
+
+  // Make this handle's already-written bytes visible to another reader and
+  // durable on the source filesystem, without closing it. Distinct from the
+  // async queue boundary (`omp_file_flush`), which only drains the client-side
+  // queue and neither fsyncs nor flushes a proxy stage.
+  virtual int commit(int file_id) = 0;
 };
 
 #endif // OMPFILE_ABSTRACT_BACKEND_H

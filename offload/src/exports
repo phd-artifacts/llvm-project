@@ -86,6 +86,7 @@ VERS1.0 {
     ompfile_mpp_proxy_copy_tile;
     ompfile_mpp_freshness_mark_fresh;
     ompfile_mpp_flush_dirty_tile;
+    ompfile_mpp_commit_stage_path_key;
     ompfile_mpp_stage_invalidate_path_key;
     ompfile_mpp_close;
     ompfile_mpp_pread;

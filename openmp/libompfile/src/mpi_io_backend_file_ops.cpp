@@ -200,6 +200,44 @@ int MPIIOBackend::write(int file_id, const void *data, size_t size) {
   return 0;
 }
 
+int MPIIOBackend::commit(int file_id) {
+  uint64_t commit_path_key = 0;
+  {
+    const auto lock = instrumentedHandleLock();
+    if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
+      io_log("Error: Invalid file handle %d\n", file_id);
+      errno = EBADF;
+      return -1;
+    }
+    auto path_key_it = file_path_key_map.find(file_id);
+    if (path_key_it != file_path_key_map.end())
+      commit_path_key = path_key_it->second;
+  }
+
+  // No tracked path key means this handle has no staged identity, so no proxy
+  // stage can be holding its bytes and there is nothing to drain.
+  if (commit_path_key == 0)
+    return 0;
+
+  // Deliberately NOT the flush_dirty_tile protocol that close runs. That one
+  // asks the headnode for the rank holding the freshest tile and carries a
+  // freshness version, which only exists once a write has been
+  // freshness-committed - so it rejects a commit issued mid-wave with EINVAL
+  // before it ever looks at the stage. (Close never noticed because it
+  // discards the result; the proxy's own close handler does the real flush.)
+  // This broadcasts a version-free stage flush instead.
+  if (!ompfile::mpp::commitStagePathKey(commit_path_key)) {
+    io_log("Error: stage commit failed for file %d errno=%d path_key=%llu\n",
+           file_id, errno,
+           static_cast<unsigned long long>(commit_path_key));
+    return -1;
+  }
+
+  io_trace("MPIIOBackend::commit done file_id=%d path_key=%llu\n", file_id,
+           static_cast<unsigned long long>(commit_path_key));
+  return 0;
+}
+
 int MPIIOBackend::close(int file_id) {
   if (strict_mpp_init_failed)
     return failStrictMpp("close");

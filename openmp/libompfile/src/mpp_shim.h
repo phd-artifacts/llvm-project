@@ -57,6 +57,10 @@ bool proxyCopyTile(uint64_t path_key, uint64_t tile_id, int source_rank,
 bool freshnessMarkFresh(uint64_t path_key, int rank, uint64_t version);
 bool flushDirtyTile(uint64_t path_key, int &source_rank_out,
                     uint64_t &flushed_version_out);
+// Version-free stage flush for omp_file_commit: every proxy pushes its dirty
+// stage for this file to the source. Unlike flushDirtyTile this needs no
+// freshness version, so it works mid-wave.
+bool commitStagePathKey(uint64_t path_key);
 bool schedRequest(const ompfile::OmpFileIORequest &request, const char *path,
                   ompfile::OmpFileIOPlan &plan);
 bool schedBatchRequest(

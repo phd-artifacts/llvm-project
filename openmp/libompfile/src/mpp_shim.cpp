@@ -23,6 +23,7 @@ extern "C" int ompfile_mpp_freshness_mark_fresh(uint64_t, int, uint64_t)
     __attribute__((weak));
 extern "C" int ompfile_mpp_flush_dirty_tile(uint64_t, int *, uint64_t *)
     __attribute__((weak));
+extern "C" int ompfile_mpp_commit_stage_path_key(uint64_t) __attribute__((weak));
 
 using MppInitFn = int (*)();
 using MppSubmitFn = int (*)(uint64_t);
@@ -56,6 +57,7 @@ using MppFreshnessWriteCommitFn = int (*)(uint64_t, int, uint64_t, int,
 using MppProxyCopyTileFn = int (*)(uint64_t, uint64_t, int, int, uint64_t);
 using MppFreshnessMarkFreshFn = int (*)(uint64_t, int, uint64_t);
 using MppFlushDirtyTileFn = int (*)(uint64_t, int *, uint64_t *);
+using MppCommitStagePathKeyFn = int (*)(uint64_t);
 using MppSchedRequestFn = int (*)(const ompfile::OmpFileIORequest *,
                                   const char *, ompfile::OmpFileIOPlan *);
 using MppSchedBatchRequestFn = int (*)(const ompfile::OmpFileIOBatchRequest *,
@@ -86,6 +88,7 @@ struct MppApi {
   MppProxyCopyTileFn proxy_copy_tile = nullptr;
   MppFreshnessMarkFreshFn freshness_mark_fresh = nullptr;
   MppFlushDirtyTileFn flush_dirty_tile = nullptr;
+  MppCommitStagePathKeyFn commit_stage_path_key = nullptr;
   MppSchedRequestFn sched_request = nullptr;
   MppSchedBatchRequestFn sched_batch_request = nullptr;
   MppPollFn poll = nullptr;
@@ -138,6 +141,8 @@ MppApi loadMppApi() {
       dlsym(RTLD_DEFAULT, "ompfile_mpp_freshness_mark_fresh"));
   loaded.flush_dirty_tile = reinterpret_cast<MppFlushDirtyTileFn>(
       dlsym(RTLD_DEFAULT, "ompfile_mpp_flush_dirty_tile"));
+  loaded.commit_stage_path_key = reinterpret_cast<MppCommitStagePathKeyFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_commit_stage_path_key"));
   loaded.sched_batch_request =
       reinterpret_cast<MppSchedBatchRequestFn>(dlsym(
           RTLD_DEFAULT, "ompfile_mpp_sched_request_batch"));
@@ -863,6 +868,38 @@ bool flushDirtyTile(uint64_t path_key, int &source_rank_out,
     errno = rc < 0 ? EIO : rc;
     source_rank_out = -1;
     flushed_version_out = 0;
+    return false;
+  }
+  return true;
+}
+
+bool commitStagePathKey(uint64_t path_key) {
+  if (path_key == 0) {
+    errno = EINVAL;
+    return false;
+  }
+
+  if (ompfile_mpp_commit_stage_path_key) {
+    const int rc = ompfile_mpp_commit_stage_path_key(path_key);
+    if (rc != 0) {
+      errno = rc < 0 ? EIO : rc;
+      return false;
+    }
+    return true;
+  }
+
+  if (!init())
+    return false;
+
+  MppApi api = getMppApiReloadIfMissing(&MppApi::commit_stage_path_key);
+  if (!api.commit_stage_path_key) {
+    errno = ENOSYS;
+    return false;
+  }
+
+  const int rc = api.commit_stage_path_key(path_key);
+  if (rc != 0) {
+    errno = rc < 0 ? EIO : rc;
     return false;
   }
   return true;

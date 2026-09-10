@@ -59,6 +59,28 @@ int IoUringIOBackend::open(const char *filename) {
   return file_id;
 }
 
+int IoUringIOBackend::commit(int file_id) {
+  assert(is_initialized && "IoUringIOBackend not initialized");
+  auto it = file_handle_map.find(file_id);
+  if (it == file_handle_map.end()) {
+    io_log("Error: Invalid file handle %d\n", file_id);
+    errno = EBADF;
+    return -1;
+  }
+
+  // Synchronous fdatasync rather than an io_uring FSYNC sqe: commit is a
+  // boundary the caller is already blocking on, so there is nothing to overlap
+  // with, and this keeps the durability path identical to the POSIX backend.
+  if (::fdatasync(it->second.fd) != 0) {
+    io_log("Error: fdatasync failed on fd=%d (%s)\n", it->second.fd,
+           strerror(errno));
+    return -1;
+  }
+
+  io_log("Commit completed for file %d\n", file_id);
+  return 0;
+}
+
 int IoUringIOBackend::close(int file_id) {
   assert(is_initialized && "IoUringIOBackend not initialized");
   auto it = file_handle_map.find(file_id);
