@@ -902,6 +902,12 @@ struct ProxyDevice {
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_COMBINE", 0)),
         OmpFileLocalDisjointReadahead(envUint64OrDefault(
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_READAHEAD", 0)),
+        OmpFileLocalDisjointWriteStreams(envUint64OrDefault(
+            "LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_STREAMS", 1)),
+        OmpFileLocalDisjointStripeMinBytes(envUint64OrDefault(
+            "LIBOMPFILE_OPT_LOCAL_DISJOINT_STRIPE_MIN_BYTES", 16u << 20)),
+        OmpFileLocalDisjointReadStreams(envUint64OrDefault(
+            "LIBOMPFILE_OPT_LOCAL_DISJOINT_READ_STREAMS", 1)),
         OmpFileHeadnodeScheduler(
             envStringOrDefault("LIBOMPFILE_SCHEDULER", "LOCAL") ==
             "HEADNODE"),
@@ -4513,6 +4519,14 @@ struct ProxyDevice {
         OmpFileStatsLocalDisjointReadaheadHits.load(std::memory_order_relaxed);
     uint64_t LocalDisjointReadaheadFills =
         OmpFileStatsLocalDisjointReadaheadFills.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointStripedWrites =
+        OmpFileStatsLocalDisjointStripedWrites.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointStripes =
+        OmpFileStatsLocalDisjointStripes.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointStripedReads =
+        OmpFileStatsLocalDisjointStripedReads.load(std::memory_order_relaxed);
+    uint64_t LocalDisjointReadStripes =
+        OmpFileStatsLocalDisjointReadStripes.load(std::memory_order_relaxed);
     size_t CacheEntries = 0;
 
     {
@@ -4570,7 +4584,10 @@ struct ProxyDevice {
             "local_disjoint_writes=%llu local_disjoint_bytes=%llu local_disjoint_fallbacks=%llu "
             "local_disjoint_reads=%llu local_disjoint_read_bytes=%llu local_disjoint_read_fallbacks=%llu "
             "local_disjoint_combined_writes=%llu local_disjoint_combine_flushes=%llu "
-            "local_disjoint_readahead_hits=%llu local_disjoint_readahead_fills=%llu\n",
+            "local_disjoint_readahead_hits=%llu local_disjoint_readahead_fills=%llu "
+            "local_disjoint_write_streams=%llu local_disjoint_striped_writes=%llu "
+            "local_disjoint_stripes=%llu local_disjoint_read_streams=%llu "
+            "local_disjoint_striped_reads=%llu local_disjoint_read_stripes=%llu\n",
             Scope ? Scope : "unknown", EventSystem.LocalRank,
             static_cast<unsigned long long>(OpenReq),
             static_cast<unsigned long long>(OpenSys),
@@ -4666,7 +4683,13 @@ struct ProxyDevice {
             static_cast<unsigned long long>(LocalDisjointCombinedWrites),
             static_cast<unsigned long long>(LocalDisjointCombineFlushes),
             static_cast<unsigned long long>(LocalDisjointReadaheadHits),
-            static_cast<unsigned long long>(LocalDisjointReadaheadFills));
+            static_cast<unsigned long long>(LocalDisjointReadaheadFills),
+            static_cast<unsigned long long>(OmpFileLocalDisjointWriteStreams),
+            static_cast<unsigned long long>(LocalDisjointStripedWrites),
+            static_cast<unsigned long long>(LocalDisjointStripes),
+            static_cast<unsigned long long>(OmpFileLocalDisjointReadStreams),
+            static_cast<unsigned long long>(LocalDisjointStripedReads),
+            static_cast<unsigned long long>(LocalDisjointReadStripes));
 
     // stats_schema=2 marks the corrected field alignment: the format now
     // carries dirty_flush_coalesced, so every counter after it lines up with
@@ -6470,6 +6493,78 @@ struct ProxyDevice {
   // Attempt the owner-bypass for one pread. Returns true only if the full
   // requested range was read locally; any failure or short read falls back to
   // the forward path (the owner's authoritative handle), fail-closed.
+  // A full-length bypass pread as up to OmpFileLocalDisjointReadStreams
+  // concurrent contiguous stripes (see pwriteStriped; same stripe rule).
+  // Returns false on any error or short read — the caller falls back to the
+  // owner, which is authoritative for in-flight writes and the true size.
+  bool preadStriped(int Fd, int64_t Offset, void *Buffer, uint64_t Size,
+                    uint64_t *BytesReadOut) {
+    uint64_t Streams = OmpFileLocalDisjointReadStreams;
+    if (Streams < 1)
+      Streams = 1;
+    const uint64_t MinStripe =
+        OmpFileLocalDisjointStripeMinBytes > 0 ? OmpFileLocalDisjointStripeMinBytes
+                                               : 1;
+    uint64_t K = Size / MinStripe;
+    if (K > Streams)
+      K = Streams;
+    if (K < 1)
+      K = 1;
+    struct Stripe {
+      int64_t Offset = 0;
+      uint64_t Size = 0;
+      uint64_t Read = 0;
+      bool Ok = true;
+    };
+    std::vector<Stripe> Stripes(static_cast<size_t>(K));
+    const uint64_t Base = Size / K;
+    const uint64_t Rem = Size % K;
+    uint64_t Cursor = 0;
+    for (uint64_t I = 0; I < K; ++I) {
+      Stripes[I].Offset = Offset + static_cast<int64_t>(Cursor);
+      Stripes[I].Size = Base + (I < Rem ? 1 : 0);
+      Cursor += Stripes[I].Size;
+    }
+    auto Run = [&](Stripe &S) {
+      char *Dst = static_cast<char *>(Buffer) +
+                  static_cast<size_t>(S.Offset - Offset);
+      while (S.Read < S.Size) {
+        const ssize_t Bytes =
+            ::pread(Fd, Dst + S.Read, static_cast<size_t>(S.Size - S.Read),
+                    static_cast<off_t>(S.Offset + static_cast<int64_t>(S.Read)));
+        if (Bytes <= 0) {
+          S.Ok = false;
+          return;
+        }
+        S.Read += static_cast<uint64_t>(Bytes);
+      }
+    };
+    if (K == 1) {
+      Run(Stripes[0]);
+    } else {
+      std::vector<std::thread> Threads;
+      Threads.reserve(static_cast<size_t>(K - 1));
+      for (uint64_t I = 1; I < K; ++I)
+        Threads.emplace_back(Run, std::ref(Stripes[I]));
+      Run(Stripes[0]);
+      for (auto &T : Threads)
+        T.join();
+      OmpFileStatsLocalDisjointStripedReads.fetch_add(1,
+                                                      std::memory_order_relaxed);
+      OmpFileStatsLocalDisjointReadStripes.fetch_add(K,
+                                                     std::memory_order_relaxed);
+    }
+    uint64_t Total = 0;
+    for (auto &S : Stripes) {
+      if (!S.Ok)
+        return false;
+      Total += S.Read;
+    }
+    if (BytesReadOut)
+      *BytesReadOut = Total;
+    return true;
+  }
+
   bool tryLocalDisjointPread(const OmpFileHandleEntry &Entry, int64_t Offset,
                              void *Buffer, uint64_t Size,
                              uint64_t *BytesRead) {
@@ -6568,19 +6663,12 @@ struct ProxyDevice {
       // Window allocation failed: fall through to the direct pread loop.
     }
     uint64_t TotalRead = 0;
-    while (TotalRead < Size) {
-      const ssize_t Bytes =
-          ::pread(Fd, static_cast<char *>(Buffer) + TotalRead,
-                  static_cast<size_t>(Size - TotalRead),
-                  static_cast<off_t>(Offset + static_cast<int64_t>(TotalRead)));
-      if (Bytes <= 0) {
-        // Error or EOF-short: the owner's handle is authoritative (it sees
-        // in-flight forwarded writes and the true size) — fall back.
-        OmpFileStatsLocalDisjointReadFallbacks.fetch_add(
-            1, std::memory_order_relaxed);
-        return false;
-      }
-      TotalRead += static_cast<uint64_t>(Bytes);
+    if (!preadStriped(Fd, Offset, Buffer, Size, &TotalRead)) {
+      // Error or EOF-short: the owner's handle is authoritative (it sees
+      // in-flight forwarded writes and the true size) — fall back.
+      OmpFileStatsLocalDisjointReadFallbacks.fetch_add(
+          1, std::memory_order_relaxed);
+      return false;
     }
     if (BytesRead)
       *BytesRead = TotalRead;
@@ -6612,6 +6700,98 @@ struct ProxyDevice {
         ::close(KV.second);
       }
     OmpFileLocalWriteFds.clear();
+  }
+
+  // One bypass pwrite, issued as up to OmpFileLocalDisjointWriteStreams
+  // concurrent contiguous stripes (see the member comment). Stripes below
+  // OmpFileLocalDisjointStripeMinBytes are not worth a thread, so the stripe
+  // count is the largest K <= streams with Size / K >= min; K == 1 is a plain
+  // pwriteFully on the calling thread and is what the default resolves to.
+  // Stats: every physical pwrite counts as a source op; the elapsed time
+  // recorded is the wall of the whole striped op, not the sum over stripes,
+  // so source_pwrite_us_total keeps meaning "time this proxy spent writing".
+  // A stripe that fails reports the first failing errno and the bytes that
+  // did land contiguously from the start, which is what the caller's partial
+  // write semantics expect.
+  bool pwriteStriped(int Fd, int64_t Offset, const void *Buffer, uint64_t Size,
+                     uint64_t *BytesWrittenOut, uint64_t *ElapsedUsOut,
+                     int &ErrnoOut) {
+    uint64_t Streams = OmpFileLocalDisjointWriteStreams;
+    if (Streams < 1)
+      Streams = 1;
+    const uint64_t MinStripe =
+        OmpFileLocalDisjointStripeMinBytes > 0 ? OmpFileLocalDisjointStripeMinBytes
+                                               : 1;
+    uint64_t K = Size / MinStripe;
+    if (K > Streams)
+      K = Streams;
+    if (K <= 1) {
+      const bool Ok = pwriteFully(Fd, Offset, Buffer, Size, BytesWrittenOut,
+                                  ElapsedUsOut, ErrnoOut);
+      recordSourcePwrite(Size, BytesWrittenOut ? *BytesWrittenOut : 0,
+                         ElapsedUsOut ? *ElapsedUsOut : 0);
+      return Ok;
+    }
+
+    struct Stripe {
+      int64_t Offset = 0;
+      uint64_t Size = 0;
+      uint64_t Written = 0;
+      uint64_t ElapsedUs = 0;
+      int Errno = 0;
+      bool Ok = true;
+    };
+    std::vector<Stripe> Stripes(static_cast<size_t>(K));
+    const uint64_t Base = Size / K;
+    const uint64_t Rem = Size % K;
+    uint64_t Cursor = 0;
+    for (uint64_t I = 0; I < K; ++I) {
+      Stripes[I].Offset = Offset + static_cast<int64_t>(Cursor);
+      Stripes[I].Size = Base + (I < Rem ? 1 : 0);
+      Cursor += Stripes[I].Size;
+    }
+    const auto WallStart = std::chrono::steady_clock::now();
+    std::vector<std::thread> Threads;
+    Threads.reserve(static_cast<size_t>(K - 1));
+    auto Run = [&](Stripe &S) {
+      S.Ok = pwriteFully(Fd, S.Offset,
+                         static_cast<const char *>(Buffer) +
+                             static_cast<size_t>(S.Offset - Offset),
+                         S.Size, &S.Written, &S.ElapsedUs, S.Errno);
+    };
+    for (uint64_t I = 1; I < K; ++I)
+      Threads.emplace_back(Run, std::ref(Stripes[I]));
+    Run(Stripes[0]); // the calling thread takes the first stripe
+    for (auto &T : Threads)
+      T.join();
+    const uint64_t WallUs =
+        elapsedMicros(WallStart, std::chrono::steady_clock::now());
+
+    // Contiguous bytes landed from the start; first failure wins.
+    uint64_t Contiguous = 0;
+    bool AllOk = true;
+    ErrnoOut = 0;
+    for (auto &S : Stripes) {
+      if (AllOk)
+        Contiguous += S.Written;
+      if (!S.Ok) {
+        if (AllOk)
+          ErrnoOut = S.Errno;
+        AllOk = false;
+      }
+    }
+    if (BytesWrittenOut)
+      *BytesWrittenOut = Contiguous;
+    if (ElapsedUsOut)
+      *ElapsedUsOut = WallUs;
+    OmpFileStatsSourcePwriteOps.fetch_add(K, std::memory_order_relaxed);
+    OmpFileStatsSourcePwriteBytes.fetch_add(Contiguous,
+                                            std::memory_order_relaxed);
+    OmpFileStatsSourcePwriteUs.fetch_add(WallUs, std::memory_order_relaxed);
+    OmpFileStatsLocalDisjointStripedWrites.fetch_add(1,
+                                                     std::memory_order_relaxed);
+    OmpFileStatsLocalDisjointStripes.fetch_add(K, std::memory_order_relaxed);
+    return AllOk;
   }
 
   // Attempt the owner-bypass for one pwrite. Returns true if the write was
@@ -6696,9 +6876,8 @@ struct ProxyDevice {
     }
     uint64_t Written = 0, ElapsedUs = 0;
     int WriteErrno = 0;
-    const bool WriteOk =
-        pwriteFully(Fd, Offset, Buffer, Size, &Written, &ElapsedUs, WriteErrno);
-    recordSourcePwrite(Size, Written, ElapsedUs);
+    const bool WriteOk = pwriteStriped(Fd, Offset, Buffer, Size, &Written,
+                                       &ElapsedUs, WriteErrno);
     if (!WriteOk) {
       errno = WriteErrno;
       OmpFileStatsLocalDisjointFallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -7538,6 +7717,28 @@ private:
   // flush point (close/sync), like page-cache write-back.
   uint64_t OmpFileLocalDisjointWriteCombine = 0;
   uint64_t OmpFileLocalDisjointReadahead = 0;
+  // Striped bypass writes (LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_STREAMS=K):
+  // one large bypass pwrite is cut into up to K contiguous stripes of at
+  // least STRIPE_MIN_BYTES and issued concurrently from K threads on the
+  // same descriptor. pwrite is positional, so a shared fd is safe, and the
+  // stripes are disjoint by construction. Why it helps is a property of the
+  // storage client, not of this code: on wekafs a file with several writing
+  // clients goes write-through, and one client's bandwidth then scales with
+  // its stream count (~4.2 -> ~6.0 GB/s at four, application/benchmarks/
+  // node-stream-probe, job 415432) where a single stream is the cap. 1 (the
+  // default) is exactly the previous path. Do not raise it on NFS, where the
+  // per-client stream is the cap and more streams only interleave worse.
+  uint64_t OmpFileLocalDisjointWriteStreams = 1;
+  uint64_t OmpFileLocalDisjointStripeMinBytes = 16u << 20;
+  // Read counterpart (LIBOMPFILE_OPT_LOCAL_DISJOINT_READ_STREAMS=K): the same
+  // striping for a large bypass pread, sharing STRIPE_MIN_BYTES. Reads scale
+  // further than writes with streams on wekafs (1.8 -> 5.7 GB/s at four,
+  // ~7 at eight, same probe).
+  uint64_t OmpFileLocalDisjointReadStreams = 1;
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointStripedWrites{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointStripes{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointStripedReads{0};
+  std::atomic<uint64_t> OmpFileStatsLocalDisjointReadStripes{0};
   std::mutex OmpFileLocalWriteBufMutex;
   std::unordered_map<std::string, LocalCoalesceBuf> OmpFileLocalWriteBufs;
   std::mutex OmpFileLocalReadCacheMutex;
