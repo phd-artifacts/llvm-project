@@ -47,6 +47,43 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
                          const omp_file_io_hint_v1 *hint);
 
 // Feature macro: defined by every runtime whose libompfile exports
+// omp_file_pwrite_owned. Guard call sites with
+// #ifdef OMPFILE_HAVE_FILE_PWRITE_OWNED when the app must also build against
+// older runtime roots.
+#define OMPFILE_HAVE_FILE_PWRITE_OWNED 1
+
+// Like omp_file_pwrite with async set, but the runtime takes ownership of
+// `data` instead of copying it: the write runs from the caller's buffer in
+// place, and once it has completed — succeeded or failed — the runtime calls
+// release(data) (free() when release is NULL). The write's own result then
+// surfaces the way every queued write's does, through omp_file_flush,
+// omp_file_flush_epoch, omp_file_commit or omp_file_close on the handle.
+//
+// Ownership follows the return value: zero means the runtime has the buffer
+// and the caller must not touch or free it again; non-zero means nothing was
+// queued, release was not called, and the buffer is still the caller's
+// (errno is EBADF when the handle is not open).
+//
+// The point is the issuing thread: omp_file_pwrite(async=1) spends the
+// payload memcpy on the caller's thread before it can return, which on a
+// target-region issuer competes with the region's own work. This form spends
+// nothing but the enqueue. It fits a buffer that is allocated per write and
+// would be freed right after it anyway.
+//
+// With no async worker available (LIBOMPFILE_ASYNC_DISABLE=1, or an MPI
+// thread level below SERIALIZED) the write runs synchronously under the same
+// rule: released and zero on success, left with the caller on failure.
+int omp_file_pwrite_owned(int file_handle, long offset, void *data,
+                          size_t size, void (*release)(void *));
+
+// The owned form of omp_file_pwrite_hint: same ownership contract, carrying
+// an I/O hint so the write can be tagged with an epoch and waited on with
+// omp_file_flush_epoch.
+int omp_file_pwrite_owned_hint(int file_handle, long offset, void *data,
+                               size_t size, void (*release)(void *),
+                               const omp_file_io_hint_v1 *hint);
+
+// Feature macro: defined by every runtime whose libompfile exports
 // omp_file_flush. Applications that must also build against older runtime
 // roots should guard their calls with #ifdef OMPFILE_HAVE_FILE_FLUSH.
 #define OMPFILE_HAVE_FILE_FLUSH 1

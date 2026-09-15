@@ -698,7 +698,31 @@ public:
     bool has_offset = false; // pwrite when true, sequential write when false
     bool has_hint = false;
     ompfile::OmpFileIOHint hint{};
+    // The payload, one of two ways. `data` is the copy `enqueue` takes on the
+    // omp_file_pwrite path. `owned` is the caller's own buffer on the
+    // omp_file_pwrite_owned path: written from in place, then handed to
+    // `release` once the write has run, so the issuing thread never pays for
+    // a memcpy of the payload. Exactly one of the two carries the bytes.
     std::vector<char> data;
+    void *owned = nullptr;
+    size_t owned_size = 0;
+    void (*release)(void *) = nullptr;
+
+    const void *payload() const { return owned ? owned : data.data(); }
+    size_t payloadSize() const { return owned ? owned_size : data.size(); }
+
+    // Hands an owned buffer back. Called by the worker after the executor
+    // returns (success or failure alike), never under the engine mutex: the
+    // callback is the application's. Not called from the destructor, because
+    // a task that was refused by `enqueue` is still the caller's buffer.
+    void releaseOwned() {
+      if (!owned)
+        return;
+      assert(release && "owned task without a release callback");
+      release(owned);
+      owned = nullptr;
+      owned_size = 0;
+    }
   };
 
   // Executes one queued task synchronously; returns the backend rc.
@@ -764,6 +788,10 @@ public:
     pending_[task.handle]++;
     if (has_epoch)
       pending_epoch_[taskEpochKey(task)]++;
+    if (task.owned) {
+      ++owned_enqueued_;
+      owned_bytes_ += task.owned_size;
+    }
     queue_.push_back(std::move(task));
     ++enqueued_;
     max_queue_depth_ = std::max(max_queue_depth_, queue_.size());
@@ -845,13 +873,24 @@ public:
     }
     if (worker_.joinable())
       worker_.join();
-    if (envFlagEnabled("LIBOMPFILE_ASYNC_TRACE"))
+    // Under LIBOMPFILE_OPT_STATS as well as the trace flag, so a benchmark
+    // lane can assert from its log that the owned (zero-copy) submit engaged.
+    // Once only: shutdown runs from the client context's destructor and again
+    // from this engine's own, and a lane sums the token over the log.
+    if (stats_reported_)
+      return;
+    stats_reported_ = true;
+    if (envFlagEnabled("LIBOMPFILE_ASYNC_TRACE") ||
+        envFlagEnabled("LIBOMPFILE_OPT_STATS"))
       io_log("Async IO stats: enqueued=%llu completed=%llu "
-             "max_queue_depth=%zu drain_calls=%llu drain_wait_ns=%llu\n",
+             "max_queue_depth=%zu drain_calls=%llu drain_wait_ns=%llu "
+             "owned_enqueued=%llu owned_bytes=%llu\n",
              static_cast<unsigned long long>(enqueued_),
              static_cast<unsigned long long>(completed_), max_queue_depth_,
              static_cast<unsigned long long>(drain_calls_),
-             static_cast<unsigned long long>(drain_wait_ns_));
+             static_cast<unsigned long long>(drain_wait_ns_),
+             static_cast<unsigned long long>(owned_enqueued_),
+             static_cast<unsigned long long>(owned_bytes_));
   }
 
 private:
@@ -910,6 +949,10 @@ private:
       not_full_.notify_one();
       lock.unlock();
       const int rc = executor_ ? executor_(task) : -1;
+      // The write has run, so the caller's buffer goes back now — before the
+      // completion is published, so a flush that returns cannot race a
+      // release still in flight.
+      task.releaseOwned();
       lock.lock();
       busy_ = false;
       auto it = pending_.find(task.handle);
@@ -961,9 +1004,12 @@ private:
   bool worker_started_ = false;
   bool busy_ = false;
   bool stop_ = false;
+  bool stats_reported_ = false;
   int sticky_error_ = 0;
   uint64_t enqueued_ = 0;
   uint64_t completed_ = 0;
+  uint64_t owned_enqueued_ = 0;
+  uint64_t owned_bytes_ = 0;
   size_t max_queue_depth_ = 0;
   uint64_t drain_calls_ = 0;
   uint64_t drain_wait_ns_ = 0;
@@ -1056,16 +1102,15 @@ public:
     // path (and token semaphore) a synchronous write would take.
     async_engine.configure([this](const AsyncWriteEngine::Task &task) -> int {
       IOResourceGuard guard(io_resource_token);
+      const void *bytes = task.payload();
+      const size_t size = task.payloadSize();
       if (task.has_offset) {
         if (task.has_hint)
-          return io_scheduler->writeAtHint(task.handle, task.offset,
-                                           task.data.data(), task.data.size(),
-                                           &task.hint);
-        return io_scheduler->writeAt(task.handle, task.offset,
-                                     task.data.data(), task.data.size());
+          return io_scheduler->writeAtHint(task.handle, task.offset, bytes,
+                                           size, &task.hint);
+        return io_scheduler->writeAt(task.handle, task.offset, bytes, size);
       }
-      return io_scheduler->write(task.handle, task.data.data(),
-                                 task.data.size());
+      return io_scheduler->write(task.handle, bytes, size);
     });
 
     io_log("OmpFileClientContext constructor called\n");
@@ -1360,6 +1405,48 @@ public:
     return writeFile(file_handle, data, size);
   }
 
+  // The owned form of submitWrite: no payload copy — the engine writes from
+  // the caller's buffer and hands it to `release` once the write has run.
+  // Ownership follows the return value and nothing else: zero means the
+  // runtime has the buffer (released after the write, whatever its rc, which
+  // then surfaces through flush/close like any queued write); non-zero means
+  // nothing was queued, `release` was not called and the buffer is still the
+  // caller's. Without an async worker the write runs inline under the same
+  // rule: released on success, left with the caller on failure.
+  int submitWriteOwned(int file_handle, long offset, void *data, size_t size,
+                       void (*release)(void *),
+                       const omp_file_io_hint_v1 *hint) {
+    assert(release && "submitWriteOwned expects a resolved release callback");
+    if (!isOpenHandle(file_handle)) {
+      io_log("submitWriteOwned: invalid file handle %d\n", file_handle);
+      errno = EBADF;
+      return -1;
+    }
+    if (async_engine.available()) {
+      AsyncWriteEngine::Task task;
+      task.handle = file_handle;
+      task.offset = offset;
+      task.has_offset = true;
+      if (hint) {
+        task.has_hint = true;
+        applyIoHint(task.hint, hint);
+      }
+      task.owned = data;
+      task.owned_size = size;
+      task.release = release;
+      // A refused task is never moved into the queue, so `data` is untouched
+      // and stays the caller's, as the contract above promises.
+      return async_engine.enqueue(std::move(task));
+    }
+    if (async_engine.active())
+      async_engine.drain();
+    const int rc = hint ? writeFileAtHint(file_handle, data, size, offset, hint)
+                        : writeFileAt(file_handle, data, size, offset);
+    if (rc == 0)
+      release(data);
+    return rc;
+  }
+
   int readFileAt(int file_handle, void *data, size_t size, long offset) {
     const uint64_t call_id =
         api_call_id.fetch_add(1, std::memory_order_relaxed);
@@ -1463,6 +1550,32 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
   auto &ctx = OmpFileClientContext::getInstance();
   return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
                          hint, async != 0);
+}
+
+int omp_file_pwrite_owned(int file_handle, long offset, void *data,
+                          size_t size, void (*release)(void *)) {
+  io_trace("omp_file_pwrite_owned api enter file_handle=%d offset=%ld "
+           "size=%zu\n",
+           file_handle, offset, size);
+  auto &ctx = OmpFileClientContext::getInstance();
+  const int rc = ctx.submitWriteOwned(file_handle, offset, data, size,
+                                      release ? release : &::free,
+                                      /*hint=*/nullptr);
+  io_trace("omp_file_pwrite_owned api exit rc=%d\n", rc);
+  return rc;
+}
+
+int omp_file_pwrite_owned_hint(int file_handle, long offset, void *data,
+                               size_t size, void (*release)(void *),
+                               const omp_file_io_hint_v1 *hint) {
+  io_trace("omp_file_pwrite_owned_hint api enter file_handle=%d offset=%ld "
+           "size=%zu\n",
+           file_handle, offset, size);
+  auto &ctx = OmpFileClientContext::getInstance();
+  const int rc = ctx.submitWriteOwned(file_handle, offset, data, size,
+                                      release ? release : &::free, hint);
+  io_trace("omp_file_pwrite_owned_hint api exit rc=%d\n", rc);
+  return rc;
 }
 
 int omp_file_flush(int file_handle) {
