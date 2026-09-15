@@ -68,6 +68,18 @@ static bool envFlagEnabled(const char *name) {
   return value && value[0] == '1' && value[1] == '\0';
 }
 
+// LIBOMPFILE_ASYNC_READ_WAIT=range: a read (or a synchronous write) waits only
+// for the queued async writes that could cover its own byte range of the same
+// file, instead of draining the whole engine. Off (drain) by default; see the
+// AsyncWriteEngine::waitForRange comment for the contract.
+static bool asyncReadWaitIsRange() {
+  static const bool range = [] {
+    const char *value = std::getenv("LIBOMPFILE_ASYNC_READ_WAIT");
+    return value && std::string(value) == "range";
+  }();
+  return range;
+}
+
 static bool isMppRemoteOnlyEnabled() {
   return MPIIOBackend::parseBoolEnv("LIBOMPFILE_MPP_OPEN", false) &&
          MPIIOBackend::parseBoolEnv("LIBOMPFILE_MPP_IO", false);
@@ -781,8 +793,19 @@ public:
         return it->second;
     }
     startWorkerLocked();
-    not_full_.wait(lock,
-                   [&] { return queue_.size() < max_depth_ || stop_; });
+    if (queue_.size() >= max_depth_ && !stop_) {
+      // Back-pressure: the issuing thread blocks here when the bounded queue
+      // is full, which is the other place (besides drain) where async issue
+      // serializes against the drain; report it so a lane can see which.
+      ++enqueue_waits_;
+      const auto start = std::chrono::steady_clock::now();
+      not_full_.wait(lock,
+                     [&] { return queue_.size() < max_depth_ || stop_; });
+      enqueue_wait_ns_ += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count());
+    }
     if (stop_)
       return -1;
     pending_[task.handle]++;
@@ -849,6 +872,58 @@ public:
     eraseHandleRange(epoch_error_, handle);
   }
 
+  // Range-scoped alternative to drain() for a read or synchronous write of
+  // [offset, offset+size) on a file that `handles` are open on: waits until
+  // no queued or in-flight task on one of those handles could cover that
+  // range, and returns at once when none can. A sequential (no-offset) write
+  // has no known range and always counts. This is the wait a dependency
+  // actually needs — a read of bytes nobody has queued a write to proceeds
+  // while the worker drains unrelated ranges of the same file — and the
+  // engine keeps FIFO order among the writes themselves, so two queued writes
+  // to one range still land in issue order. Opt-in through
+  // LIBOMPFILE_ASYNC_READ_WAIT=range; the caller passes every handle open on
+  // the read's path, since a file open twice is still one file.
+  void waitForRange(const std::vector<int> &handles, long offset,
+                    size_t size) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    if (!worker_started_)
+      return;
+    const auto covers = [&](int handle, bool has_offset, long task_offset,
+                            size_t task_size) {
+      if (std::find(handles.begin(), handles.end(), handle) == handles.end())
+        return false;
+      if (!has_offset)
+        return true; // cursor write: range unknown, be conservative
+      const long lo = task_offset;
+      const long hi = task_offset + static_cast<long>(task_size);
+      return lo < offset + static_cast<long>(size) && offset < hi;
+    };
+    const auto pending = [&] {
+      if (current_.active &&
+          covers(current_.handle, current_.has_offset, current_.offset,
+                 current_.size))
+        return true;
+      for (const Task &t : queue_)
+        if (covers(t.handle, t.has_offset, t.offset, t.payloadSize()))
+          return true;
+      return false;
+    };
+    if (!pending()) {
+      // Counted only when something was outstanding: these are the reads a
+      // drain would have stalled and this wait let through.
+      if (current_.active || !queue_.empty())
+        ++range_wait_free_;
+      return;
+    }
+    ++range_waits_;
+    const auto start = std::chrono::steady_clock::now();
+    handle_done_.wait(lock, [&] { return !pending(); });
+    range_wait_ns_ += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
+  }
+
   // Waits until the whole queue has drained and the worker is idle.
   int drain() {
     const auto start = std::chrono::steady_clock::now();
@@ -884,13 +959,20 @@ public:
         envFlagEnabled("LIBOMPFILE_OPT_STATS"))
       io_log("Async IO stats: enqueued=%llu completed=%llu "
              "max_queue_depth=%zu drain_calls=%llu drain_wait_ns=%llu "
-             "owned_enqueued=%llu owned_bytes=%llu\n",
+             "owned_enqueued=%llu owned_bytes=%llu range_waits=%llu "
+             "range_wait_ns=%llu range_wait_free=%llu enqueue_waits=%llu "
+             "enqueue_wait_ns=%llu\n",
              static_cast<unsigned long long>(enqueued_),
              static_cast<unsigned long long>(completed_), max_queue_depth_,
              static_cast<unsigned long long>(drain_calls_),
              static_cast<unsigned long long>(drain_wait_ns_),
              static_cast<unsigned long long>(owned_enqueued_),
-             static_cast<unsigned long long>(owned_bytes_));
+             static_cast<unsigned long long>(owned_bytes_),
+             static_cast<unsigned long long>(range_waits_),
+             static_cast<unsigned long long>(range_wait_ns_),
+             static_cast<unsigned long long>(range_wait_free_),
+             static_cast<unsigned long long>(enqueue_waits_),
+             static_cast<unsigned long long>(enqueue_wait_ns_));
   }
 
 private:
@@ -946,6 +1028,10 @@ private:
       Task task = std::move(queue_.front());
       queue_.pop_front();
       busy_ = true;
+      // Keep the in-flight task's range visible to waitForRange while it is
+      // no longer in the queue.
+      current_ = {true, task.handle, task.has_offset, task.offset,
+                  task.payloadSize()};
       not_full_.notify_one();
       lock.unlock();
       const int rc = executor_ ? executor_(task) : -1;
@@ -955,6 +1041,7 @@ private:
       task.releaseOwned();
       lock.lock();
       busy_ = false;
+      current_.active = false;
       auto it = pending_.find(task.handle);
       if (it != pending_.end() && --it->second == 0)
         pending_.erase(it);
@@ -989,6 +1076,14 @@ private:
   std::condition_variable handle_done_;
   std::condition_variable idle_;
   std::deque<Task> queue_;
+  struct InFlight {
+    bool active = false;
+    int handle = -1;
+    bool has_offset = false;
+    long offset = 0;
+    size_t size = 0;
+  };
+  InFlight current_;
   std::unordered_map<int, uint64_t> pending_;
   // First failing rc per handle; entries are dropped on close (see
   // forgetHandle) so a reused file id starts clean.
@@ -1013,6 +1108,11 @@ private:
   size_t max_queue_depth_ = 0;
   uint64_t drain_calls_ = 0;
   uint64_t drain_wait_ns_ = 0;
+  uint64_t range_waits_ = 0;
+  uint64_t range_wait_ns_ = 0;
+  uint64_t range_wait_free_ = 0;
+  uint64_t enqueue_waits_ = 0;
+  uint64_t enqueue_wait_ns_ = 0;
 };
 
 class OmpFileClientContext {
@@ -1030,6 +1130,40 @@ private:
   // "all writes completed" for a file that was never open.
   std::mutex open_handles_mutex;
   std::unordered_set<int> open_handles;
+  // The path each open handle was opened with, so a range-scoped wait can
+  // treat every handle on one file as that file (the OOC apps open a path
+  // once per lane). Compared as the strings the app passed; two spellings of
+  // one file are two files here, which errs toward waiting less than a
+  // drain would but never toward a stale read of a range this process wrote
+  // through the same string.
+  std::unordered_map<int, std::string> handle_paths;
+
+  // Every open handle on the same path as `file_handle`, itself included.
+  std::vector<int> sameFileHandles(int file_handle) {
+    std::lock_guard<std::mutex> lock(open_handles_mutex);
+    std::vector<int> out;
+    auto it = handle_paths.find(file_handle);
+    if (it == handle_paths.end()) {
+      out.push_back(file_handle);
+      return out;
+    }
+    for (const auto &entry : handle_paths)
+      if (entry.second == it->second)
+        out.push_back(entry.first);
+    return out;
+  }
+
+  // The wait a read or synchronous write of [offset, offset+size) on
+  // `file_handle` owes the async queue: everything (the historical drain), or
+  // only the queued writes that could cover that range of the same file.
+  void waitForQueuedWrites(int file_handle, long offset, size_t size) {
+    if (!async_engine.active())
+      return;
+    if (asyncReadWaitIsRange())
+      async_engine.waitForRange(sameFileHandles(file_handle), offset, size);
+    else
+      async_engine.drain();
+  }
 
   // RAII guard for IO resource token
   class IOResourceGuard {
@@ -1186,6 +1320,7 @@ public:
       {
         std::lock_guard<std::mutex> lock(open_handles_mutex);
         open_handles.insert(rc);
+        handle_paths[rc] = filename ? filename : "";
       }
       // A recycled file id must not inherit the previous owner's async rc.
       async_engine.forgetHandle(rc);
@@ -1232,6 +1367,7 @@ public:
       {
         std::lock_guard<std::mutex> lock(open_handles_mutex);
         open_handles.erase(file_handle);
+        handle_paths.erase(file_handle);
       }
       async_engine.forgetHandle(file_handle);
     }
@@ -1395,13 +1531,16 @@ public:
       task.data.assign(bytes, bytes + size);
       return async_engine.enqueue(std::move(task));
     }
-    if (async_engine.active())
-      async_engine.drain();
     if (has_offset) {
+      // A synchronous pwrite behind queued async ones must land after any of
+      // them that cover its range; the rest may keep draining.
+      waitForQueuedWrites(file_handle, offset, size);
       if (hint)
         return writeFileAtHint(file_handle, data, size, offset, hint);
       return writeFileAt(file_handle, data, size, offset);
     }
+    if (async_engine.active())
+      async_engine.drain();
     return writeFile(file_handle, data, size);
   }
 
@@ -1455,8 +1594,7 @@ public:
              static_cast<void *>(this),
              static_cast<unsigned long long>(call_id), file_handle, offset,
              size, io_resource_token.load());
-    if (async_engine.active())
-      async_engine.drain();
+    waitForQueuedWrites(file_handle, offset, size);
     IOResourceGuard guard(io_resource_token);
     const int rc = io_scheduler->readAt(file_handle, offset, data, size);
     io_trace("ctx=%p call=%llu readFileAt exit rc=%d tokens=%d\n",
@@ -1477,8 +1615,7 @@ public:
              size, io_resource_token.load());
     ompfile::OmpFileIOHint internal_hint{};
     applyIoHint(internal_hint, hint);
-    if (async_engine.active())
-      async_engine.drain();
+    waitForQueuedWrites(file_handle, offset, size);
     IOResourceGuard guard(io_resource_token);
     const int rc = io_scheduler->readAtHint(file_handle, offset, data, size,
                                             hint ? &internal_hint : nullptr);
