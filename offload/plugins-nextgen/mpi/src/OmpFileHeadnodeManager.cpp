@@ -212,12 +212,13 @@ bool OmpFileHeadnodeManager::hasRebalanceConflictUnlocked(
   return false;
 }
 
-void OmpFileHeadnodeManager::initialize(int NewWorldSize, int NewHeadnodeRank) {
+void OmpFileHeadnodeManager::initialize(int NewWorkerCount,
+                                        int NewHeadnodeRank) {
   const std::lock_guard<std::mutex> Lock(Mutex);
   if (Initialized)
     return;
 
-  WorldSize = std::max(NewWorldSize, 1);
+  WorkerCount = std::max(NewWorkerCount, 1);
   HeadnodeRank = NewHeadnodeRank;
   MaxAffinityLoadSkew = parseUint64Env(
       "LIBOMPFILE_SCHED_MAX_AFFINITY_LOAD_SKEW",
@@ -238,7 +239,7 @@ void OmpFileHeadnodeManager::initialize(int NewWorldSize, int NewHeadnodeRank) {
 void OmpFileHeadnodeManager::resetForTesting() {
   const std::lock_guard<std::mutex> Lock(Mutex);
   Initialized = false;
-  WorldSize = 1;
+  WorkerCount = 1;
   HeadnodeRank = 0;
   MaxAffinityLoadSkew = 2;
   BatchStatsReportEvery = 128;
@@ -724,7 +725,6 @@ bool OmpFileHeadnodeManager::classifyRebalanceConflictForTesting(
 #endif
 
 bool OmpFileHeadnodeManager::isWorkerRankUnlocked(int Rank) const {
-  const int WorkerCount = std::max(WorldSize - 1, 0);
   return Rank >= 0 && Rank < WorkerCount;
 }
 
@@ -736,8 +736,7 @@ void OmpFileHeadnodeManager::ensureHandlersUnlocked() {
   if (!Handlers.empty())
     return;
 
-  const int WorkerCount = std::max(WorldSize - 1, 0);
-  if (WorkerCount == 0) {
+  if (WorkerCount <= 0) {
     Handlers.push_back({0, 0});
     return;
   }

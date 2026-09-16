@@ -95,6 +95,8 @@ VERS1.0 {
     ompfile_mpp_pwrite_ex;
     ompfile_mpp_poll;
     ompfile_mpp_finalize;
+    ompfile_mpp_app_comm;
+    ompfile_mpp_num_workers;
   local:
     *;
 };

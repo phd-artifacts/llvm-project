@@ -958,8 +958,8 @@ struct ProxyDevice {
     EventSystem.initialize();
     PluginManager.init();
     if (EventSystem.LocalRank == getHeadnodeRank()) {
-      OmpFileHeadnodeManager::instance().initialize(EventSystem.WorldSize,
-                                                    getHeadnodeRank());
+      OmpFileHeadnodeManager::instance().initialize(
+          EventSystem.numWorkerRanks(), getHeadnodeRank());
       DP("Initialized global OMPFile headnode manager on rank %d\n",
          EventSystem.LocalRank);
     }
@@ -1225,7 +1225,11 @@ struct ProxyDevice {
     std::tie(PluginId, DeviceId) =
         EventSystem.mapDeviceId(RequestManager.DeviceId);
 
-    PluginManager.Plugins[PluginId]->init_device(DeviceId);
+    // Every origin initializes its devices, so with several origins this
+    // event arrives once per origin for the same local device; the device is
+    // initialized once and every origin gets the same device pointer.
+    if (!PluginManager.Plugins[PluginId]->is_device_initialized(DeviceId))
+      PluginManager.Plugins[PluginId]->init_device(DeviceId);
 
     auto *DevicePtr = &PluginManager.Plugins[PluginId]->getDevice(DeviceId);
 
@@ -5305,7 +5309,7 @@ struct ProxyDevice {
   }
 
   bool isWorkerRank(int Rank) const {
-    return Rank >= 0 && Rank < EventSystem.WorldSize - 1;
+    return Rank >= 0 && Rank < EventSystem.numWorkerRanks();
   }
 
   int getHeadnodeRank() const { return 0; }
@@ -5313,7 +5317,7 @@ struct ProxyDevice {
   OmpFileIOPlan buildSchedulePlan(const OmpFileIORequest &Request,
                                   const char *Path) {
     OmpFileHeadnodeManager &Manager = OmpFileHeadnodeManager::instance();
-    Manager.initialize(EventSystem.WorldSize, getHeadnodeRank());
+    Manager.initialize(EventSystem.numWorkerRanks(), getHeadnodeRank());
     return Manager.planRequest(Request, Path, EventSystem.LocalRank);
   }
 
@@ -5370,7 +5374,7 @@ struct ProxyDevice {
     const auto *Segments = static_cast<const OmpFileIOBatchSegment *>(Payload);
     std::vector<OmpFileIOBatchPlanEntry> Entries;
     OmpFileHeadnodeManager &Manager = OmpFileHeadnodeManager::instance();
-    Manager.initialize(EventSystem.WorldSize, getHeadnodeRank());
+    Manager.initialize(EventSystem.numWorkerRanks(), getHeadnodeRank());
     if (!Manager.planBatchRequest(Request, Segments, Plan, Entries,
                                   EventSystem.LocalRank)) {
       Plan.Status = -1;
@@ -6002,8 +6006,8 @@ struct ProxyDevice {
     DP("ompfile_mpp_init via proxy runtime (rank=%d, world=%d)\n",
        EventSystem.LocalRank, EventSystem.WorldSize);
     if (EventSystem.LocalRank == getHeadnodeRank())
-      OmpFileHeadnodeManager::instance().initialize(EventSystem.WorldSize,
-                                                    getHeadnodeRank());
+      OmpFileHeadnodeManager::instance().initialize(
+          EventSystem.numWorkerRanks(), getHeadnodeRank());
     const auto State = EventSystem.EventSystemState.load();
     if (State == EventSystemStateTy::RUNNING ||
         State == EventSystemStateTy::INITIALIZED)
@@ -6957,7 +6961,7 @@ struct ProxyDevice {
     Request.Generation = Generation;
 
     int FirstErrno = 0;
-    for (int Rank = 0; Rank < EventSystem.WorldSize - 1; ++Rank) {
+    for (int Rank = 0; Rank < EventSystem.numWorkerRanks(); ++Rank) {
       OmpFileStageInvalidateReply Reply{};
       if (!stageInvalidateOnRank(Rank, Request, Path, Reply)) {
         if (FirstErrno == 0)
@@ -7369,10 +7373,22 @@ struct ProxyDevice {
 
   EventTy exit(MPIRequestManagerTy RequestManager,
                std::atomic<EventSystemStateTy> &EventSystemState) {
-    EventSystemStateTy OldState =
-        EventSystemState.exchange(EventSystemStateTy::EXITED);
-    assert(OldState != EventSystemStateTy::EXITED &&
-           "Exit event received multiple times");
+    // One EXIT arrives from every origin rank (EventSystemTy::deinitialize);
+    // the proxy keeps serving until the last of them, so an origin that
+    // finishes first cannot stop the workers under the others. With the
+    // default single-origin partition this is the old behaviour exactly.
+    const int Remaining = EventSystem.PendingOriginExits.fetch_sub(1) - 1;
+    if (Remaining <= 0) {
+      EventSystemStateTy OldState =
+          EventSystemState.exchange(EventSystemStateTy::EXITED);
+      if (OldState == EventSystemStateTy::EXITED)
+        REPORT("Exit event received after the event system already exited "
+               "(rank %d, origin %d).\n",
+               EventSystem.LocalRank, RequestManager.OtherRank);
+    } else {
+      DP("Exit event from origin %d; %d origin(s) still running.\n",
+         RequestManager.OtherRank, Remaining);
+    }
 
     // Event completion notification
     RequestManager.send(nullptr, 0, MPI_BYTE);

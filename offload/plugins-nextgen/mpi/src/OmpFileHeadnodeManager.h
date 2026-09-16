@@ -76,7 +76,10 @@ public:
     return computePathKey(Path);
   }
 
-  void initialize(int WorldSize, int HeadnodeRank);
+  /// WorkerCount is the size of the proxy partition (ranks [0, WorkerCount)
+  /// are the I/O workers this manager may hand out); origin ranks above it
+  /// are clients, never aggregators.
+  void initialize(int WorkerCount, int HeadnodeRank);
 
   OmpFileIOPlan planRequest(const OmpFileIORequest &Request, const char *Path,
                             int LocalRank);
@@ -174,7 +177,7 @@ private:
 
   std::mutex Mutex;
   bool Initialized = false;
-  int WorldSize = 1;
+  int WorkerCount = 1;
   int HeadnodeRank = 0;
   uint64_t MaxAffinityLoadSkew = 2;
   uint64_t BatchStatsReportEvery = 128;

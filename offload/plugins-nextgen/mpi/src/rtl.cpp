@@ -2848,6 +2848,60 @@ int ompfile_mpp_poll(uint64_t Token, int *Done) {
   return OFFLOAD_SUCCESS;
 }
 
+// The origins-only communicator (EventSystemTy::AppComm). An SPMD application
+// whose MPI ranks are all origins (OMPTARGET_MPI_NUM_WORKERS=W with W below
+// the world size) runs its own collectives on this communicator, never on
+// MPI_COMM_WORLD, where the proxy ranks sit in the gate loop and would never
+// take part. Forces plugin initialization, which is where the communicator is
+// split; the initialization is collective over the world, so every origin
+// must reach it before any of them proceeds. libomptarget loads its plugins
+// lazily, so an application calls omp_get_num_devices() (or runs any target
+// construct) before resolving this symbol; until then ActiveMPIPlugin is
+// null and the call fails. An application that initialised MPI itself must
+// not call MPI_Finalize: the EXIT events go out at libomptarget's teardown.
+int ompfile_mpp_app_comm(MPI_Comm *Comm) {
+  using namespace llvm::omp::target::plugin;
+  if (!Comm)
+    return OFFLOAD_FAIL;
+  *Comm = MPI_COMM_NULL;
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin) {
+    DP("ompfile_mpp_app_comm: ActiveMPIPlugin is null.\n");
+    return OFFLOAD_FAIL;
+  }
+  if (auto Err = Plugin->init()) {
+    DP("ompfile_mpp_app_comm: Plugin->init failed: %s\n",
+       llvm::toString(std::move(Err)).c_str());
+    return OFFLOAD_FAIL;
+  }
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+  *Comm = Plugin->getEventSystemForOmpFile().getAppComm();
+  return *Comm != MPI_COMM_NULL ? OFFLOAD_SUCCESS : OFFLOAD_FAIL;
+}
+
+// Size of the proxy partition (OMPTARGET_MPI_NUM_WORKERS resolved against the
+// world size), so an application can pick the proxy on its own host or deal
+// work over all of them. Same initialization contract as ompfile_mpp_app_comm.
+int ompfile_mpp_num_workers(int *NumWorkers) {
+  using namespace llvm::omp::target::plugin;
+  if (!NumWorkers)
+    return OFFLOAD_FAIL;
+  *NumWorkers = 0;
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+  if (auto Err = Plugin->init()) {
+    DP("ompfile_mpp_num_workers: Plugin->init failed: %s\n",
+       llvm::toString(std::move(Err)).c_str());
+    return OFFLOAD_FAIL;
+  }
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+  *NumWorkers = Plugin->getEventSystemForOmpFile().numWorkerRanks();
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_finalize() {
   using namespace llvm::omp::target::plugin;
   auto &Events = getOmpfileMppEvents();
