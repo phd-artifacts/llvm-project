@@ -7283,22 +7283,10 @@ struct ProxyDevice {
 
   EventTy exit(MPIRequestManagerTy RequestManager,
                std::atomic<EventSystemStateTy> &EventSystemState) {
-    // One EXIT arrives from every origin rank (EventSystemTy::deinitialize);
-    // the proxy keeps serving until the last of them, so an origin that
-    // finishes first cannot stop the workers under the others. With the
-    // default single-origin partition this is the old behaviour exactly.
-    const int Remaining = EventSystem.PendingOriginExits.fetch_sub(1) - 1;
-    if (Remaining <= 0) {
-      EventSystemStateTy OldState =
-          EventSystemState.exchange(EventSystemStateTy::EXITED);
-      if (OldState == EventSystemStateTy::EXITED)
-        REPORT("Exit event received after the event system already exited "
-               "(rank %d, origin %d).\n",
-               EventSystem.LocalRank, RequestManager.OtherRank);
-    } else {
-      DP("Exit event from origin %d; %d origin(s) still running.\n",
-         RequestManager.OtherRank, Remaining);
-    }
+    EventSystemStateTy OldState =
+        EventSystemState.exchange(EventSystemStateTy::EXITED);
+    assert(OldState != EventSystemStateTy::EXITED &&
+           "Exit event received multiple times");
 
     // Event completion notification
     RequestManager.send(nullptr, 0, MPI_BYTE);

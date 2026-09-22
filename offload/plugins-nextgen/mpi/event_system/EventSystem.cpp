@@ -1534,8 +1534,7 @@ EventTy EventQueue::pop(std::stop_token &Stop) {
 /// Event System implementation
 EventSystemTy::EventSystemTy()
     : EventSystemState(EventSystemStateTy::CREATED),
-      NumMPIComms("OMPTARGET_NUM_MPI_COMMS", 10),
-      NumWorkersEnv("OMPTARGET_MPI_NUM_WORKERS", 0) {}
+      NumMPIComms("OMPTARGET_NUM_MPI_COMMS", 10) {}
 
 EventSystemTy::~EventSystemTy() {
   if (EventSystemState == EventSystemStateTy::FINALIZED)
@@ -1574,12 +1573,9 @@ bool EventSystemTy::deinitialize() {
     return false;
   }
 
-  // Only send exit events from the origin side. Every origin sends one to
-  // every proxy; a proxy stops once it has one from each origin (see the
-  // proxy's exit handler), so one origin finishing early does not tear the
-  // workers down under the others.
+  // Only send exit events from the origin side.
   if (isHost() && WorldSize > 1) {
-    const int NumWorkers = NumWorkerRanks;
+    const int NumWorkers = numWorkerRanks();
     llvm::SmallVector<EventTy> ExitEvents(NumWorkers);
     for (int WorkerRank = 0; WorkerRank < NumWorkers; WorkerRank++) {
       ExitEvents[WorkerRank] =
@@ -1782,40 +1778,6 @@ bool EventSystemTy::createLocalMPIContext() {
   CHECK(MPIError == MPI_SUCCESS,
         "Failed to acquire the world size with error %d\n", MPIError);
 
-  // Role partition. Default: every rank but the top one is a proxy, which is
-  // the layout every existing lane runs. OMPTARGET_MPI_NUM_WORKERS=W makes
-  // ranks [W, WorldSize) origins instead; it must leave at least one of each.
-  {
-    const int64_t Requested = NumWorkersEnv.get();
-    NumWorkerRanks = WorldSize - 1;
-    if (Requested > 0) {
-      if (Requested < WorldSize)
-        NumWorkerRanks = static_cast<int>(Requested);
-      else
-        REPORT("Invalid OMPTARGET_MPI_NUM_WORKERS=%lld for world size %d; "
-               "using %d.\n",
-               static_cast<long long>(Requested), WorldSize, NumWorkerRanks);
-    }
-    PendingOriginExits.store(isHost() ? 0 : WorldSize - NumWorkerRanks);
-  }
-
-  // The origins-only communicator. MPI_Comm_split is collective over the
-  // world like the dups above, and every rank (proxies included) reaches
-  // this point at its own initialization, in the same order.
-  MPIError = MPI_Comm_split(MPI_COMM_WORLD, isHost() ? 1 : MPI_UNDEFINED,
-                            LocalRank, &AppComm);
-  CHECK(MPIError == MPI_SUCCESS,
-        "Failed to split the application communicator with error %d\n",
-        MPIError);
-  if (isHost()) {
-    int AppSize = 0;
-    MPI_Comm_size(AppComm, &AppSize);
-    CHECK(AppSize == WorldSize - NumWorkerRanks,
-          "Application communicator has %d ranks, expected %d\n", AppSize,
-          WorldSize - NumWorkerRanks);
-    configureCommErrhandlerForDebug(AppComm, "AppComm");
-  }
-
   // Get max value for MPI tags.
   MPI_Aint *Value = nullptr;
   int Flag = 0;
@@ -1837,8 +1799,6 @@ bool EventSystemTy::destroyLocalMPIContext() {
 
   // Note: We don't need to assert here since application part of the program
   // was finished.
-  if (AppComm != MPI_COMM_NULL)
-    MPI_Comm_free(&AppComm);
   // Free gate thread comm.
   MPIError = MPI_Comm_free(&GateThreadComm);
   CHECK(MPIError == MPI_SUCCESS,
@@ -1872,11 +1832,11 @@ bool EventSystemTy::destroyLocalMPIContext() {
 
 int EventSystemTy::getNumWorkers() const {
   if (isHost())
-    return NumWorkerRanks;
+    return numWorkerRanks();
   return 0;
 }
 
-int EventSystemTy::isHost() const { return LocalRank >= NumWorkerRanks; };
+int EventSystemTy::isHost() const { return LocalRank == WorldSize - 1; };
 
 /// Map DeviceId to the pair <RemoteRank, RemoteDeviceId>
 RemoteDeviceId EventSystemTy::mapDeviceId(int32_t DeviceId) {

@@ -870,21 +870,6 @@ class EventSystemTy {
   /// The local rank of the current instance.
   int LocalRank = -1;
 
-  /// Role partition of MPI_COMM_WORLD: ranks [0, NumWorkerRanks) are proxy
-  /// (worker) processes, ranks [NumWorkerRanks, WorldSize) are application
-  /// (origin) processes. OMPTARGET_MPI_NUM_WORKERS sets it; the default,
-  /// WorldSize - 1, is the single-origin layout every lane before Sep 2026
-  /// ran (the app rank is the top rank). Every origin sees the same W
-  /// proxies as its devices; a proxy exits after an EXIT from every origin.
-  int NumWorkerRanks = -1;
-
-  /// Communicator over the origin ranks only, split from MPI_COMM_WORLD at
-  /// init on every rank (MPI_COMM_NULL on proxies). An SPMD application whose
-  /// ranks are all origins runs its own collectives on this instead of
-  /// MPI_COMM_WORLD, where the proxy ranks sit in the gate loop and would
-  /// never take part.
-  MPI_Comm AppComm = MPI_COMM_NULL;
-
   /// Number of events created by the current instance so far. This is used to
   /// generate unique MPI tags for each event.
   std::atomic<int> EventCounter{0};
@@ -903,13 +888,6 @@ class EventSystemTy {
   /// Number of communicators to be spawned and distributed for the events.
   /// Allows for parallel use of network resources.
   Int64Envar NumMPIComms;
-
-  /// Size of the worker partition (see NumWorkerRanks); 0 = WorldSize - 1.
-  Int64Envar NumWorkersEnv;
-
-  /// EXIT events still expected by this proxy before it may stop, one per
-  /// origin rank; decremented by the exit handler. Unused on origins.
-  std::atomic<int> PendingOriginExits{0};
 
   /// True when the event system called MPI_Init_thread itself and therefore
   /// owns MPI_Finalize during teardown.
@@ -988,22 +966,16 @@ public:
   int getNumWorkers() const;
 
   /// Size of the worker partition regardless of the local role: the ranks
-  /// [0, numWorkerRanks()) are proxies on every process.
-  int numWorkerRanks() const { return NumWorkerRanks; }
-
-  /// Number of application (origin) ranks, WorldSize - numWorkerRanks().
-  int numOriginRanks() const { return WorldSize - NumWorkerRanks; }
+  /// [0, numWorkerRanks()) are proxies on every process. An MPP job is always
+  /// one application (origin) rank -- the top one -- over WorldSize - 1
+  /// proxies; the runtime owns MPI and applications never see it.
+  int numWorkerRanks() const { return WorldSize - 1; }
 
   /// Check if we are at an application (origin) MPI process.
   ///
-  /// \return true if the current MPI process is an origin (rank >=
-  /// numWorkerRanks(); with the default partition, rank WorldSize-1), false
-  /// on a proxy.
+  /// \return true if the current MPI process is the origin (rank
+  /// WorldSize-1), false on a proxy.
   int isHost() const;
-
-  /// The origins-only communicator (MPI_COMM_NULL on proxies and before
-  /// initialization).
-  MPI_Comm getAppComm() const { return AppComm; }
 
   RemoteDeviceId mapDeviceId(int32_t DeviceId);
 

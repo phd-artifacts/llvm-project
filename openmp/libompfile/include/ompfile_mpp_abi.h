@@ -106,14 +106,4 @@ OMPFILE_MPP_ENTRYPOINTS(OMPFILE_MPP_DECLARE_ENTRYPOINT)
 #undef OMPFILE_MPP_DECLARE_ENTRYPOINT
 } // extern "C"
 
-// Origin-side exports for applications, not part of the shim table: the
-// origins-only communicator and the worker count of the partitioned world.
-// Declared only when mpi.h is already included, because MPI_Comm is its type.
-#if defined(MPI_VERSION)
-extern "C" {
-int ompfile_mpp_app_comm(MPI_Comm *Comm);
-int ompfile_mpp_num_workers(int *NumWorkers);
-} // extern "C"
-#endif
-
 #endif // OMPFILE_MPP_ABI_H
