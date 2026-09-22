@@ -5892,13 +5892,23 @@ struct ProxyDevice {
 
     OmpFileIOPlan Plan{};
     if (!dispatchSchedRequest(Request, Path, Plan)) {
-      DP("OMPFile scheduler request failed in proxy rank %d; using local rank\n",
-         EventSystem.LocalRank);
+      // Not DP(): that compiles out of a release plugin, and a silently
+      // re-routed open reads as a performance anomaly rather than a fault.
+      fprintf(stderr,
+              "MPIProxyDevice --> OMPFile scheduler fallback rank=%d "
+              "reason=request_failed errno=%d path=%s using_rank=%d\n",
+              EventSystem.LocalRank, errno, Path ? Path : "(null)", Rank);
       return Rank;
     }
 
     if (isWorkerRank(Plan.AggregatorRank))
       return Plan.AggregatorRank;
+    fprintf(stderr,
+            "MPIProxyDevice --> OMPFile scheduler fallback rank=%d "
+            "reason=plan_rank_not_a_worker plan_rank=%d status=%d errno=%d "
+            "path=%s using_rank=%d\n",
+            EventSystem.LocalRank, Plan.AggregatorRank, Plan.Status, Plan.Errno,
+            Path ? Path : "(null)", Rank);
     return Rank;
   }
 

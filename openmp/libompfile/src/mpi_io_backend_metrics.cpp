@@ -222,7 +222,7 @@ void MPIIOBackend::reportPhase0Stats() const {
           : static_cast<double>(coalesced_write_bytes) /
                 static_cast<double>(coalesced_writes);
 
-  io_log("Two-phase stats: pread_requests=%llu remote_pread_events=%llu "
+  io_report("Two-phase stats: pread_requests=%llu remote_pread_events=%llu "
          "remote_pread_bytes_total=%llu remote_pread_avg_bytes=%.2f "
          "pwrite_requests=%llu remote_pwrite_events=%llu "
          "remote_pwrite_bytes_total=%llu remote_pwrite_avg_bytes=%.2f "

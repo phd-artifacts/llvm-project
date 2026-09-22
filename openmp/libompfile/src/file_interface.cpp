@@ -957,7 +957,7 @@ public:
     stats_reported_ = true;
     if (envFlagEnabled("LIBOMPFILE_ASYNC_TRACE") ||
         envFlagEnabled("LIBOMPFILE_OPT_STATS"))
-      io_log("Async IO stats: enqueued=%llu completed=%llu "
+      io_report("Async IO stats: enqueued=%llu completed=%llu "
              "max_queue_depth=%zu drain_calls=%llu drain_wait_ns=%llu "
              "owned_enqueued=%llu owned_bytes=%llu range_waits=%llu "
              "range_wait_ns=%llu range_wait_free=%llu enqueue_waits=%llu "

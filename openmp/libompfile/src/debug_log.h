@@ -37,10 +37,31 @@ inline uint64_t io_next_trace_seq() {
   return seq.fetch_add(1, std::memory_order_relaxed);
 }
 
+// LIBOMPFILE_DEBUG=0 silences io_log at run time. Unset keeps every line
+// the lanes have always seen (the compile-time OMP_IO_DEBUG default is on).
+inline bool io_log_enabled() {
+  static const bool enabled = []() {
+    const char *env = std::getenv("LIBOMPFILE_DEBUG");
+    return !(env && env[0] == '0' && env[1] == '\0');
+  }();
+  return enabled;
+}
+
 inline void io_log(const char *fmt, ...) {
-  if (!kOmpIoDebug) {
-    return; // will be optimized out by the compiler if not enabled
+  if (!kOmpIoDebug || !io_log_enabled()) {
+    return;
   }
+  va_list args;
+  va_start(args, fmt);
+  fprintf(stderr, "[omp-io] ");
+  vfprintf(stderr, fmt, args);
+  va_end(args);
+}
+
+// Never gated: the stats lines the lanes parse ("Async IO stats",
+// "Two-phase stats") go through here with the same "[omp-io] " prefix, so
+// LIBOMPFILE_DEBUG=0 cannot silence a test contract.
+inline void io_report(const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
   fprintf(stderr, "[omp-io] ");

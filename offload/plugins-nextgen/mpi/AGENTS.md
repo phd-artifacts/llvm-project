@@ -56,8 +56,10 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   - handler table (rank + in-flight load)
   - global file table (`path -> preferred aggregator rank`)
   - flightplan table (request tracking)
-- If scheduler request fails, current behavior falls back to local rank
-  selection path.
+- If the scheduler request fails, or the plan names a rank that is not a
+  worker, the open falls back to the local rank and says so on stderr
+  (`MPIProxyDevice --> OMPFile scheduler fallback ...`, at every build
+  level); a lane that sees that line measured the wrong aggregator.
 
 ## Ownership and handles
 
