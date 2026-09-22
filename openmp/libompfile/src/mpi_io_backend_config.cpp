@@ -1,23 +1,18 @@
 #include "mpi_io_backend.h"
 #include "debug_log.h"
+#include "ompfile_env.h"
 
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 
 bool MPIIOBackend::parseBoolEnv(const char *name, bool default_value) {
-  const char *env = std::getenv(name);
-  if (!env)
-    return default_value;
-
-  if (env[0] == '1' && env[1] == '\0')
-    return true;
-  if (env[0] == '0' && env[1] == '\0')
-    return false;
-
-  io_log("Invalid boolean value for %s='%s'; using default=%d\n", name, env,
-         static_cast<int>(default_value));
-  return default_value;
+  bool malformed = false;
+  const bool value = ompfile::env::boolOr(name, default_value, &malformed);
+  if (malformed)
+    io_log("Invalid boolean value for %s='%s'; using default=%d\n", name,
+           std::getenv(name), static_cast<int>(default_value));
+  return value;
 }
 
 MPIIOBackend::TwoPhasePolicy

@@ -36,7 +36,8 @@ target_link_libraries(omptarget.rtl.mpi PRIVATE
 
 # Add include directories
 target_include_directories(omptarget.rtl.mpi PRIVATE
-                           ${LIBOMPTARGET_INCLUDE_DIR})
+                           ${LIBOMPTARGET_INCLUDE_DIR}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../../../openmp/libompfile/include)
 
 # Set C++20 as the target standard for this plugin.
 set_target_properties(omptarget.rtl.mpi
@@ -125,6 +126,7 @@ target_include_directories(llvm-offload-mpi-proxy-device PRIVATE
   ${LIBOMPTARGET_INCLUDE_DIR}
   ${LIBOMPTARGET_LLVM_INCLUDE_DIRS}
   ${LIBOMPTARGET_BINARY_INCLUDE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../../openmp/libompfile/include
 )
 
 foreach(plugin IN LISTS LIBOMPTARGET_REMOTE_PLUGINS_TO_BUILD)

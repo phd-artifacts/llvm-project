@@ -27,7 +27,17 @@ libompfile backend behavior and MPP shim usage.
 - Public interface glue: `src/file_interface.cpp`,
   `include/file_interface.h`
 - MPP shim: `src/mpp_shim.cpp`, `src/mpp_shim.h`
-- Scheduler structs: `include/ompfile_sched.h`
+- Scheduler structs: `include/ompfile_sched.h` (the plugin aliases them; it
+  is not installed, the plugin reaches it through its include path)
+- Bridge ABI: `include/ompfile_mpp_abi.h` (the `OMPFILE_MPP_ENTRYPOINTS`
+  X-macro; a new `ompfile_mpp_*` call is one row here plus its definition in
+  `rtl.cpp` and/or `ProxyDevice.cpp`)
+- Environment readers shared with the proxy: `include/ompfile_env.h`
+- Stage extent algebra (pure, unit-tested): `include/ompfile_extents.h`
+- Source lists: `cmake/OmpFileSources.cmake` (also included by
+  `application/tests/test-mpp-rebalance-fallback-regression`)
+- Unit tests: `tests/` (built with the runtime, run by the build jobs;
+  add a case there for any new pure helper)
 
 ## Backend modes
 
@@ -56,6 +66,8 @@ libompfile backend behavior and MPP shim usage.
 ## Useful knobs
 
 - `LIBOMPFILE_MPP_PING=1` for health check.
+- `LIBOMPFILE_DEBUG=0` silences `io_log`; the stats lines lanes parse go
+  through `io_report` and cannot be silenced.
 - `LIBOMPFILE_MPI_COMM_SELF=1` to force `MPI_COMM_SELF` in non-remote-only
   mode.
 - `LIBOMPFILE_SCHEDULER=HEADNODE` to request headnode scheduling policy.

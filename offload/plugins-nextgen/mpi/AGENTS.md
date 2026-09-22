@@ -26,12 +26,27 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   `src/OmpFileHeadnodeManager.cpp`
 - Event dispatch: `event_system/EventSystem.h`,
   `event_system/EventSystem.cpp`
+- Bridge ABI shared with libompfile:
+  `openmp/libompfile/include/ompfile_mpp_abi.h` (the entrypoint X-macro;
+  both bridges define its prototypes); the scheduler wire structs are
+  libompfile's `ompfile_sched.h`, aliased in `EventSystem.h`
+- Shared environment readers: `openmp/libompfile/include/ompfile_env.h`
+  (`normalizeStageWriteMode` and the `envBoolOrDefault` family forward to it)
 
 ## Event model
 
-- OMPFile events: `OMPFILE_OPEN`, `OMPFILE_CLOSE`, `OMPFILE_PREAD`,
-  `OMPFILE_PWRITE`, `OMPFILE_PING`
-- Scheduler events: `OMPFILE_SCHED_REQUEST`, `OMPFILE_SCHED_PLAN`
+- File events: `OMPFILE_OPEN`, `OMPFILE_CLOSE`, `OMPFILE_PREAD`,
+  `OMPFILE_PREAD_NO_STAGE`, `OMPFILE_PWRITE`, `OMPFILE_PING`
+- Scheduler events: `OMPFILE_SCHED_REQUEST`, `OMPFILE_SCHED_PLAN`,
+  `OMPFILE_SCHED_REQUEST_BATCH`
+- Coherence events (write-back staging): `OMPFILE_STAGE_INVALIDATE`,
+  `OMPFILE_FRESHNESS_QUERY`, `OMPFILE_FRESHNESS_WRITE_COMMIT`,
+  `OMPFILE_FRESHNESS_MARK_FRESH`, `OMPFILE_PROXY_COPY_TILE`,
+  `OMPFILE_FLUSH_DIRTY_TILE`, `OMPFILE_DIRTY_OWNER_PREAD`,
+  `OMPFILE_DIRTY_OWNER_PREAD_BATCH`, `OMPFILE_DIRTY_OWNER_QUERY`
+- The full enum with its pinned numeric values is `EventTypeTy` in
+  `event_system/EventSystem.h`; the static_asserts there are the wire
+  contract
 - `ProxyDevice` creates rank-targeted events and waits for completion.
 
 ## Scheduler behavior

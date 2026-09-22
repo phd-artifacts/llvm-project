@@ -36,7 +36,8 @@
 
 #include "llvm/ADT/SmallVector.h"
 
-#include "../../../../openmp/libompfile/include/ompfile_sched.h"
+#include "ompfile_mpp_abi.h"
+#include "ompfile_sched.h"
 
 #include "Shared/APITypes.h"
 #include "Shared/EnvironmentVar.h"
@@ -265,12 +266,8 @@ struct OmpFileDirtyOwnerPreadReplyFrame {
 
 constexpr uint32_t OMPFILE_DIRTY_OWNER_PREAD_BATCH_REPLY_MAGIC = 0x44525042u;
 
-struct OmpFileDirtyOwnerPreadBatchSegment {
-  int64_t Offset = 0;
-  uint64_t Size = 0;
-  uint64_t ExpectedVersion = 0;
-  uint64_t ClientSegmentId = 0;
-};
+// Shared with the shim through ompfile_mpp_abi.h (it is a bridge parameter).
+using ompfile::OmpFileDirtyOwnerPreadBatchSegment;
 
 struct OmpFileDirtyOwnerPreadBatchReplyHeader {
   uint32_t AbiVersion = OMPFILE_DIRTY_OWNER_PREAD_ABI_VERSION;
@@ -304,119 +301,34 @@ struct RetrieveTimingTy {
   ~RetrieveTimingTy();
 };
 
-enum class OmpFileIOOp : uint32_t {
-  OPEN = 0,
-  CLOSE = 1,
-  PREAD = 2,
-  PWRITE = 3,
-  PREFETCH = 4,
-};
-
-constexpr uint32_t OMPFILE_IO_HINT_ABI_VERSION = 1u;
-
-enum OmpFileIOHintFlags : uint32_t {
-  OMPFILE_IO_HINT_HAS_EPOCH = 1u << 0,
-  OMPFILE_IO_HINT_HAS_STREAM = 1u << 1,
-  OMPFILE_IO_HINT_HAS_TILE = 1u << 2,
-};
-
-struct OmpFileIOHint {
-  uint32_t AbiVersion = OMPFILE_IO_HINT_ABI_VERSION;
-  uint32_t HintFlags = 0;
-  uint64_t EpochId = 0;
-  uint64_t StreamId = 0;
-  uint64_t TileId = 0;
-};
-
-struct OmpFileIORequest {
-  uint64_t RequestId = 0;
-  OmpFileIOOp Op = OmpFileIOOp::OPEN;
-  int32_t FileHandle = -1;
-  int32_t Flags = 0;
-  int32_t Mode = 0;
-  int32_t ClientRank = -1;
-  int64_t Offset = 0;
-  uint64_t Size = 0;
-  uint32_t PathSize = 0;
-  uint32_t HintFlags = 0;
-  uint64_t EpochId = 0;
-  uint64_t StreamId = 0;
-  uint64_t TileId = 0;
-};
-
-struct OmpFileIOPlan {
-  uint64_t RequestId = 0;
-  int32_t AggregatorRank = -1;
-  int32_t RemoteHandle = -1;
-  int32_t Status = 0;
-  int32_t Errno = 0;
-  int64_t Offset = 0;
-  uint64_t Size = 0;
-  uint32_t PlanFlags = 0;
-  uint32_t Reserved = 0;
-};
-
-constexpr uint32_t OMPFILE_SCHED_BATCH_ABI_VERSION = 1u;
-
-enum OmpFileBatchRequestFlags : uint32_t {
-  OMPFILE_BATCH_REQ_FAIL_ON_ANY_ERROR = 1u << 0,
-  OMPFILE_BATCH_REQ_DISABLE_SCALAR_FALLBACK = 1u << 1,
-};
-
-enum OmpFileBatchPlanFlags : uint32_t {
-  OMPFILE_BATCH_PLAN_BATCH_API = 1u << 0,
-  OMPFILE_BATCH_PLAN_SCALAR_FALLBACK = 1u << 1,
-  OMPFILE_BATCH_PLAN_FILE_AFFINITY = 1u << 2,
-  OMPFILE_BATCH_PLAN_REBALANCED = 1u << 3,
-};
-
-struct OmpFileIOBatchSegment {
-  uint64_t SegmentId = 0;
-  int32_t FileHandle = -1;
-  int32_t ClientRank = -1;
-  int64_t Offset = 0;
-  uint64_t Size = 0;
-  uint64_t PathKey = 0;
-  uint32_t SegmentFlags = 0;
-  uint32_t Reserved = 0;
-  uint64_t EpochId = 0;
-  uint64_t StreamId = 0;
-  uint64_t TileId = 0;
-};
-
-struct OmpFileIOBatchRequest {
-  uint32_t AbiVersion = OMPFILE_SCHED_BATCH_ABI_VERSION;
-  uint32_t SegmentCount = 0;
-  uint32_t RequestFlags = 0;
-  uint32_t Reserved0 = 0;
-  uint64_t BatchId = 0;
-  uint32_t PayloadBytes = 0;
-  uint32_t Reserved1 = 0;
-};
-
-struct OmpFileIOBatchPlanEntry {
-  uint64_t SegmentId = 0;
-  int32_t AggregatorRank = -1;
-  int32_t RemoteHandle = -1;
-  int32_t Status = 0;
-  int32_t Errno = 0;
-  int64_t Offset = 0;
-  uint64_t Size = 0;
-  uint32_t PlanFlags = 0;
-  uint32_t Reserved = 0;
-};
-
-struct OmpFileIOBatchPlan {
-  uint32_t AbiVersion = OMPFILE_SCHED_BATCH_ABI_VERSION;
-  uint32_t SegmentCount = 0;
-  uint32_t PlanFlags = 0;
-  uint32_t Reserved0 = 0;
-  uint64_t BatchId = 0;
-  int32_t Status = 0;
-  int32_t Errno = 0;
-  uint32_t PayloadBytes = 0;
-  uint32_t Reserved1 = 0;
-};
+// The scheduler wire types are libompfile's (ompfile_sched.h). The plugin
+// used to carry its own copies of these thirteen, and they had already
+// drifted (OmpFileIOHint gained Role on the client side only). They are
+// aliased into the global namespace so every existing unqualified use in the
+// plugin keeps compiling against the one definition.
+using ompfile::OmpFileIOOp;
+using ompfile::OMPFILE_IO_HINT_ABI_VERSION;
+using ompfile::OmpFileIOHintFlags;
+using ompfile::OMPFILE_IO_HINT_HAS_EPOCH;
+using ompfile::OMPFILE_IO_HINT_HAS_STREAM;
+using ompfile::OMPFILE_IO_HINT_HAS_TILE;
+using ompfile::OMPFILE_IO_HINT_HAS_ROLE;
+using ompfile::OmpFileIOHint;
+using ompfile::OmpFileIORequest;
+using ompfile::OmpFileIOPlan;
+using ompfile::OMPFILE_SCHED_BATCH_ABI_VERSION;
+using ompfile::OmpFileBatchRequestFlags;
+using ompfile::OMPFILE_BATCH_REQ_FAIL_ON_ANY_ERROR;
+using ompfile::OMPFILE_BATCH_REQ_DISABLE_SCALAR_FALLBACK;
+using ompfile::OmpFileBatchPlanFlags;
+using ompfile::OMPFILE_BATCH_PLAN_BATCH_API;
+using ompfile::OMPFILE_BATCH_PLAN_SCALAR_FALLBACK;
+using ompfile::OMPFILE_BATCH_PLAN_FILE_AFFINITY;
+using ompfile::OMPFILE_BATCH_PLAN_REBALANCED;
+using ompfile::OmpFileIOBatchSegment;
+using ompfile::OmpFileIOBatchRequest;
+using ompfile::OmpFileIOBatchPlanEntry;
+using ompfile::OmpFileIOBatchPlan;
 
 struct OmpFileIOCompletion {
   uint64_t RequestId = 0;
@@ -456,6 +368,19 @@ static_assert(std::is_standard_layout_v<OmpFileStageInvalidateRequest>);
 static_assert(std::is_standard_layout_v<OmpFileStageInvalidateReply>);
 static_assert(std::is_standard_layout_v<OmpFileFreshnessQueryRequest>);
 static_assert(std::is_standard_layout_v<OmpFileFreshnessQueryReply>);
+// Wire types cross the MPI transport by memcpy: trivially copyable, always.
+static_assert(std::is_trivially_copyable_v<OmpFileIORequest>);
+static_assert(std::is_trivially_copyable_v<OmpFileIOPlan>);
+static_assert(std::is_trivially_copyable_v<OmpFileIOBatchSegment>);
+static_assert(std::is_trivially_copyable_v<OmpFileIOBatchRequest>);
+static_assert(std::is_trivially_copyable_v<OmpFileIOBatchPlanEntry>);
+static_assert(std::is_trivially_copyable_v<OmpFileIOBatchPlan>);
+static_assert(std::is_trivially_copyable_v<OmpFileIOCompletion>);
+static_assert(std::is_trivially_copyable_v<OmpFileStageInvalidateRequest>);
+static_assert(std::is_trivially_copyable_v<OmpFileStageInvalidateReply>);
+static_assert(std::is_trivially_copyable_v<OmpFileFreshnessQueryRequest>);
+static_assert(std::is_trivially_copyable_v<OmpFileFreshnessQueryReply>);
+static_assert(std::is_trivially_copyable_v<OmpFileDirtyOwnerPreadBatchSegment>);
 static_assert(sizeof(OmpFileStageInvalidateRequest) == 24);
 static_assert(offsetof(OmpFileStageInvalidateRequest, AbiVersion) == 0);
 static_assert(offsetof(OmpFileStageInvalidateRequest, PathSize) == 4);

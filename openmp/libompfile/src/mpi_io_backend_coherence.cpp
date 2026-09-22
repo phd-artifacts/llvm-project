@@ -1,5 +1,6 @@
 #include "mpi_io_backend.h"
 #include "mpp_shim.h"
+#include "ompfile_env.h"
 
 #include <cassert>
 #include <cerrno>
@@ -15,7 +16,7 @@ bool isWritebackStageModeEnv() {
   const char *StageMode = std::getenv("LIBOMPFILE_STAGE_MODE");
   const char *WriteMode = std::getenv("LIBOMPFILE_STAGE_WRITE_MODE");
   return StageMode && std::strcmp(StageMode, "readthrough") == 0 &&
-         WriteMode && std::strcmp(WriteMode, "write-back") == 0;
+         ompfile::env::isWriteBackMode(WriteMode);
 }
 
 } // namespace

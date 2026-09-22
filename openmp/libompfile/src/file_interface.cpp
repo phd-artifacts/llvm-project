@@ -1,5 +1,6 @@
 #include "abstract_backend.h"
 #include "debug_log.h"
+#include "ompfile_env.h"
 #include "file_interface.h"
 #include "mpp_shim.h"
 #include "ompfile_sched.h"
@@ -64,8 +65,7 @@ static const char *backendTypeToString(IOBackendTy backend_type) {
 }
 
 static bool envFlagEnabled(const char *name) {
-  const char *value = std::getenv(name);
-  return value && value[0] == '1' && value[1] == '\0';
+  return ompfile::env::flag(name);
 }
 
 // LIBOMPFILE_ASYNC_READ_WAIT=range: a read (or a synchronous write) waits only

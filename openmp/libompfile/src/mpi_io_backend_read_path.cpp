@@ -1,4 +1,5 @@
 #include "debug_log.h"
+#include "ompfile_env.h"
 #include "mpi_io_backend.h"
 #include "mpp_shim.h"
 
@@ -15,13 +16,12 @@
 namespace {
 
 bool envEquals(const char *Name, const char *Expected) {
-  const char *Value = std::getenv(Name);
-  return Value && std::strcmp(Value, Expected) == 0;
+  return ompfile::env::equals(Name, Expected);
 }
 
 bool scalarPlannedReadRebalanceEnabledForStage() {
   return envEquals("LIBOMPFILE_STAGE_MODE", "readthrough") &&
-         envEquals("LIBOMPFILE_STAGE_WRITE_MODE", "write-back") &&
+         ompfile::env::isWriteBackMode(std::getenv("LIBOMPFILE_STAGE_WRITE_MODE")) &&
          !envEquals("LIBOMPFILE_STAGE_FRESHNESS_GUARD", "0");
 }
 
@@ -39,16 +39,7 @@ bool remoteDirtyOwnerPfsRebalanceEnabled() {
 }
 
 unsigned parsePositiveEnv(const char *Name) {
-  const char *Value = std::getenv(Name);
-  if (!Value || Value[0] == '\0')
-    return 0;
-  char *End = nullptr;
-  errno = 0;
-  const unsigned long Parsed = std::strtoul(Value, &End, 10);
-  if (errno != 0 || End == Value || (End && *End != '\0') || Parsed == 0 ||
-      Parsed > static_cast<unsigned long>(std::numeric_limits<unsigned>::max()))
-    return 0;
-  return static_cast<unsigned>(Parsed);
+  return ompfile::env::positiveOr(Name);
 }
 
 uint64_t dirtyOwnerReadAheadBytes() {

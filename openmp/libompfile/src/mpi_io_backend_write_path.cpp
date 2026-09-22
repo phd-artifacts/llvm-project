@@ -1,4 +1,5 @@
 #include "debug_log.h"
+#include "ompfile_env.h"
 #include "mpi_io_backend.h"
 #include "mpp_shim.h"
 
@@ -19,28 +20,17 @@ bool freshnessWriteThroughModeEnabled() {
     return false;
   if (mode && std::strcmp(mode, "write-through") == 0)
     return true;
-  const char *stage_write_mode = std::getenv("LIBOMPFILE_STAGE_WRITE_MODE");
-  if (stage_write_mode && std::strcmp(stage_write_mode, "write-back") == 0)
+  if (ompfile::env::isWriteBackMode(std::getenv("LIBOMPFILE_STAGE_WRITE_MODE")))
     return false;
   return true;
 }
 
 bool writebackDistributeWritesEnabled() {
-  const char *env = std::getenv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES");
-  return env && env[0] == '1' && env[1] == '\0';
+  return ompfile::env::flag("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES");
 }
 
 unsigned parsePositiveEnv(const char *name) {
-  const char *env = std::getenv(name);
-  if (!env || env[0] == '\0')
-    return 0;
-  char *end = nullptr;
-  errno = 0;
-  const unsigned long parsed = std::strtoul(env, &end, 10);
-  if (errno != 0 || end == env || (end && *end != '\0') || parsed == 0 ||
-      parsed > static_cast<unsigned long>(std::numeric_limits<unsigned>::max()))
-    return 0;
-  return static_cast<unsigned>(parsed);
+  return ompfile::env::positiveOr(name);
 }
 
 unsigned writebackDistributeRankCount() {

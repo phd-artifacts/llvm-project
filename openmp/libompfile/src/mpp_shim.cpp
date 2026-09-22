@@ -1,4 +1,5 @@
 #include "mpp_shim.h"
+#include "ompfile_mpp_abi.h"
 
 #include "debug_log.h"
 
@@ -25,131 +26,24 @@ extern "C" int ompfile_mpp_flush_dirty_tile(uint64_t, int *, uint64_t *)
     __attribute__((weak));
 extern "C" int ompfile_mpp_commit_stage_path_key(uint64_t) __attribute__((weak));
 
-using MppInitFn = int (*)();
-using MppSubmitFn = int (*)(uint64_t);
-using MppOpenFn = int (*)(const char *, int, int, int *);
-using MppOpenOnRankFn = int (*)(const char *, int, int, int, int *);
-using MppHandleOwnerRankFn = int (*)(int, int *);
-using MppCloseFn = int (*)(int);
-using MppPreadFn = int (*)(int, int64_t, void *, uint64_t);
-using MppPreadExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
-using MppPreadNoStageExFn = int (*)(int, int64_t, void *, uint64_t, uint64_t *);
-using MppDirtyOwnerPreadExFn = int (*)(int, int, uint64_t, int64_t, void *,
-                                       uint64_t, uint64_t *);
-struct MppDirtyOwnerPreadBatchAbiSegment {
-  int64_t Offset = 0;
-  uint64_t Size = 0;
-  uint64_t ExpectedVersion = 0;
-  uint64_t ClientSegmentId = 0;
-};
-using MppDirtyOwnerPreadBatchExFn = int (*)(
-    int, int, const MppDirtyOwnerPreadBatchAbiSegment *, uint64_t,
-    void *const *, uint64_t *, int *, int *);
-using MppDirtyOwnerQueryExFn = int (*)(int, int, uint64_t, int64_t, uint64_t,
-                                       int *);
-using MppPwriteFn = int (*)(int, int64_t, const void *, uint64_t);
-using MppPwriteExFn = int (*)(int, int64_t, const void *, uint64_t, uint64_t *);
-using MppStageInvalidatePathKeyFn = int (*)(uint64_t, uint64_t, const char *);
-using MppFreshnessQueryFn = int (*)(const ompfile::OmpFileFreshnessQueryRequest *,
-                                    ompfile::OmpFileFreshnessQueryReply *);
-using MppFreshnessWriteCommitFn = int (*)(uint64_t, int, uint64_t, int,
-                                          uint64_t *);
-using MppProxyCopyTileFn = int (*)(uint64_t, uint64_t, int, int, uint64_t);
-using MppFreshnessMarkFreshFn = int (*)(uint64_t, int, uint64_t);
-using MppFlushDirtyTileFn = int (*)(uint64_t, int *, uint64_t *);
-using MppCommitStagePathKeyFn = int (*)(uint64_t);
-using MppSchedRequestFn = int (*)(const ompfile::OmpFileIORequest *,
-                                  const char *, ompfile::OmpFileIOPlan *);
-using MppSchedBatchRequestFn = int (*)(const ompfile::OmpFileIOBatchRequest *,
-                                       const void *, uint64_t,
-                                       ompfile::OmpFileIOBatchPlan *, void *,
-                                       uint64_t, uint64_t *);
-using MppPollFn = int (*)(uint64_t, int *);
-using MppFinalizeFn = int (*)();
+// The bridge ABI (one row per entrypoint) lives in ompfile_mpp_abi.h; the
+// table and its loader below are generated from it.
+using MppDirtyOwnerPreadBatchAbiSegment =
+    ompfile::OmpFileDirtyOwnerPreadBatchSegment;
 
 struct MppApi {
-  MppInitFn init = nullptr;
-  MppSubmitFn submit = nullptr;
-  MppOpenFn open = nullptr;
-  MppOpenOnRankFn open_on_rank = nullptr;
-  MppHandleOwnerRankFn handle_owner_rank = nullptr;
-  MppCloseFn close = nullptr;
-  MppPreadFn pread = nullptr;
-  MppPreadExFn pread_ex = nullptr;
-  MppPreadNoStageExFn pread_no_stage_ex = nullptr;
-  MppDirtyOwnerPreadExFn dirty_owner_pread_ex = nullptr;
-  MppDirtyOwnerPreadBatchExFn dirty_owner_pread_batch_ex = nullptr;
-  MppDirtyOwnerQueryExFn dirty_owner_query_ex = nullptr;
-  MppPwriteFn pwrite = nullptr;
-  MppPwriteExFn pwrite_ex = nullptr;
-  MppStageInvalidatePathKeyFn stage_invalidate_path_key = nullptr;
-  MppFreshnessQueryFn freshness_query = nullptr;
-  MppFreshnessWriteCommitFn freshness_write_commit = nullptr;
-  MppProxyCopyTileFn proxy_copy_tile = nullptr;
-  MppFreshnessMarkFreshFn freshness_mark_fresh = nullptr;
-  MppFlushDirtyTileFn flush_dirty_tile = nullptr;
-  MppCommitStagePathKeyFn commit_stage_path_key = nullptr;
-  MppSchedRequestFn sched_request = nullptr;
-  MppSchedBatchRequestFn sched_batch_request = nullptr;
-  MppPollFn poll = nullptr;
-  MppFinalizeFn finalize = nullptr;
+#define OMPFILE_MPP_API_MEMBER(name, ret, params) ret(*name) params = nullptr;
+  OMPFILE_MPP_ENTRYPOINTS(OMPFILE_MPP_API_MEMBER)
+#undef OMPFILE_MPP_API_MEMBER
 };
 
 MppApi loadMppApi() {
   MppApi loaded;
-  loaded.init = reinterpret_cast<MppInitFn>(dlsym(RTLD_DEFAULT,
-                                                  "ompfile_mpp_init"));
-  loaded.submit = reinterpret_cast<MppSubmitFn>(dlsym(RTLD_DEFAULT,
-                                                      "ompfile_mpp_submit"));
-  loaded.open = reinterpret_cast<MppOpenFn>(dlsym(RTLD_DEFAULT,
-                                                       "ompfile_mpp_open"));
-  loaded.open_on_rank = reinterpret_cast<MppOpenOnRankFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_open_on_rank"));
-  loaded.handle_owner_rank = reinterpret_cast<MppHandleOwnerRankFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_handle_owner_rank"));
-  loaded.close = reinterpret_cast<MppCloseFn>(dlsym(RTLD_DEFAULT,
-                                                        "ompfile_mpp_close"));
-  loaded.pread = reinterpret_cast<MppPreadFn>(dlsym(RTLD_DEFAULT,
-                                                       "ompfile_mpp_pread"));
-  loaded.pread_ex = reinterpret_cast<MppPreadExFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_ex"));
-  loaded.pread_no_stage_ex = reinterpret_cast<MppPreadNoStageExFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_pread_no_stage_ex"));
-  loaded.dirty_owner_pread_ex = reinterpret_cast<MppDirtyOwnerPreadExFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_dirty_owner_pread_ex"));
-  loaded.dirty_owner_pread_batch_ex =
-      reinterpret_cast<MppDirtyOwnerPreadBatchExFn>(
-          dlsym(RTLD_DEFAULT, "ompfile_mpp_dirty_owner_pread_batch_ex"));
-  loaded.dirty_owner_query_ex = reinterpret_cast<MppDirtyOwnerQueryExFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_dirty_owner_query_ex"));
-  loaded.pwrite = reinterpret_cast<MppPwriteFn>(dlsym(RTLD_DEFAULT,
-                                                        "ompfile_mpp_pwrite"));
-  loaded.pwrite_ex = reinterpret_cast<MppPwriteExFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_pwrite_ex"));
-  loaded.stage_invalidate_path_key =
-      reinterpret_cast<MppStageInvalidatePathKeyFn>(
-          dlsym(RTLD_DEFAULT, "ompfile_mpp_stage_invalidate_path_key"));
-  loaded.sched_request = reinterpret_cast<MppSchedRequestFn>(dlsym(
-      RTLD_DEFAULT, "ompfile_mpp_sched_request"));
-  loaded.freshness_query = reinterpret_cast<MppFreshnessQueryFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_freshness_query"));
-  loaded.freshness_write_commit = reinterpret_cast<MppFreshnessWriteCommitFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_freshness_write_commit"));
-  loaded.proxy_copy_tile = reinterpret_cast<MppProxyCopyTileFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_proxy_copy_tile"));
-  loaded.freshness_mark_fresh = reinterpret_cast<MppFreshnessMarkFreshFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_freshness_mark_fresh"));
-  loaded.flush_dirty_tile = reinterpret_cast<MppFlushDirtyTileFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_flush_dirty_tile"));
-  loaded.commit_stage_path_key = reinterpret_cast<MppCommitStagePathKeyFn>(
-      dlsym(RTLD_DEFAULT, "ompfile_mpp_commit_stage_path_key"));
-  loaded.sched_batch_request =
-      reinterpret_cast<MppSchedBatchRequestFn>(dlsym(
-          RTLD_DEFAULT, "ompfile_mpp_sched_request_batch"));
-  loaded.poll = reinterpret_cast<MppPollFn>(dlsym(RTLD_DEFAULT,
-                                                  "ompfile_mpp_poll"));
-  loaded.finalize = reinterpret_cast<MppFinalizeFn>(dlsym(RTLD_DEFAULT,
-                                                          "ompfile_mpp_finalize"));
+#define OMPFILE_MPP_API_LOAD(name, ret, params)                               \
+  loaded.name = reinterpret_cast<ret(*) params>(                              \
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_" #name));
+  OMPFILE_MPP_ENTRYPOINTS(OMPFILE_MPP_API_LOAD)
+#undef OMPFILE_MPP_API_LOAD
   return loaded;
 }
 
@@ -242,7 +136,7 @@ bool init() {
   io_trace_symbol_owner("ompfile_mpp_sched_request",
                         reinterpret_cast<void *>(api.sched_request));
   io_trace_symbol_owner("ompfile_mpp_sched_request_batch",
-                        reinterpret_cast<void *>(api.sched_batch_request));
+                        reinterpret_cast<void *>(api.sched_request_batch));
 
   int init_rc = api.init();
   if (init_rc != 0) {
@@ -992,14 +886,14 @@ bool schedBatchRequest(
     return false;
   }
 
-  MppApi api = getMppApiReloadIfMissing(&MppApi::sched_batch_request);
+  MppApi api = getMppApiReloadIfMissing(&MppApi::sched_request_batch);
 
-  if (api.sched_batch_request) {
+  if (api.sched_request_batch) {
     std::vector<uint8_t> plan_payload(
         static_cast<size_t>(ompfile::batchPlanPayloadBytes(
             normalized_request.SegmentCount)));
     uint64_t plan_payload_bytes = plan_payload.size();
-    int rc = api.sched_batch_request(
+    int rc = api.sched_request_batch(
         &normalized_request,
         request_payload.empty() ? nullptr : request_payload.data(),
         static_cast<uint64_t>(request_payload.size()), &plan,

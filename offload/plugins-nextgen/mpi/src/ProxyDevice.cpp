@@ -31,6 +31,8 @@
 #include <sys/statvfs.h>
 
 #include "EventSystem.h"
+#include "ompfile_env.h"
+#include "ompfile_extents.h"
 #include "OmpFileHeadnodeManager.h"
 #include "RemotePluginManager.h"
 #include "Shared/APITypes.h"
@@ -93,10 +95,7 @@ std::string getLocalShortHostname() {
 }
 
 std::string envStringOrDefault(const char *Name, const char *DefaultValue) {
-  const char *Value = std::getenv(Name);
-  if (!Value || Value[0] == '\0')
-    return DefaultValue ? std::string(DefaultValue) : std::string();
-  return Value;
+  return ompfile::env::stringOr(Name, DefaultValue);
 }
 
 uint64_t elapsedMicros(std::chrono::steady_clock::time_point Start,
@@ -109,27 +108,11 @@ uint64_t elapsedMicros(std::chrono::steady_clock::time_point Start,
 }
 
 uint64_t envUint64OrDefault(const char *Name, uint64_t DefaultValue) {
-  const char *Value = std::getenv(Name);
-  if (!Value || Value[0] == '\0')
-    return DefaultValue;
-  char *End = nullptr;
-  errno = 0;
-  unsigned long long Parsed = std::strtoull(Value, &End, 10);
-  if (errno != 0 || End == Value || (End && *End != '\0'))
-    return DefaultValue;
-  return static_cast<uint64_t>(Parsed);
+  return ompfile::env::uint64Or(Name, DefaultValue);
 }
 
 double envDoubleOrDefault(const char *Name, double DefaultValue) {
-  const char *Value = std::getenv(Name);
-  if (!Value || Value[0] == '\0')
-    return DefaultValue;
-  char *End = nullptr;
-  errno = 0;
-  double Parsed = std::strtod(Value, &End);
-  if (errno != 0 || End == Value || (End && *End != '\0'))
-    return DefaultValue;
-  return Parsed;
+  return ompfile::env::doubleOr(Name, DefaultValue);
 }
 
 // OMPTARGET_MPI_PROXY_EVENT_STATS=1: per-event-type wall time on the proxy,
@@ -217,25 +200,14 @@ static ProxyEventStatsTy &proxyEventStats() {
 }
 
 bool envBoolOrDefault(const char *Name, bool DefaultValue) {
-  const char *Value = std::getenv(Name);
-  if (!Value || Value[0] == '\0')
-    return DefaultValue;
-  if (Value[0] == '0' && Value[1] == '\0')
-    return false;
-  if (Value[0] == '1' && Value[1] == '\0')
-    return true;
-  return DefaultValue;
+  return ompfile::env::boolOr(Name, DefaultValue);
 }
 
 // Normalize the stage write policy to one of: "write-through",
 // "write-back", or "off". Unknown values fall back to "write-through"
 // so a misspelled knob never silently disables staging correctness.
 std::string normalizeStageWriteMode(const std::string &Raw) {
-  if (Raw == "write-back" || Raw == "writeback")
-    return "write-back";
-  if (Raw == "off" || Raw == "disabled")
-    return "off";
-  return "write-through";
+  return ompfile::env::normalizeStageWriteMode(Raw);
 }
 
 std::string defaultStageRunStem() {
@@ -756,10 +728,9 @@ struct ProxyDevice {
     uint64_t RefCount = 0;
   };
 
-  struct OmpFileStageExtent {
-    uint64_t Begin = 0;
-    uint64_t End = 0;
-  };
+  // The extent algebra lives in ompfile_extents.h (unit-tested); the
+  // members below forward to it so the call sites read as before.
+  using OmpFileStageExtent = ompfile::extents::Extent;
 
   struct OmpFileStageEntry {
     std::string SourcePath;
@@ -2125,106 +2096,35 @@ struct ProxyDevice {
   }
 
   uint64_t saturatingAdd(uint64_t Base, uint64_t Delta) const {
-    if (Delta > std::numeric_limits<uint64_t>::max() - Base)
-      return std::numeric_limits<uint64_t>::max();
-    return Base + Delta;
+    return ompfile::extents::saturatingAdd(Base, Delta);
   }
 
   uint64_t alignDown(uint64_t Value, uint64_t Alignment) const {
-    if (Alignment == 0)
-      return Value;
-    return (Value / Alignment) * Alignment;
+    return ompfile::extents::alignDown(Value, Alignment);
   }
 
   uint64_t alignUp(uint64_t Value, uint64_t Alignment) const {
-    if (Alignment == 0)
-      return Value;
-    const uint64_t Remainder = Value % Alignment;
-    if (Remainder == 0)
-      return Value;
-    const uint64_t Delta = Alignment - Remainder;
-    return saturatingAdd(Value, Delta);
+    return ompfile::extents::alignUp(Value, Alignment);
   }
 
   bool isCoveredByExtents(const std::vector<OmpFileStageExtent> &Extents,
                           uint64_t Begin, uint64_t End) const {
-    if (End <= Begin)
-      return true;
-    uint64_t Cursor = Begin;
-    for (const OmpFileStageExtent &Extent : Extents) {
-      if (Extent.End <= Cursor)
-        continue;
-      if (Extent.Begin > Cursor)
-        return false;
-      Cursor = std::max(Cursor, Extent.End);
-      if (Cursor >= End)
-        return true;
-    }
-    return Cursor >= End;
+    return ompfile::extents::isCoveredByExtents(Extents, Begin, End);
   }
 
   bool overlapsAnyExtent(const std::vector<OmpFileStageExtent> &Extents,
                          uint64_t Begin, uint64_t End) const {
-    if (End <= Begin)
-      return false;
-    for (const OmpFileStageExtent &Extent : Extents) {
-      if (Extent.End <= Begin)
-        continue;
-      if (Extent.Begin >= End)
-        return false;
-      return true;
-    }
-    return false;
+    return ompfile::extents::overlapsAnyExtent(Extents, Begin, End);
   }
 
   void addCoveredExtent(std::vector<OmpFileStageExtent> &Extents,
                         uint64_t Begin, uint64_t End) {
-    if (End <= Begin)
-      return;
-    OmpFileStageExtent NewExtent{Begin, End};
-    Extents.push_back(NewExtent);
-    std::sort(Extents.begin(), Extents.end(),
-              [](const OmpFileStageExtent &Lhs, const OmpFileStageExtent &Rhs) {
-                return Lhs.Begin < Rhs.Begin;
-              });
-    std::vector<OmpFileStageExtent> Merged;
-    Merged.reserve(Extents.size());
-    for (const OmpFileStageExtent &Extent : Extents) {
-      if (Merged.empty() || Extent.Begin > Merged.back().End) {
-        Merged.push_back(Extent);
-        continue;
-      }
-      Merged.back().End = std::max(Merged.back().End, Extent.End);
-    }
-    Extents.swap(Merged);
+    ompfile::extents::addCoveredExtent(Extents, Begin, End);
   }
 
   uint64_t removeCoveredRange(std::vector<OmpFileStageExtent> &Extents,
                               uint64_t Begin, uint64_t End) {
-    if (End <= Begin || Extents.empty())
-      return 0;
-
-    uint64_t RemovedBytes = 0;
-    std::vector<OmpFileStageExtent> Updated;
-    Updated.reserve(Extents.size());
-    for (const OmpFileStageExtent &Extent : Extents) {
-      if (Extent.End <= Begin || Extent.Begin >= End) {
-        Updated.push_back(Extent);
-        continue;
-      }
-
-      const uint64_t OverlapBegin = std::max(Extent.Begin, Begin);
-      const uint64_t OverlapEnd = std::min(Extent.End, End);
-      if (OverlapEnd > OverlapBegin)
-        RemovedBytes += (OverlapEnd - OverlapBegin);
-
-      if (Extent.Begin < Begin)
-        Updated.push_back(OmpFileStageExtent{Extent.Begin, Begin});
-      if (Extent.End > End)
-        Updated.push_back(OmpFileStageExtent{End, Extent.End});
-    }
-    Extents.swap(Updated);
-    return RemovedBytes;
+    return ompfile::extents::removeCoveredRange(Extents, Begin, End);
   }
 
   // --- Write-back dirty-region helpers ---

@@ -6,25 +6,11 @@ project(libompfile CXX)
 message(STATUS "OpenMP I/O debug logs enabled.")
 add_compile_definitions(OMP_IO_DEBUG)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/OmpFileSources.cmake)
 add_library(ompfile SHARED
-    src/file_interface.cpp
-    src/mpi_io_backend_config.cpp
-    src/mpi_io_backend_coherence.cpp
-    src/mpi_io_backend_file_ops.cpp
-    src/mpi_io_backend_forecast_affinity.cpp
-    src/mpi_io_backend_handles.cpp
-    src/mpi_io_backend_key_utils.cpp
-    src/mpi_io_backend_lifecycle.cpp
-    src/mpi_io_backend_metrics.cpp
-    src/mpi_io_backend_read_path.cpp
-    src/mpi_io_backend_remote_read_handles.cpp
-    src/mpi_io_backend_two_phase_cache.cpp
-    src/mpi_io_backend_two_phase_scheduler.cpp
-    src/mpi_io_backend_write_batch_grouping.cpp
-    src/mpi_io_backend_write_path.cpp
-    src/mpp_shim.cpp
-    src/posix_backend.cpp
-    src/io_uring_io_backend.cpp
+    ${OMPFILE_FRONTEND_SOURCES_REL}
+    ${OMPFILE_MPI_BACKEND_SOURCES_REL}
+    ${OMPFILE_LOCAL_BACKEND_SOURCES_REL}
 )
 
 find_package(MPI REQUIRED)
@@ -97,3 +83,12 @@ add_custom_command(
 add_custom_target(copy_ompfile_headers ALL
     DEPENDS "${CMAKE_BINARY_DIR}/include/file_interface.h"
 )
+
+# Unit tests of the pure units (wire codec, extent algebra, env readers). A
+# plain executable in the default target, so every runtime build compiles it;
+# the cluster build jobs run it after the build.
+option(OMPFILE_BUILD_UNIT_TESTS "Build libompfile's unit tests (tests/)" ON)
+if (OMPFILE_BUILD_UNIT_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
