@@ -49,6 +49,56 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   contract
 - `ProxyDevice` creates rank-targeted events and waits for completion.
 
+## Proxy queues and threads
+
+- Three queues, one pool each: `ExecEventQueue` (`LAUNCH_KERNEL` only),
+  `IoEventQueue` (every type `isFileIoEvent()` accepts — file ops, the
+  `OMPFILE_SCHED_*` control events, the coherence events), `DataEventQueue`
+  (everything else). The policy comment on those members in
+  `EventSystem.h` is the contract; keep it current.
+- A new `OMPFILE_*` event type must be added to `isFileIoEvent()` or it
+  silently lands on the data queue.
+- `OMPTARGET_NUM_IO_EVENT_HANDLERS` defaults to **4**, not 1, because an io
+  handler can block: the owner-forwarding paths (`openOnRank`,
+  `preadOnRank`, `pwriteOnRank`, `closeOnRank`) call `waitForEvent`, which
+  is `EventTy::wait()`. With one io thread, two proxies forwarding to each
+  other starve each other. Do not lower the default until those waits are
+  `co_await`s.
+- Each pool is at least one thread whatever its knob says.
+
+## MPI call lock invariant (do not regress)
+
+- `ompfileWithMPICallLock` serializes MPI calls process-wide when
+  `LIBOMPFILE_MPI_SERIALIZE` is on (the default). **Only non-blocking MPI
+  calls may go through it.** `sendBlocking`, `receiveBlocking` and
+  `receiveInBatchsBlocking` call MPI directly on purpose: a rendezvous-sized
+  blocking transfer held under that lock deadlocked two proxies that each
+  wrote a file the other owned (Sep 2026, rtm-miniapp checkpoint lane;
+  `docs/known-issues.md`). Safe because the runtime negotiates
+  `MPI_THREAD_MULTIPLE`, each event owns its (communicator, tag), and
+  `MPIRequestManagerTy` is move-only per-event state.
+- The one blocking call still under the lock is the gate thread's
+  `MPI_Mrecv` after a matching `MPI_Improbe`, which completes on call.
+
+## Tracing
+
+- NVTX ranges via `openmp/libompfile/include/ompfile_trace.h` only — never
+  include NVTX directly. Compiled in when `OMPFILE_ENABLE_NVTX` (CMake,
+  `openmp/libompfile/cmake/OmpFileNvtx.cmake`) finds the header — in practice
+  always, since both clusters build in the `ompc-base` container.
+- Event lifetimes are `rangeStart`/`rangeEnd` with the id in
+  `promise_type::TraceRangeId`, never push/pop: a proxy event is resumed by
+  whichever handler pops it. Push/pop (`Scope`) is for thread-local work
+  only.
+- Never put a range on a path that runs once per poll. `mpi-lock-wait` did,
+  opening on every contended acquisition: 2.5 million ranges in a 15 s rtm
+  run, a 7.5 GB nsys session, and a traced app rank that could not exit
+  inside the case timeout. It now opens only past a 100 us wait
+  (`OmpfileMPILockWaitTraceThreshold`); size any new range by its call
+  count, not by how interesting it sounds.
+- Collection recipe: `docs/getting-started.md`, "Tracing with Nsight
+  Systems".
+
 ## Scheduler behavior
 
 - `LIBOMPFILE_SCHEDULER=HEADNODE` triggers scheduler request on open.

@@ -19,6 +19,11 @@ target_link_libraries(EventSystem PRIVATE
   LLVMSupport
 )
 
+# NVTX ranges (ompfile_trace.h). PUBLIC so the origin plugin and the proxy tool,
+# which both link EventSystem, compile the same trace surface.
+include(${OMPFILE_INCLUDE_DIR}/../cmake/OmpFileNvtx.cmake)
+ompfile_enable_nvtx(EventSystem PUBLIC)
+
 target_compile_options(EventSystem PUBLIC ${offload_compile_flags})
 target_link_options(EventSystem PUBLIC ${offload_link_flags})
 

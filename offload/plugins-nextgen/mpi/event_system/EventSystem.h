@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <concepts>
 #include <condition_variable>
 #include <coroutine>
@@ -38,6 +39,7 @@
 
 #include "ompfile_mpp_abi.h"
 #include "ompfile_sched.h"
+#include "ompfile_trace.h"
 
 #include "Shared/APITypes.h"
 #include "Shared/EnvironmentVar.h"
@@ -62,17 +64,53 @@ inline bool ompfileSerializeMPICallsEnabled() {
   return Enabled;
 }
 
-inline std::mutex &ompfileMPICallMutex() {
-  static std::mutex M;
+inline std::timed_mutex &ompfileMPICallMutex() {
+  static std::timed_mutex M;
   return M;
 }
 
+/// A wait for the MPI call lock shorter than this is not traced.
+inline constexpr std::chrono::microseconds OmpfileMPILockWaitTraceThreshold{100};
+
+/// Serializes one MPI call against every other MPI call in the process when
+/// LIBOMPFILE_MPI_SERIALIZE is on (the default).
+///
+/// Invariant: only NON-BLOCKING MPI calls go through this lock (MPI_Isend,
+/// MPI_Irecv, MPI_Testany, MPI_Improbe, and the matched MPI_Mrecv on the gate
+/// thread, which completes as soon as it is called). A blocking call that
+/// needs the peer to act — MPI_Send, MPI_Recv — must never be made while
+/// holding it: a rendezvous-sized transfer then blocks inside the lock, and the
+/// threads that would make the progress calls to complete it need the same
+/// lock. With two proxies each writing a file the other owns, that deadlocks
+/// both processes (docs/known-issues.md, "The process-wide MPI serialization
+/// mutex deadlocks..."). The blocking helpers in EventSystem.cpp therefore call
+/// MPI directly; the runtime negotiates MPI_THREAD_MULTIPLE, and concurrent
+/// events already run on distinct (communicator, tag) pairs.
+///
+/// Only a wait longer than OmpfileMPILockWaitTraceThreshold is traced, as an
+/// "mpi-lock-wait" range that opens once the threshold has passed (so its width
+/// understates the wait by that much). A stuck process still shows every waiter
+/// as an open range. Short waits are the norm and must not be traced: the
+/// origin's polling threads contend for this lock on almost every resume, 2.5
+/// million times in a 15 s rtm run with a 0.4 us median and a 268 us maximum
+/// (job 828), and a range per contended acquisition made the app rank's nsys
+/// session grow by gigabytes.
 template <typename FnTy>
 inline decltype(auto) ompfileWithMPICallLock(FnTy &&Fn) {
   if (!ompfileSerializeMPICallsEnabled())
     return std::forward<FnTy>(Fn)();
 
-  std::lock_guard<std::mutex> Lock(ompfileMPICallMutex());
+  std::timed_mutex &M = ompfileMPICallMutex();
+  if constexpr (ompfile::trace::Enabled) {
+    if (!M.try_lock_for(OmpfileMPILockWaitTraceThreshold)) {
+      ompfile::trace::Scope Wait(ompfile::trace::Domain::MPP, "mpi-lock-wait",
+                                 ompfile::trace::Color::Wait);
+      M.lock();
+    }
+  } else {
+    M.lock();
+  }
+  std::lock_guard<std::timed_mutex> Lock(M, std::adopt_lock);
   return std::forward<FnTy>(Fn)();
 }
 
@@ -175,6 +213,38 @@ static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY) 
 static_assert(
     static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD_BATCH) ==
     45);
+
+/// True for the event types the proxy serves on its file-I/O queue
+/// (EventSystemTy::IoEventQueue): file operations, the HEADNODE scheduler's
+/// control traffic, and the write-back coherence events. The scheduler events
+/// go with the I/O they plan, so plan-before-use ordering stays inside one
+/// queue. This list is the one place that classification lives; a new
+/// OMPFILE_* event must be added here or it lands on the data queue.
+constexpr bool isFileIoEvent(EventTypeTy Type) {
+  switch (Type) {
+  case EventTypeTy::OMPFILE_PING:
+  case EventTypeTy::OMPFILE_OPEN:
+  case EventTypeTy::OMPFILE_CLOSE:
+  case EventTypeTy::OMPFILE_PREAD:
+  case EventTypeTy::OMPFILE_PREAD_NO_STAGE:
+  case EventTypeTy::OMPFILE_PWRITE:
+  case EventTypeTy::OMPFILE_SCHED_REQUEST:
+  case EventTypeTy::OMPFILE_SCHED_REQUEST_BATCH:
+  case EventTypeTy::OMPFILE_SCHED_PLAN:
+  case EventTypeTy::OMPFILE_STAGE_INVALIDATE:
+  case EventTypeTy::OMPFILE_FRESHNESS_QUERY:
+  case EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH:
+  case EventTypeTy::OMPFILE_FRESHNESS_WRITE_COMMIT:
+  case EventTypeTy::OMPFILE_PROXY_COPY_TILE:
+  case EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE:
+  case EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD:
+  case EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY:
+  case EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD_BATCH:
+    return true;
+  default:
+    return false;
+  }
+}
 
 using OmpFileFreshnessDecision = ompfile::OmpFileFreshnessDecision;
 using OmpFileFreshnessQueryRequest = ompfile::OmpFileFreshnessQueryRequest;
@@ -287,6 +357,8 @@ struct OmpFileDirtyOwnerPreadBatchReplySegment {
 };
 
 std::string EventTypeToString(EventTypeTy eventType);
+/// Same names, no allocation: for hot paths such as trace range labels.
+const char *eventTypeName(EventTypeTy eventType);
 
 // Aggregate local-clock phase durations, never cross-process timestamps.
 // Disabled unless OMPTARGET_MPI_TRANSFER_STATS=1. No MPI in destruction.
@@ -447,9 +519,18 @@ struct EventTy {
     uint64_t StatCreatedUs = 0;
     uint64_t StatFirstResumeUs = 0;
     uint32_t StatResumes = 0;
+    /// NVTX range id for this event's lifetime (ompfile_trace.h). An explicit
+    /// id rather than push/pop because a proxy event is resumed by whichever
+    /// handler pops it next, so its lifetime crosses threads. Zero and unused
+    /// unless the proxy gate starts one; the handler ends it on completion and
+    /// the destructor ends it if the event dies first (teardown, stopped queue).
+    uint64_t TraceRangeId = 0;
 
     promise_type() : CoroutineError(std::nullopt) {
       PrevHandle = RootHandle = CoHandleTy::from_promise(*this);
+    }
+    ~promise_type() {
+      ompfile::trace::rangeEnd(ompfile::trace::Domain::MPP, TraceRangeId);
     }
 
     /// Event coroutines should always suspend upon creation and finalization.
@@ -874,13 +955,24 @@ class EventSystemTy {
   /// generate unique MPI tags for each event.
   std::atomic<int> EventCounter{0};
 
-  /// Event queue between the local gate thread and the event handlers. The exec
-  /// queue is responsible for only running the execution events, while the data
-  /// queue executes all the other ones. This allows for long running execution
-  /// events to not block any data transfers (which are all done in a
-  /// non-blocking fashion).
+  /// Event queues between the local gate thread and the event handlers. This
+  /// comment is the plugin's scheduling policy:
+  ///
+  /// - Exec: LAUNCH_KERNEL only. Long-running execution must not block data
+  ///   transfers or file I/O.
+  /// - Io: every type isFileIoEvent() accepts. File I/O has its own queue and
+  ///   pool so it never occupies the kernel pool and so it can be scheduled as
+  ///   a domain of its own. Its handlers may block: the owner-forwarding paths
+  ///   (ProxyDevice openOnRank / preadOnRank / pwriteOnRank / closeOnRank) wait
+  ///   on a forwarded event with EventTy::wait(), which is why the pool defaults
+  ///   to more than one thread (OMPTARGET_NUM_IO_EVENT_HANDLERS). With a single
+  ///   io thread, two proxies forwarding to each other would each hold their
+  ///   only io thread waiting for the other. Turning those waits into co_await
+  ///   is what would let the pool go back to one.
+  /// - Data: everything else, which is all done in a non-blocking fashion.
   EventQueue ExecEventQueue{};
   EventQueue DataEventQueue{};
+  EventQueue IoEventQueue{};
 
   /// Event System execution state.
   std::atomic<EventSystemStateTy> EventSystemState{};

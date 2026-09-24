@@ -4,6 +4,7 @@
 #include "file_interface.h"
 #include "mpp_shim.h"
 #include "ompfile_sched.h"
+#include "ompfile_trace.h"
 #include "mpi.h"
 #include "mpi_io_backend.h"
 #include "posix_backend.h"
@@ -1013,7 +1014,10 @@ private:
     if (worker_started_)
       return;
     worker_started_ = true;
-    worker_ = std::thread([this] { workerLoop(); });
+    worker_ = std::thread([this] {
+      ompfile::trace::nameThisThread("ompfile-async-worker");
+      workerLoop();
+    });
   }
 
   void workerLoop() {
@@ -1034,7 +1038,16 @@ private:
                   task.payloadSize()};
       not_full_.notify_one();
       lock.unlock();
-      const int rc = executor_ ? executor_(task) : -1;
+      int rc = -1;
+      {
+        // The queued write actually running: its width against the issuing
+        // thread's short omp_file_pwrite range is the async overlap.
+        ompfile::trace::Scope Trace(ompfile::trace::Domain::LibOmpFile,
+                                    "async-write",
+                                    ompfile::trace::Color::Io,
+                                    task.payloadSize());
+        rc = executor_ ? executor_(task) : -1;
+      }
       // The write has run, so the caller's buffer goes back now — before the
       // completion is published, so a flush that returns cannot race a
       // release still in flight.
@@ -1643,6 +1656,13 @@ public:
 
 OmpFileClientContext *OmpFileClientContext::instance = nullptr;
 
+// One range per public call, on the calling thread (thread-local, so
+// push/pop). Payload = the request size where there is one.
+#define OMPFILE_API_TRACE(Name, Size)                                          \
+  ompfile::trace::Scope OmpFileApiTrace(ompfile::trace::Domain::LibOmpFile,   \
+                                        Name, ompfile::trace::Color::Io,       \
+                                        static_cast<uint64_t>(Size))
+
 extern "C" {
 
 // Reads cannot be fire-and-forget through the fixed C ABI (there is no
@@ -1660,6 +1680,7 @@ static void note_async_read_synchronous(int async) {
 }
 
 int omp_file_open(const char *filename) {
+  OMPFILE_API_TRACE("omp_file_open", 0);
   io_trace("omp_file_open api enter filename=%s\n",
            filename ? filename : "(null)");
   auto &ctx = OmpFileClientContext::getInstance();
@@ -1676,6 +1697,7 @@ int omp_file_write(int file_handle, const void *data, size_t size, int async) {
 
 int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size,
                     int async) {
+  OMPFILE_API_TRACE("omp_file_pwrite", size);
   auto &ctx = OmpFileClientContext::getInstance();
   return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
                          /*hint=*/nullptr, async != 0);
@@ -1684,6 +1706,7 @@ int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size,
 int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
                          size_t size, int async,
                          const omp_file_io_hint_v1 *hint) {
+  OMPFILE_API_TRACE("omp_file_pwrite_hint", size);
   auto &ctx = OmpFileClientContext::getInstance();
   return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
                          hint, async != 0);
@@ -1691,6 +1714,7 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
 
 int omp_file_pwrite_owned(int file_handle, long offset, void *data,
                           size_t size, void (*release)(void *)) {
+  OMPFILE_API_TRACE("omp_file_pwrite_owned", size);
   io_trace("omp_file_pwrite_owned api enter file_handle=%d offset=%ld "
            "size=%zu\n",
            file_handle, offset, size);
@@ -1705,6 +1729,7 @@ int omp_file_pwrite_owned(int file_handle, long offset, void *data,
 int omp_file_pwrite_owned_hint(int file_handle, long offset, void *data,
                                size_t size, void (*release)(void *),
                                const omp_file_io_hint_v1 *hint) {
+  OMPFILE_API_TRACE("omp_file_pwrite_owned_hint", size);
   io_trace("omp_file_pwrite_owned_hint api enter file_handle=%d offset=%ld "
            "size=%zu\n",
            file_handle, offset, size);
@@ -1716,6 +1741,7 @@ int omp_file_pwrite_owned_hint(int file_handle, long offset, void *data,
 }
 
 int omp_file_flush(int file_handle) {
+  OMPFILE_API_TRACE("omp_file_flush", 0);
   io_trace("omp_file_flush api enter file_handle=%d\n", file_handle);
   auto &ctx = OmpFileClientContext::getInstance();
   const int rc = ctx.flushFile(file_handle);
@@ -1724,6 +1750,7 @@ int omp_file_flush(int file_handle) {
 }
 
 int omp_file_flush_epoch(int file_handle, uint64_t epoch) {
+  OMPFILE_API_TRACE("omp_file_flush_epoch", epoch);
   io_trace("omp_file_flush_epoch api enter file_handle=%d epoch=%llu\n",
            file_handle, static_cast<unsigned long long>(epoch));
   auto &ctx = OmpFileClientContext::getInstance();
@@ -1733,6 +1760,7 @@ int omp_file_flush_epoch(int file_handle, uint64_t epoch) {
 }
 
 int omp_file_commit(int file_handle) {
+  OMPFILE_API_TRACE("omp_file_commit", 0);
   io_trace("omp_file_commit api enter file_handle=%d\n", file_handle);
   auto &ctx = OmpFileClientContext::getInstance();
   const int rc = ctx.commitFile(file_handle);
@@ -1742,6 +1770,7 @@ int omp_file_commit(int file_handle) {
 
 int omp_file_pread(int file_handle, long offset, void *data, size_t size,
                    int async) {
+  OMPFILE_API_TRACE("omp_file_pread", size);
   note_async_read_synchronous(async);
   io_trace("omp_file_pread api enter file_handle=%d offset=%ld size=%zu\n",
            file_handle, offset, size);
@@ -1753,6 +1782,7 @@ int omp_file_pread(int file_handle, long offset, void *data, size_t size,
 
 int omp_file_pread_hint(int file_handle, long offset, void *data, size_t size,
                         int async, const omp_file_io_hint_v1 *hint) {
+  OMPFILE_API_TRACE("omp_file_pread_hint", size);
   note_async_read_synchronous(async);
   auto &ctx = OmpFileClientContext::getInstance();
   return ctx.readFileAtHint(file_handle, data, size, offset, hint);
@@ -1765,6 +1795,7 @@ int omp_file_read(int file_handle, void *data, size_t size, int async) {
 }
 
 int omp_file_close(int file_handle) {
+  OMPFILE_API_TRACE("omp_file_close", 0);
   io_trace("omp_file_close api enter file_handle=%d\n", file_handle);
   auto &ctx = OmpFileClientContext::getInstance();
   const int rc = ctx.closeFile(file_handle);

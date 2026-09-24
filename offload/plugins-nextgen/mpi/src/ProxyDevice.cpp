@@ -854,6 +854,10 @@ struct ProxyDevice {
   ProxyDevice()
       : NumExecEventHandlers("OMPTARGET_NUM_EXEC_EVENT_HANDLERS", 1),
         NumDataEventHandlers("OMPTARGET_NUM_DATA_EVENT_HANDLERS", 1),
+        // More than one on purpose: an io handler can block in waitForEvent
+        // while forwarding to another rank (see the queue policy comment on
+        // EventSystemTy::IoEventQueue).
+        NumIoEventHandlers("OMPTARGET_NUM_IO_EVENT_HANDLERS", 4),
         EventPollingRate("OMPTARGET_EVENT_POLLING_RATE", 0),
         OmpFileOpenCacheEnable("LIBOMPFILE_OPT_OPEN_CACHE", false),
         OmpFileOpenCacheKeepOpen("LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN", true),
@@ -3528,6 +3532,8 @@ struct ProxyDevice {
   bool preadFully(int Fd, int64_t Offset, void *Buffer, uint64_t Size,
                   uint64_t *BytesReadOut, uint64_t *ElapsedUsOut,
                   int &ErrnoOut) {
+    ompfile::trace::Scope Trace(ompfile::trace::Domain::MPP, "fs-pread",
+                                ompfile::trace::Color::Syscall, Size);
     ErrnoOut = 0;
     if (BytesReadOut)
       *BytesReadOut = 0;
@@ -3589,6 +3595,8 @@ struct ProxyDevice {
   // fdatasync on an authoritative (source) fd, timed. Returns false with errno
   // preserved, exactly like ::fdatasync, so call sites keep their error paths.
   bool fdatasyncSourceTimed(int Fd) {
+    ompfile::trace::Scope Trace(ompfile::trace::Domain::MPP, "fs-fdatasync",
+                                ompfile::trace::Color::Syscall);
     const auto Start = std::chrono::steady_clock::now();
     const int Ret = ::fdatasync(Fd);
     const int SyncErrno = Ret != 0 ? errno : 0;
@@ -3606,6 +3614,8 @@ struct ProxyDevice {
   bool pwriteFully(int Fd, int64_t Offset, const void *Buffer, uint64_t Size,
                    uint64_t *BytesWrittenOut, uint64_t *ElapsedUsOut,
                    int &ErrnoOut) {
+    ompfile::trace::Scope Trace(ompfile::trace::Domain::MPP, "fs-pwrite",
+                                ompfile::trace::Color::Syscall, Size);
     ErrnoOut = 0;
     if (BytesWrittenOut)
       *BytesWrittenOut = 0;
@@ -7313,16 +7323,35 @@ struct ProxyDevice {
         ++Promise.StatResumes;
       }
 
-      Event.resume();
+      {
+        // One rotation on this thread: thread-local, so push/pop. The gap
+        // between the event's lifetime range starting and its first resume
+        // range is its queue wait.
+        ompfile::trace::Scope Trace(
+            ompfile::trace::Domain::MPP,
+            ompfile::trace::Enabled ? eventTypeName(Event.getEventType())
+                                    : "resume",
+            ompfile::trace::Color::Other);
 
-      // Bounded in-place retry (OMPTARGET_MPI_PROXY_EVENT_SPIN), so an event
-      // waiting on its counterpart does not pay a queue rotation per poll.
-      for (unsigned Spin = proxyEventSpin(); Spin > 0 && !Event.done(); --Spin)
         Event.resume();
+
+        // Bounded in-place retry (OMPTARGET_MPI_PROXY_EVENT_SPIN), so an event
+        // waiting on its counterpart does not pay a queue rotation per poll.
+        for (unsigned Spin = proxyEventSpin(); Spin > 0 && !Event.done();
+             --Spin)
+          Event.resume();
+      }
 
       if (!Event.done()) {
         Queue.push(std::move(Event));
         continue;
+      }
+
+      {
+        auto &Promise = Event.getHandle().promise();
+        ompfile::trace::rangeEnd(ompfile::trace::Domain::MPP,
+                                 Promise.TraceRangeId);
+        Promise.TraceRangeId = 0;
       }
 
       if (Stats) {
@@ -7355,18 +7384,31 @@ struct ProxyDevice {
 
     // Updates the event state and
     EventSystem.EventSystemState = EventSystemStateTy::RUNNING;
+    ompfile::trace::nameThisThread("mpp-gate");
 
-    // Spawns the event handlers.
+    // Spawns the event handlers: exec, then data, then io, positionally. Each
+    // pool is at least one thread, whatever the knob says, so no queue is ever
+    // left without a consumer.
+    const int NumExec = std::max(1, NumExecEventHandlers.get());
+    const int NumData = std::max(1, NumDataEventHandlers.get());
+    const int NumIo = std::max(1, NumIoEventHandlers.get());
     llvm::SmallVector<std::jthread> EventHandlers;
-    EventHandlers.resize(NumExecEventHandlers.get() +
-                         NumDataEventHandlers.get());
-    int EventHandlersSize = EventHandlers.size();
-    auto HandlerFunction = std::bind_front(&ProxyDevice::runEventHandler, this);
-    for (int Idx = 0; Idx < EventHandlersSize; Idx++) {
+    EventHandlers.resize(NumExec + NumData + NumIo);
+    for (int Idx = 0; Idx < NumExec + NumData + NumIo; Idx++) {
+      EventQueue *Queue = &EventSystem.IoEventQueue;
+      std::string Name = "mpp-io-" + std::to_string(Idx - NumExec - NumData);
+      if (Idx < NumExec) {
+        Queue = &EventSystem.ExecEventQueue;
+        Name = "mpp-exec-" + std::to_string(Idx);
+      } else if (Idx < NumExec + NumData) {
+        Queue = &EventSystem.DataEventQueue;
+        Name = "mpp-data-" + std::to_string(Idx - NumExec);
+      }
       EventHandlers[Idx] = std::jthread(
-          HandlerFunction, std::ref(Idx < NumExecEventHandlers.get()
-                                        ? EventSystem.ExecEventQueue
-                                        : EventSystem.DataEventQueue));
+          [this, Queue, Name = std::move(Name)](std::stop_token Stop) {
+            ompfile::trace::nameThisThread(Name.c_str());
+            runEventHandler(Stop, *Queue);
+          });
     }
 
     // Executes the gate thread logic
@@ -7563,8 +7605,32 @@ struct ProxyDevice {
       if (proxyEventStatsEnabled() && !NewEvent.empty())
         NewEvent.getHandle().promise().StatCreatedUs = proxyNowUs();
 
-      if (NewEventType == LAUNCH_KERNEL) {
+      // Route on the local NewEventType (the label written above is the same
+      // value, but this is the unambiguous source). Queue policy is documented
+      // on EventSystemTy's queue members.
+      const bool IsExec = NewEventType == LAUNCH_KERNEL;
+      const bool IsIo = isFileIoEvent(NewEventType);
+
+      // Event lifetime range: starts here, ends in whichever handler thread
+      // completes it. The payload is the correlation key the origin side also
+      // knows, (logical event id << 32) | origin rank, so origin and proxy
+      // reports can be lined up event by event.
+      if (!NewEvent.empty()) {
+        const uint64_t Key =
+            (static_cast<uint64_t>(static_cast<uint32_t>(EventInfo[1])) << 32) |
+            static_cast<uint32_t>(EventStatus.MPI_SOURCE);
+        NewEvent.getHandle().promise().TraceRangeId = ompfile::trace::rangeStart(
+            ompfile::trace::Domain::MPP, eventTypeName(NewEventType),
+            IsExec ? ompfile::trace::Color::Exec
+            : IsIo ? ompfile::trace::Color::Io
+                   : ompfile::trace::Color::Data,
+            Key);
+      }
+
+      if (IsExec) {
         EventSystem.ExecEventQueue.push(std::move(NewEvent));
+      } else if (IsIo) {
+        EventSystem.IoEventQueue.push(std::move(NewEvent));
       } else {
         EventSystem.DataEventQueue.push(std::move(NewEvent));
       }
@@ -7584,6 +7650,8 @@ private:
   IntEnvar NumExecEventHandlers;
   /// Number of data event handlers to spawn.
   IntEnvar NumDataEventHandlers;
+  /// Number of file-I/O event handlers to spawn (EventSystemTy::IoEventQueue).
+  IntEnvar NumIoEventHandlers;
   /// Polling rate period (us) used by event handlers.
   IntEnvar EventPollingRate;
   IntEnvar OmpFileOpenEioRetries;

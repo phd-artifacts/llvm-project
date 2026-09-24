@@ -28,6 +28,10 @@ target_link_libraries(ompfile PRIVATE dl)
 
 target_link_libraries(ompfile PUBLIC omp)
 
+# NVTX ranges (include/ompfile_trace.h), shared decision with the MPI plugin.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/OmpFileNvtx.cmake)
+ompfile_enable_nvtx(ompfile PRIVATE)
+
 # Let the library's include/ directory be available as a public include path
 target_include_directories(ompfile
     PUBLIC

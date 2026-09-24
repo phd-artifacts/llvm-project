@@ -48,6 +48,10 @@
   }
 
 std::string EventTypeToString(EventTypeTy eventType) {
+  return eventTypeName(eventType);
+}
+
+const char *eventTypeName(EventTypeTy eventType) {
   switch (eventType) {
     case EventTypeTy::RETRIEVE_NUM_DEVICES: return "RETRIEVE_NUM_DEVICES";
     case EventTypeTy::INIT_DEVICE: return "INIT_DEVICE";
@@ -272,6 +276,14 @@ void EventTy::resume() {
 
 /// Wait until event completes.
 void EventTy::wait() {
+  // The calling thread is consumed until the event completes: on the origin
+  // that is the thread that called omp_file_*, and on a proxy it is a handler
+  // thread forwarding to another rank. Thread-local, so a push/pop range; its
+  // width on the timeline is exactly the thread-occupancy cost.
+  ompfile::trace::Scope Trace(ompfile::trace::Domain::MPP,
+                              ompfile::trace::Enabled ? eventTypeName(EventType)
+                                                      : "event-wait",
+                              ompfile::trace::Color::Wait);
   // Advance the event progress until it is completed.
   while (!done()) {
     advance();
@@ -349,12 +361,19 @@ void MPIRequestManagerTy::sendTagged(const void *Buffer, int Size,
   }
 }
 
+// Deliberately NOT under ompfileWithMPICallLock: a blocking MPI_Send of a
+// rendezvous-sized chunk does not return until the peer posts its receive, and
+// the peer's receive may be waiting on this process's lock (see the invariant
+// on ompfileWithMPICallLock). Safe without it: MPI_THREAD_MULTIPLE is
+// negotiated, this event owns its (communicator, tag), and the request manager
+// is move-only per-event state, so there is nothing shared to protect.
 llvm::Error MPIRequestManagerTy::sendBlocking(const void *Buffer, int Size,
                                               MPI_Datatype Datatype) {
-  int MPIError = ompfileWithMPICallLock([&]() {
-    return MPI_Send(const_cast<void *>(Buffer), Size, Datatype, OtherRank, Tag,
-                    Comm);
-  });
+  ompfile::trace::Scope Trace(ompfile::trace::Domain::MPP, "mpi-blocking-send",
+                              ompfile::trace::Color::Wait,
+                              static_cast<uint64_t>(Size));
+  int MPIError = MPI_Send(const_cast<void *>(Buffer), Size, Datatype, OtherRank,
+                          Tag, Comm);
   if (MPIError != MPI_SUCCESS)
     return createError("Blocking MPI send failed with code %d", MPIError);
   return llvm::Error::success();
@@ -414,12 +433,14 @@ void MPIRequestManagerTy::receiveTagged(void *Buffer, int Size,
   }
 }
 
+// Not under ompfileWithMPICallLock, for the same reason as sendBlocking.
 llvm::Error MPIRequestManagerTy::receiveBlocking(void *Buffer, int Size,
                                                  MPI_Datatype Datatype) {
-  int MPIError = ompfileWithMPICallLock([&]() {
-    return MPI_Recv(Buffer, Size, Datatype, OtherRank, Tag, Comm,
-                    MPI_STATUS_IGNORE);
-  });
+  ompfile::trace::Scope Trace(ompfile::trace::Domain::MPP, "mpi-blocking-recv",
+                              ompfile::trace::Color::Wait,
+                              static_cast<uint64_t>(Size));
+  int MPIError = MPI_Recv(Buffer, Size, Datatype, OtherRank, Tag, Comm,
+                          MPI_STATUS_IGNORE);
   if (MPIError != MPI_SUCCESS)
     return createError("Blocking MPI receive failed with code %d", MPIError);
   return llvm::Error::success();
@@ -515,10 +536,13 @@ llvm::Error MPIRequestManagerTy::receiveInBatchsBlocking(void *Buffer,
   while (RemainingBytes > 0) {
     const int64_t Chunk = std::min({RemainingBytes, FragmentSize, MaxMPIChunk});
     assert(Chunk > 0 && "MPI fragment chunk must be positive.");
-    int MPIError = ompfileWithMPICallLock([&]() {
-      return MPI_Recv(&BufferByteArray[Offset], static_cast<int>(Chunk),
-                      MPI_BYTE, OtherRank, Tag, Comm, MPI_STATUS_IGNORE);
-    });
+    // Not under ompfileWithMPICallLock, for the same reason as sendBlocking.
+    ompfile::trace::Scope Trace(ompfile::trace::Domain::MPP,
+                                "mpi-blocking-recv", ompfile::trace::Color::Wait,
+                                static_cast<uint64_t>(Chunk));
+    int MPIError =
+        MPI_Recv(&BufferByteArray[Offset], static_cast<int>(Chunk), MPI_BYTE,
+                 OtherRank, Tag, Comm, MPI_STATUS_IGNORE);
     if (MPIError != MPI_SUCCESS)
       return createError("Blocking MPI receive failed with code %d", MPIError);
     Offset += Chunk;
