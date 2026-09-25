@@ -117,6 +117,18 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   local-handle -> {rank, remote_handle}.
 - `mppPread`/`mppPwrite` route via that stored rank.
 - `mppClose` closes on that stored rank and removes handle mapping.
+- Several `ompfile_mpp_*` exports exist twice: the origin definition in
+  `src/rtl.cpp` and a proxy-side one in `src/ProxyDevice.cpp`, which is what a
+  call from inside a target region resolves to. A proxy-side definition must
+  not assume the proxy running the region owns the file: the HEADNODE may
+  place it on a peer, and which one varies per run. `ompfile_mpp_commit_stage_path_key`
+  flushed only its own process until Sep 2026, so a commit from a region
+  reached nothing whenever the file lived on the peer; it now broadcasts
+  Action 3 like the origin (`commitPathKeyOnAllWorkers`).
+- Under `LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=close` a write-through write's
+  `fdatasync` waits in `OmpFileUnsyncedWriteFds` for the next commit or the
+  logical close; the commit handler drains it (`syncDeferredWritesForPathKey`).
+  Anything new that promises durability must drain that set too.
 
 ## Debug checklist
 

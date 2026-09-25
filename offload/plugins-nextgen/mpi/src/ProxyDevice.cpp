@@ -2214,6 +2214,13 @@ struct ProxyDevice {
       return false;
     }
 
+    // A commit is a durability point under every fsync policy. With "close"
+    // the write-through path left its fdatasync for the logical close, so
+    // drain it here for this file, or a commit would return before the bytes
+    // it promises are durable.
+    if (!syncDeferredWritesForPathKey(BasePathKey))
+      return false;
+
     std::vector<std::shared_ptr<OmpFileStageEntry>> Entries;
     {
       const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
@@ -2256,6 +2263,44 @@ struct ProxyDevice {
     }
 
     return AllOk;
+  }
+
+  // fdatasync the write-through fds that policy "close" left unsynced for one
+  // file, and the owner-bypass write fd for it. Each fd leaves the unsynced set
+  // only once its sync succeeded, so a failed commit is retried by the close.
+  bool syncDeferredWritesForPathKey(uint64_t BasePathKey) {
+    if (writethroughFsyncEachEnabled())
+      return true;
+    std::vector<int> Fds;
+    {
+      const std::lock_guard<std::mutex> UnsyncedLock(
+          OmpFileUnsyncedWriteFdMutex);
+      Fds.assign(OmpFileUnsyncedWriteFds.begin(),
+                 OmpFileUnsyncedWriteFds.end());
+    }
+    for (int Fd : Fds) {
+      std::string Path;
+      if (!getTrackedOmpFileFdPath(Fd, Path) ||
+          OmpFileHeadnodeManager::computePathKeyForPath(Path) != BasePathKey)
+        continue;
+      if (!fdatasyncSourceTimed(Fd))
+        return false;
+      const std::lock_guard<std::mutex> UnsyncedLock(
+          OmpFileUnsyncedWriteFdMutex);
+      OmpFileUnsyncedWriteFds.erase(Fd);
+    }
+    if (OmpFileLocalDisjointWrite) {
+      if (!flushLocalWriteBufs())
+        return false;
+      const std::lock_guard<std::mutex> Lock(OmpFileLocalWriteFdMutex);
+      for (auto &KV : OmpFileLocalWriteFds)
+        if (KV.second >= 0 &&
+            OmpFileHeadnodeManager::computePathKeyForPath(KV.first) ==
+                BasePathKey &&
+            ::fdatasync(KV.second) != 0)
+          return false;
+    }
+    return true;
   }
 
   bool flushLocalDirtyTileToSource(uint64_t TilePathKey, uint64_t Version) {
@@ -5765,6 +5810,49 @@ struct ProxyDevice {
     return true;
   }
 
+  // Commit issued on this proxy (from inside a target region): flush this
+  // process, then ask every peer proxy to do the same for the file, the way the
+  // origin's commit broadcasts Action 3. The file's writes live on whichever
+  // proxy owns it, which the HEADNODE may place on a peer, so a local-only
+  // flush would return with the owner's deferred fdatasyncs (fsync policy
+  // "close") and any dirty write-back stage still pending. Every peer is asked,
+  // not only the owner: a proxy holding nothing for the file answers at once.
+  bool commitPathKeyOnAllWorkers(uint64_t PathKey) {
+    if (PathKey == 0) {
+      errno = EINVAL;
+      return false;
+    }
+    int FirstErrno = 0;
+    if (!flushLocalDirtyStageForPathKey(PathKey))
+      FirstErrno = errno != 0 ? errno : EIO;
+
+    for (int Rank = 0; Rank < EventSystem.numWorkerRanks(); ++Rank) {
+      if (Rank == EventSystem.LocalRank)
+        continue;
+      OmpFileFlushDirtyTileRequest Request{};
+      Request.Action = 3;
+      Request.PathKey = PathKey;
+      OmpFileFlushDirtyTileReply Reply{};
+      EventTy Event = createRankEvent(OriginEvents::ompfileFlushDirtyTile,
+                                      EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE,
+                                      Rank, /*TargetDeviceId=*/0, &Request,
+                                      &Reply);
+      if (!waitForEvent(Event, "commit_stage_peer")) {
+        if (FirstErrno == 0)
+          FirstErrno = EIO;
+        continue;
+      }
+      if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
+        if (FirstErrno == 0)
+          FirstErrno = EPROTO;
+      } else if (Reply.Status != 0 && FirstErrno == 0) {
+        FirstErrno = Reply.Errno != 0 ? Reply.Errno : EIO;
+      }
+    }
+    errno = FirstErrno;
+    return FirstErrno == 0;
+  }
+
   bool completeDirtyFlushOnHeadnode(uint64_t PathKey, int SourceRank,
                                     uint64_t Version, bool Success) {
     if (PathKey == 0 || SourceRank < 0 || Version == 0) {
@@ -8060,13 +8148,12 @@ int ompfile_mpp_flush_dirty_tile(uint64_t PathKey, int *SourceRank,
 }
 
 // Proxy-side counterpart of the origin export in rtl.cpp. libompfile resolves
-// whichever definition its own process provides, and inside a proxy there is no
-// origin plugin to broadcast Action 3 with - nor any need for one, since this
-// process is the one holding the dirty stage. So commit here means "flush my
-// own stage", directly and without the event system.
-//
-// This is the path a commit issued from inside a target region takes, because
-// that region executes on the proxy.
+// whichever definition its own process provides; this is the path a commit
+// issued from inside a target region takes, because that region executes on
+// the proxy. It flushes this process and broadcasts Action 3 to the peer
+// proxies (commitPathKeyOnAllWorkers). Until Sep 2026 it flushed only this
+// process, on the assumption that the proxy running the region owns the file;
+// the HEADNODE can place it on a peer, and then the commit reached nothing.
 int ompfile_mpp_commit_stage_path_key(uint64_t PathKey) {
   ProxyDevice *PD = getActiveProxyDevice();
   if (!PD)
@@ -8074,7 +8161,7 @@ int ompfile_mpp_commit_stage_path_key(uint64_t PathKey) {
   if (PathKey == 0)
     return EINVAL;
   errno = 0;
-  if (!PD->flushLocalDirtyStageForPathKey(PathKey))
+  if (!PD->commitPathKeyOnAllWorkers(PathKey))
     return errno != 0 ? errno : EIO;
   return 0;
 }
