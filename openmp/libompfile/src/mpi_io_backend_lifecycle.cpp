@@ -62,6 +62,13 @@ MPIIOBackend::MPIIOBackend() {
   mpp_call_lock_bypass =
       parseBoolEnv("LIBOMPFILE_OPT_MPP_CALL_LOCK_FREE", false) &&
       provided == MPI_THREAD_MULTIPLE;
+  // Same fail-safe: releasing mpp_call_mutex between polls lets another client
+  // thread issue MPI while this write is in flight.
+  mpp_split_phase_writes =
+      parseBoolEnv("LIBOMPFILE_MPP_SPLIT_PHASE_WRITES", false) &&
+      provided == MPI_THREAD_MULTIPLE;
+  io_log("libompfile mpp_split_phase_writes=%d\n",
+         static_cast<int>(mpp_split_phase_writes));
   io_log("libompfile mpp_call_lock_bypass=%d (requested=%d thread_level=%d "
          "multiple=%d)\n",
          static_cast<int>(mpp_call_lock_bypass),

@@ -12,6 +12,13 @@ namespace mpp {
 bool init();
 bool submit(uint64_t token);
 bool poll(uint64_t token, bool &done);
+// Split-phase pwrite through the submit/poll seam. Available only when both
+// bridge entrypoints resolve; callers fall back to pwriteEx otherwise.
+bool splitPhaseWriteAvailable();
+uint64_t nextSplitPhaseToken();
+bool pwriteSubmit(int handle, int64_t offset, const void *buffer, size_t size,
+                  uint64_t token);
+bool pollEx(uint64_t token, bool &done, size_t &bytes);
 void finalize();
 bool ping();
 

@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <fstream>
 #include <cstdio>
+#include <optional>
 #include <cstdlib>
 #include <cstring>
 #include <fnmatch.h>
@@ -6074,6 +6075,110 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
+  // Split-phase counterpart of mppPwriteEx. Only a write to a peer owner has
+  // anything to overlap; the owner-bypass and local-owner paths complete here
+  // and the first poll reports them. Same result semantics as pwriteOnRank.
+  int mppPwriteSubmit(int Handle, int64_t Offset, const void *Buffer,
+                      uint64_t Size, uint64_t Token) {
+    if (!Buffer && Size > 0) {
+      errno = EINVAL;
+      return OFFLOAD_FAIL;
+    }
+    {
+      const std::lock_guard<std::mutex> Lock(MppEventMutex);
+      if (MppPendingWrites.count(Token)) {
+        errno = EEXIST;
+        return OFFLOAD_FAIL;
+      }
+    }
+    OmpFileHandleEntry Entry{};
+    if (!findRemoteHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+
+    auto Pending = std::make_unique<MppPendingWrite>();
+    Pending->Size = Size;
+    bool HardFail = false;
+    if (tryLocalDisjointPwrite(Entry, Offset, Buffer, Size, &Pending->Bytes,
+                               &HardFail)) {
+      Pending->Ok = true;
+    } else if (HardFail) {
+      return OFFLOAD_FAIL;
+    } else if (Entry.Rank == EventSystem.LocalRank) {
+      Pending->Ok = pwriteOnRank(Entry.Rank, Entry.RemoteHandle, Offset,
+                                 Buffer, Size, &Pending->Bytes);
+      Pending->Errno = Pending->Ok ? 0 : errno;
+    } else {
+      Pending->Event.emplace(createRankEvent(
+          OriginEvents::ompfilePwrite, EventTypeTy::OMPFILE_PWRITE,
+          Entry.Rank, /*TargetDeviceId=*/0, Entry.RemoteHandle, Offset, Buffer,
+          Size, &Pending->IoRet, &Pending->RemoteErrno, &Pending->Bytes));
+      if (Pending->Event->empty()) {
+        errno = EIO;
+        return OFFLOAD_FAIL;
+      }
+    }
+    const std::lock_guard<std::mutex> Lock(MppEventMutex);
+    MppPendingWrites.emplace(Token, std::move(Pending));
+    return OFFLOAD_SUCCESS;
+  }
+
+  int mppPollEx(uint64_t Token, int *Done, uint64_t *BytesOut) {
+    if (!Done || !BytesOut)
+      return OFFLOAD_FAIL;
+    *Done = 0;
+    *BytesOut = 0;
+    std::unique_ptr<MppPendingWrite> Pending;
+    {
+      const std::lock_guard<std::mutex> Lock(MppEventMutex);
+      auto It = MppPendingWrites.find(Token);
+      if (It == MppPendingWrites.end()) {
+        errno = ENOENT;
+        return OFFLOAD_FAIL;
+      }
+      Pending = std::move(It->second);
+      MppPendingWrites.erase(It);
+    }
+
+    if (!Pending->Event) {
+      *Done = 1;
+      *BytesOut = Pending->Bytes;
+      if (!Pending->Ok) {
+        errno = Pending->Errno;
+        return OFFLOAD_FAIL;
+      }
+      return OFFLOAD_SUCCESS;
+    }
+
+    Pending->Event->resume();
+    if (!Pending->Event->done()) {
+      const std::lock_guard<std::mutex> Lock(MppEventMutex);
+      MppPendingWrites.emplace(Token, std::move(Pending));
+      return OFFLOAD_SUCCESS;
+    }
+
+    *Done = 1;
+    if (auto Error = Pending->Event->getError()) {
+      REPORT("OMPFile split-phase pwrite event failed: %s\n",
+             toString(std::move(Error)).c_str());
+      errno = EIO;
+      return OFFLOAD_FAIL;
+    }
+    if (Pending->IoRet != 0) {
+      errno = Pending->RemoteErrno;
+      return OFFLOAD_FAIL;
+    }
+    if (Pending->Bytes > Pending->Size) {
+      errno = EPROTO;
+      return OFFLOAD_FAIL;
+    }
+    *BytesOut = Pending->Bytes;
+    if (Pending->Bytes < Pending->Size) {
+      errno = EIO;
+      return OFFLOAD_FAIL;
+    }
+    return OFFLOAD_SUCCESS;
+  }
+
   int mppOpen(const char *Path, int Flags, int Mode, int *Handle) {
     if (!Path || !Handle)
       return OFFLOAD_FAIL;
@@ -7951,6 +8056,20 @@ private:
   std::mutex MppEventMutex;
   std::unordered_map<uint64_t, EventTy> MppEvents;
   std::unordered_set<uint64_t> CompletedMppTokens;
+  // Split-phase writes (mppPwriteSubmit / mppPollEx), guarded by
+  // MppEventMutex. A poll owns its entry (taken out of the map) while it
+  // resumes the event.
+  struct MppPendingWrite {
+    std::optional<EventTy> Event; // empty: completed at submit
+    int IoRet = -1;
+    int RemoteErrno = 0;
+    uint64_t Bytes = 0;
+    uint64_t Size = 0;
+    bool Ok = false; // result of a write completed at submit
+    int Errno = 0;
+  };
+  std::unordered_map<uint64_t, std::unique_ptr<MppPendingWrite>>
+      MppPendingWrites;
 };
 
 static ProxyDevice *getActiveProxyDevice() {
@@ -8171,6 +8290,21 @@ int ompfile_mpp_poll(uint64_t Token, int *Done) {
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppPoll(Token, Done);
+}
+
+int ompfile_mpp_pwrite_submit(int Handle, int64_t Offset, const void *Buffer,
+                              uint64_t Size, uint64_t Token) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppPwriteSubmit(Handle, Offset, Buffer, Size, Token);
+}
+
+int ompfile_mpp_poll_ex(uint64_t Token, int *Done, uint64_t *Bytes) {
+  ProxyDevice *PD = getActiveProxyDevice();
+  if (!PD)
+    return OFFLOAD_FAIL;
+  return PD->mppPollEx(Token, Done, Bytes);
 }
 
 int ompfile_mpp_finalize() {

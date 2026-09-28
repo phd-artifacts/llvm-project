@@ -328,6 +328,10 @@ private:
   // Set once at init from LIBOMPFILE_OPT_MPP_CALL_LOCK_FREE and the granted MPI
   // thread level; never flipped afterwards, so it needs no synchronisation.
   bool mpp_call_lock_bypass = false;
+  // Set once at init from LIBOMPFILE_MPP_SPLIT_PHASE_WRITES (default off):
+  // remote writes go through the submit/poll seam and mpp_call_mutex is held
+  // per submit and per poll, not across the whole wait.
+  bool mpp_split_phase_writes = false;
 
   bool two_phase_batch_in_progress = false;
   bool write_batch_in_progress = false;
@@ -760,6 +764,8 @@ public:
   int writeAt(int file_id, long offset, const void *data, size_t size) override;
 
 private:
+  bool splitPhasePwrite(int remote_handle, long offset, const void *data,
+                        size_t size, size_t &bytes_written);
   int writeAtRemoteHandle(int remote_handle, long offset, const void *data,
                           size_t size, size_t &bytes_written);
   int writeAtBatched(int file_id, long offset, const void *data, size_t size,

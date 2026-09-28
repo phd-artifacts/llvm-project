@@ -2,6 +2,7 @@
 #include "ompfile_env.h"
 #include "mpi_io_backend.h"
 #include "mpp_shim.h"
+#include "ompfile_trace.h"
 
 #include <cassert>
 #include <cerrno>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -79,6 +81,38 @@ bool MPIIOBackend::isWriteBatchActive() const {
   return write_batch_enabled && mpp_remote_only;
 }
 
+// One remote write through the submit/poll seam. mpp_call_mutex is taken
+// for the submit and for each poll, never across the wait, and the wait
+// yields, then backs off, instead of spinning in EventTy::wait(). One NVTX
+// range per write (never per poll).
+bool MPIIOBackend::splitPhasePwrite(int remote_handle, long offset,
+                                    const void *data, size_t size,
+                                    size_t &bytes_written) {
+  bytes_written = 0;
+  const uint64_t token = ompfile::mpp::nextSplitPhaseToken();
+  {
+    const auto lock = instrumentedMppCallLock();
+    if (!ompfile::mpp::pwriteSubmit(remote_handle, offset, data, size, token))
+      return false;
+  }
+  ompfile::trace::Scope trace(ompfile::trace::Domain::LibOmpFile,
+                              "split-phase-wait", ompfile::trace::Color::Wait);
+  for (unsigned polls = 0;; ++polls) {
+    bool done = false;
+    bool ok = false;
+    {
+      const auto lock = instrumentedMppCallLock();
+      ok = ompfile::mpp::pollEx(token, done, bytes_written);
+    }
+    if (done || !ok)
+      return ok && done;
+    if (polls < 64)
+      std::this_thread::yield();
+    else
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+  }
+}
+
 int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
                                       const void *data, size_t size,
                                       size_t &bytes_written) {
@@ -96,7 +130,10 @@ int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
 
     bool pwrite_ok = false;
     size_t call_bytes_written = 0;
-    {
+    if (mpp_split_phase_writes && ompfile::mpp::splitPhaseWriteAvailable()) {
+      pwrite_ok = splitPhasePwrite(remote_handle, current_offset, cursor,
+                                   remaining, call_bytes_written);
+    } else {
       const auto lock = instrumentedMppCallLock();
       pwrite_ok = ompfile::mpp::pwriteEx(remote_handle, current_offset, cursor,
                                          remaining, call_bytes_written);

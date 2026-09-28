@@ -129,6 +129,14 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   `fdatasync` waits in `OmpFileUnsyncedWriteFds` for the next commit or the
   logical close; the commit handler drains it (`syncDeferredWritesForPathKey`).
   Anything new that promises durability must drain that set too.
+- Split-phase writes (`ompfile_mpp_pwrite_submit` / `ompfile_mpp_poll_ex`,
+  behind libompfile's `LIBOMPFILE_MPP_SPLIT_PHASE_WRITES`): a poll takes its
+  entry out of the token map while it resumes the event, so one event is never
+  resumed by two threads; the event's result slots live on the heap next to it.
+  Resuming an `OMPFILE_PWRITE` event runs its **blocking payload send on the
+  resuming thread**, so a split-phase write frees no thread until that send can
+  be suspended across (Sep 2026 trace). On a proxy, a file it owns completes at
+  submit — there is no event on that path.
 
 ## Debug checklist
 

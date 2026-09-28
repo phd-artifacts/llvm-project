@@ -21,6 +21,7 @@
 #include <cstring>
 #include <functional>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -209,6 +210,26 @@ static std::mutex &getOmpfileMppMutex() {
 static std::unordered_map<uint64_t, EventTy> &getOmpfileMppEvents() {
   static auto *Events = new std::unordered_map<uint64_t, EventTy>();
   return *Events;
+}
+
+// A write issued through the split-phase seam (ompfile_mpp_pwrite_submit /
+// ompfile_mpp_poll_ex). The event writes its result through pointers, so the
+// result slots live on the heap next to it and outlive the submit call.
+struct OmpfileMppPendingWrite {
+  std::optional<EventTy> Event;
+  int IoRet = -1;
+  int RemoteErrno = 0;
+  uint64_t Bytes = 0;
+  uint64_t Size = 0;
+};
+
+// Guarded by getOmpfileMppMutex(). A poll takes its entry out of the map for
+// the duration of the resume, so one event is never resumed by two threads.
+static std::unordered_map<uint64_t, std::unique_ptr<OmpfileMppPendingWrite>> &
+getOmpfileMppPendingWrites() {
+  static auto *Pending = new std::unordered_map<
+      uint64_t, std::unique_ptr<OmpfileMppPendingWrite>>();
+  return *Pending;
 }
 
 struct OmpfileMppHandleEntry {
@@ -2320,6 +2341,49 @@ int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
   return OFFLOAD_SUCCESS;
 }
 
+// Split-phase pwrite: create the event and return without waiting, so the
+// issuing thread is not consumed by EventTy::wait(); ompfile_mpp_poll_ex
+// advances it. Result semantics match ompfile_mpp_pwrite_ex (a short write is
+// reported, not failed; the caller loops).
+int ompfile_mpp_pwrite_submit(int Handle, int64_t Offset, const void *Buffer,
+                              uint64_t Size, uint64_t Token) {
+  using namespace llvm::omp::target::plugin;
+  if (!Buffer && Size > 0)
+    return OFFLOAD_FAIL;
+
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+  if (auto Err = Plugin->init())
+    return OFFLOAD_FAIL;
+  if (!Plugin->ensureEventSystemInitializedForOmpFile())
+    return OFFLOAD_FAIL;
+
+  OmpfileMppHandleEntry Entry{};
+  {
+    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+    if (!findOmpfileMppHandle(Handle, Entry))
+      return OFFLOAD_FAIL;
+    if (getOmpfileMppPendingWrites().count(Token)) {
+      errno = EEXIST;
+      return OFFLOAD_FAIL;
+    }
+  }
+
+  auto Pending = std::make_unique<OmpfileMppPendingWrite>();
+  Pending->Size = Size;
+  Pending->Event.emplace(Plugin->getEventSystemForOmpFile().createEvent(
+      OriginEvents::ompfilePwrite, EventTypeTy::OMPFILE_PWRITE,
+      /*DstDeviceID=*/Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
+      &Pending->IoRet, &Pending->RemoteErrno, &Pending->Bytes));
+  if (Pending->Event->empty())
+    return OFFLOAD_FAIL;
+
+  const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+  getOmpfileMppPendingWrites().emplace(Token, std::move(Pending));
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,
                        uint64_t Size) {
   uint64_t BytesWritten = 0;
@@ -2848,12 +2912,60 @@ int ompfile_mpp_poll(uint64_t Token, int *Done) {
   return OFFLOAD_SUCCESS;
 }
 
+// Advance a split-phase write once (resume, no sleep: the caller owns the
+// backoff). Done=0 leaves it pending; Done=1 retires the token and reports.
+int ompfile_mpp_poll_ex(uint64_t Token, int *Done, uint64_t *Bytes) {
+  using namespace llvm::omp::target::plugin;
+  if (!Done || !Bytes)
+    return OFFLOAD_FAIL;
+  *Done = 0;
+  *Bytes = 0;
+
+  std::unique_ptr<OmpfileMppPendingWrite> Pending;
+  {
+    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+    auto &Map = getOmpfileMppPendingWrites();
+    auto It = Map.find(Token);
+    if (It == Map.end()) {
+      errno = ENOENT;
+      return OFFLOAD_FAIL;
+    }
+    Pending = std::move(It->second);
+    Map.erase(It);
+  }
+
+  Pending->Event->resume();
+  if (!Pending->Event->done()) {
+    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
+    getOmpfileMppPendingWrites().emplace(Token, std::move(Pending));
+    return OFFLOAD_SUCCESS;
+  }
+
+  *Done = 1;
+  if (auto Error = Pending->Event->getError()) {
+    llvm::consumeError(std::move(Error));
+    errno = EIO;
+    return OFFLOAD_FAIL;
+  }
+  if (Pending->IoRet != 0) {
+    errno = Pending->RemoteErrno;
+    return OFFLOAD_FAIL;
+  }
+  if (Pending->Bytes > Pending->Size) {
+    errno = EPROTO;
+    return OFFLOAD_FAIL;
+  }
+  *Bytes = Pending->Bytes;
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_finalize() {
   using namespace llvm::omp::target::plugin;
   auto &Events = getOmpfileMppEvents();
   auto &Handles = getOmpfileMppHandles();
   const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
   Events.clear();
+  getOmpfileMppPendingWrites().clear();
   Handles.clear();
   return OFFLOAD_SUCCESS;
 }

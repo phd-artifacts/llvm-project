@@ -177,6 +177,46 @@ bool poll(uint64_t token, bool &done) {
   return true;
 }
 
+bool splitPhaseWriteAvailable() {
+  if (!init())
+    return false;
+  const MppApi api = getMppApiReloadIfMissing(&MppApi::pwrite_submit);
+  return api.pwrite_submit && api.poll_ex;
+}
+
+uint64_t nextSplitPhaseToken() {
+  static std::atomic<uint64_t> token{1};
+  return token.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool pwriteSubmit(int handle, int64_t offset, const void *buffer, size_t size,
+                  uint64_t token) {
+  if (!buffer && size > 0)
+    return false;
+  if (!init())
+    return false;
+  const MppApi api = getMppApiReloadIfMissing(&MppApi::pwrite_submit);
+  if (!api.pwrite_submit)
+    return false;
+  return api.pwrite_submit(handle, offset, buffer, size, token) == 0;
+}
+
+bool pollEx(uint64_t token, bool &done, size_t &bytes) {
+  done = false;
+  bytes = 0;
+  const MppApi api = getMppApiReloadIfMissing(&MppApi::poll_ex);
+  if (!api.poll_ex)
+    return false;
+  int raw_done = 0;
+  uint64_t raw_bytes = 0;
+  const int rc = api.poll_ex(token, &raw_done, &raw_bytes);
+  done = raw_done != 0;
+  if (raw_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+    return false;
+  bytes = static_cast<size_t>(raw_bytes);
+  return rc == 0;
+}
+
 void finalize() {
   const auto &api = getMppApi();
   if (api.finalize)

@@ -73,6 +73,9 @@ static_assert(std::is_trivially_copyable_v<OmpFileDirtyOwnerPreadBatchSegment>);
   X(pwrite_ex, int,                                                           \
     (int Handle, int64_t Offset, const void *Buffer, uint64_t Size,           \
      uint64_t *BytesWritten))                                                 \
+  X(pwrite_submit, int,                                                       \
+    (int Handle, int64_t Offset, const void *Buffer, uint64_t Size,           \
+     uint64_t Token))                                                         \
   X(stage_invalidate_path_key, int,                                           \
     (uint64_t PathKey, uint64_t Generation, const char *Path))                \
   X(freshness_query, int,                                                     \
@@ -97,6 +100,7 @@ static_assert(std::is_trivially_copyable_v<OmpFileDirtyOwnerPreadBatchSegment>);
      ompfile::OmpFileIOBatchPlan *Plan, void *PlanPayload,                    \
      uint64_t PlanPayloadCapBytes, uint64_t *PlanPayloadOutBytes))            \
   X(poll, int, (uint64_t Token, int *Done))                                   \
+  X(poll_ex, int, (uint64_t Token, int *Done, uint64_t *Bytes))               \
   X(finalize, int, ())
 
 extern "C" {
