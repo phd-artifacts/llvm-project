@@ -137,6 +137,21 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   resuming thread**, so a split-phase write frees no thread until that send can
   be suspended across (Sep 2026 trace). On a proxy, a file it owns completes at
   submit — there is no event on that path.
+- The pwrite payload send can suspend (`LIBOMPFILE_MPP_ASYNC_PWRITE_SEND=1`,
+  `ompfilePwrite` in `EventSystem.cpp`): header first, then the payload's
+  `MPI_Isend` fragments awaited on their own, then the completion receives —
+  never the payload and the completion in one wait. It was made blocking in
+  May 2026 (a1461b1) against `internal_Testall` aborts; polling has used
+  `MPI_Testany` since 494c060. An `MPI_Isend` progresses only while a thread
+  is inside MPI, so a suspended payload is only as fast as whoever polls it —
+  that, not the seam, is what limits several writes in flight (Sep 2026).
+- Which threads can block on a peer: the owner-forwarding helpers
+  (`openOnRank`, `preadOnRank`, `pwriteOnRank`, `closeOnRank`) run only on
+  kernel threads via the `mpp*` bridges. An I/O-handler coroutine reaches
+  `waitForEvent` only through the headnode coherence helpers
+  (`freshnessQueryOnHeadnode`, `freshnessWriteCommitOnHeadnode`,
+  `completeDirtyFlushOnHeadnode`), i.e. under write-back staging on a
+  non-headnode rank. Keep it that way, or make the new wait a `co_await`.
 
 ## Debug checklist
 

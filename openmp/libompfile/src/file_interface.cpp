@@ -697,12 +697,15 @@ static std::mutex &getClientContextInitMutex() {
 // overlaps the drain of write N instead of stalling behind it.
 //
 // Safety: the proxy initializes MPI at MPI_THREAD_MULTIPLE, so the worker may
-// call MPI concurrently. Even so, we keep exactly one worker and never let the
-// issuing thread touch the scheduler while writes are queued: it only enqueues
-// during a write wave and drains the engine at every sync point (open/close/
-// read/seek). That keeps scheduler/headnode state single-threaded in practice
-// while still overlapping issue with drain. If the runtime is ever initialized
-// below MPI_THREAD_SERIALIZED, async falls back to synchronous execution.
+// call MPI concurrently. By default there is exactly one worker, and the
+// issuing thread never touches the scheduler while writes are queued: it only
+// enqueues during a write wave and drains the engine at every sync point
+// (open/close/read/seek). LIBOMPFILE_ASYNC_WRITE_WORKERS > 1 lets several
+// queued writes run at once — the write path already serves concurrent
+// synchronous writers (two host threads, the write batcher's leader/follower)
+// — while writes whose byte ranges overlap still run one at a time in issue
+// order. If the runtime is ever initialized below MPI_THREAD_SERIALIZED, async
+// falls back to synchronous execution.
 class AsyncWriteEngine {
 public:
   struct Task {
@@ -764,6 +767,7 @@ public:
   void configure(Executor exec) {
     executor_ = std::move(exec);
     max_depth_ = resolveDepth();
+    num_workers_ = resolveWorkers();
   }
 
   // Lazily decides (once) whether the async worker path is usable. When it
@@ -825,7 +829,7 @@ public:
 
   bool active() {
     std::lock_guard<std::mutex> lock(mtx_);
-    return worker_started_ && (!queue_.empty() || busy_);
+    return worker_started_ && (!queue_.empty() || !in_flight_.empty());
   }
 
   // Waits until every queued write for `handle` has drained, then reports
@@ -900,10 +904,9 @@ public:
       return lo < offset + static_cast<long>(size) && offset < hi;
     };
     const auto pending = [&] {
-      if (current_.active &&
-          covers(current_.handle, current_.has_offset, current_.offset,
-                 current_.size))
-        return true;
+      for (const InFlight &f : in_flight_)
+        if (covers(f.handle, f.has_offset, f.offset, f.size))
+          return true;
       for (const Task &t : queue_)
         if (covers(t.handle, t.has_offset, t.offset, t.payloadSize()))
           return true;
@@ -912,7 +915,7 @@ public:
     if (!pending()) {
       // Counted only when something was outstanding: these are the reads a
       // drain would have stalled and this wait let through.
-      if (current_.active || !queue_.empty())
+      if (!in_flight_.empty() || !queue_.empty())
         ++range_wait_free_;
       return;
     }
@@ -932,7 +935,7 @@ public:
     if (!worker_started_)
       return sticky_error_;
     ++drain_calls_;
-    idle_.wait(lock, [&] { return queue_.empty() && !busy_; });
+    idle_.wait(lock, [&] { return queue_.empty() && in_flight_.empty(); });
     drain_wait_ns_ += static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start)
@@ -947,8 +950,9 @@ public:
       has_work_.notify_all();
       not_full_.notify_all();
     }
-    if (worker_.joinable())
-      worker_.join();
+    for (std::thread &worker : workers_)
+      if (worker.joinable())
+        worker.join();
     // Under LIBOMPFILE_OPT_STATS as well as the trace flag, so a benchmark
     // lane can assert from its log that the owned (zero-copy) submit engaged.
     // Once only: shutdown runs from the client context's destructor and again
@@ -962,7 +966,7 @@ public:
              "max_queue_depth=%zu drain_calls=%llu drain_wait_ns=%llu "
              "owned_enqueued=%llu owned_bytes=%llu range_waits=%llu "
              "range_wait_ns=%llu range_wait_free=%llu enqueue_waits=%llu "
-             "enqueue_wait_ns=%llu\n",
+             "enqueue_wait_ns=%llu workers=%zu max_in_flight=%zu\n",
              static_cast<unsigned long long>(enqueued_),
              static_cast<unsigned long long>(completed_), max_queue_depth_,
              static_cast<unsigned long long>(drain_calls_),
@@ -973,7 +977,8 @@ public:
              static_cast<unsigned long long>(range_wait_ns_),
              static_cast<unsigned long long>(range_wait_free_),
              static_cast<unsigned long long>(enqueue_waits_),
-             static_cast<unsigned long long>(enqueue_wait_ns_));
+             static_cast<unsigned long long>(enqueue_wait_ns_), num_workers_,
+             max_in_flight_);
   }
 
 private:
@@ -986,6 +991,22 @@ private:
         return static_cast<size_t>(v);
     }
     return 2; // double-buffer: one draining, one queued ahead
+  }
+
+  // LIBOMPFILE_ASYNC_WRITE_WORKERS: how many queued writes may be in flight at
+  // once (default 1, the historical single worker). Writes whose byte ranges
+  // overlap never run together and keep issue order; see nextDispatchable.
+  // Each running write holds an IO token, so keep this at or below
+  // LIBOMPFILE_IO_TOKENS or the extra workers only sleep in the token backoff.
+  static size_t resolveWorkers() {
+    const char *env = std::getenv("LIBOMPFILE_ASYNC_WRITE_WORKERS");
+    if (env && env[0]) {
+      char *end = nullptr;
+      long v = std::strtol(env, &end, 10);
+      if (end != env && v > 0)
+        return static_cast<size_t>(std::min<long>(v, 64));
+    }
+    return 1;
   }
 
   static bool resolveEnabled() {
@@ -1014,28 +1035,67 @@ private:
     if (worker_started_)
       return;
     worker_started_ = true;
-    worker_ = std::thread([this] {
-      ompfile::trace::nameThisThread("ompfile-async-worker");
-      workerLoop();
-    });
+    for (size_t i = 0; i < num_workers_; ++i)
+      workers_.emplace_back([this] {
+        ompfile::trace::nameThisThread("ompfile-async-worker");
+        workerLoop();
+      });
+  }
+
+  static bool rangesOverlap(int handle_a, bool offset_a, long off_a,
+                            size_t size_a, int handle_b, bool offset_b,
+                            long off_b, size_t size_b) {
+    if (handle_a != handle_b)
+      return false;
+    if (!offset_a || !offset_b)
+      return true; // a cursor write has no known range: exclusive per handle
+    return off_a < off_b + static_cast<long>(size_b) &&
+           off_b < off_a + static_cast<long>(size_a);
+  }
+
+  // Index of the oldest queued task that may start now: it overlaps no write
+  // in flight and no older queued write, so writes to one range still land in
+  // issue order. Returns queue_.size() when none can.
+  size_t nextDispatchable() const {
+    for (size_t i = 0; i < queue_.size(); ++i) {
+      const Task &t = queue_[i];
+      bool blocked = false;
+      for (const InFlight &f : in_flight_)
+        if (rangesOverlap(t.handle, t.has_offset, t.offset, t.payloadSize(),
+                          f.handle, f.has_offset, f.offset, f.size)) {
+          blocked = true;
+          break;
+        }
+      for (size_t j = 0; !blocked && j < i; ++j) {
+        const Task &o = queue_[j];
+        if (rangesOverlap(t.handle, t.has_offset, t.offset, t.payloadSize(),
+                          o.handle, o.has_offset, o.offset, o.payloadSize()))
+          blocked = true;
+      }
+      if (!blocked)
+        return i;
+    }
+    return queue_.size();
   }
 
   void workerLoop() {
     std::unique_lock<std::mutex> lock(mtx_);
     for (;;) {
-      has_work_.wait(lock, [&] { return !queue_.empty() || stop_; });
-      if (queue_.empty()) {
-        if (stop_)
-          return;
-        continue;
-      }
-      Task task = std::move(queue_.front());
-      queue_.pop_front();
-      busy_ = true;
-      // Keep the in-flight task's range visible to waitForRange while it is
-      // no longer in the queue.
-      current_ = {true, task.handle, task.has_offset, task.offset,
-                  task.payloadSize()};
+      size_t index = queue_.size();
+      has_work_.wait(lock, [&] {
+        index = nextDispatchable();
+        return index < queue_.size() || (stop_ && queue_.empty());
+      });
+      if (index >= queue_.size())
+        return; // stopping and nothing left to run
+      Task task = std::move(queue_[index]);
+      queue_.erase(queue_.begin() + static_cast<std::ptrdiff_t>(index));
+      // Keep the in-flight task's range visible to waitForRange and to the
+      // other workers while it is no longer in the queue.
+      const uint64_t flight_id = ++next_flight_id_;
+      in_flight_.push_back({flight_id, task.handle, task.has_offset,
+                            task.offset, task.payloadSize()});
+      max_in_flight_ = std::max(max_in_flight_, in_flight_.size());
       not_full_.notify_one();
       lock.unlock();
       int rc = -1;
@@ -1053,8 +1113,9 @@ private:
       // release still in flight.
       task.releaseOwned();
       lock.lock();
-      busy_ = false;
-      current_.active = false;
+      in_flight_.erase(std::find_if(
+          in_flight_.begin(), in_flight_.end(),
+          [&](const InFlight &f) { return f.id == flight_id; }));
       auto it = pending_.find(task.handle);
       if (it != pending_.end() && --it->second == 0)
         pending_.erase(it);
@@ -1079,6 +1140,8 @@ private:
       ++completed_;
       handle_done_.notify_all();
       idle_.notify_all();
+      // A queued write held back by this one's range may start now.
+      has_work_.notify_all();
     }
   }
 
@@ -1090,13 +1153,15 @@ private:
   std::condition_variable idle_;
   std::deque<Task> queue_;
   struct InFlight {
-    bool active = false;
+    uint64_t id = 0;
     int handle = -1;
     bool has_offset = false;
     long offset = 0;
     size_t size = 0;
   };
-  InFlight current_;
+  std::vector<InFlight> in_flight_;
+  uint64_t next_flight_id_ = 0;
+  size_t max_in_flight_ = 0;
   std::unordered_map<int, uint64_t> pending_;
   // First failing rc per handle; entries are dropped on close (see
   // forgetHandle) so a reused file id starts clean.
@@ -1105,12 +1170,12 @@ private:
   // a handle's whole epoch range in one pass; both stay small.
   std::map<EpochKey, uint64_t> pending_epoch_;
   std::map<EpochKey, int> epoch_error_;
-  std::thread worker_;
+  std::vector<std::thread> workers_;
+  size_t num_workers_ = 1;
   std::once_flag available_once_;
   size_t max_depth_ = 2;
   bool enabled_ = false;
   bool worker_started_ = false;
-  bool busy_ = false;
   bool stop_ = false;
   bool stats_reported_ = false;
   int sticky_error_ = 0;

@@ -458,6 +458,16 @@ int MPIIOBackend::writeAtBatched(int file_id, long offset, const void *data,
   if (size > 0)
     std::memcpy(request.Data.data(), data, size);
 
+  // Counts the threads inside the batched write path, so an adaptive leader
+  // can tell whether any follower could still arrive.
+  struct ActiveWriterGuard {
+    std::atomic<uint32_t> &count;
+    explicit ActiveWriterGuard(std::atomic<uint32_t> &c) : count(c) {
+      count.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~ActiveWriterGuard() { count.fetch_sub(1, std::memory_order_acq_rel); }
+  } active_writer(write_batch_active_writers);
+
   std::vector<WriteBatchRequest *> batch;
   const auto enqueue_ts = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lock(write_batch_mutex);
@@ -471,7 +481,10 @@ int MPIIOBackend::writeAtBatched(int file_id, long offset, const void *data,
     if (!write_batch_in_progress) {
       write_batch_in_progress = true;
       write_leader_turn_count.fetch_add(1, std::memory_order_relaxed);
-      if (write_batch_window_us > 0) {
+      const bool nobody_can_join =
+          write_batch_window_adaptive && write_batch_queue.size() <= 1 &&
+          write_batch_active_writers.load(std::memory_order_acquire) <= 1;
+      if (write_batch_window_us > 0 && !nobody_can_join) {
         const auto window_wait_begin = std::chrono::steady_clock::now();
         write_batch_queue_cv.wait_for(
             lock, std::chrono::microseconds(write_batch_window_us));

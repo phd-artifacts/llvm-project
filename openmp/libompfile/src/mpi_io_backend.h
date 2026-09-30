@@ -124,6 +124,11 @@ private:
   uint64_t two_phase_max_batch_bytes = 0;
   uint64_t two_phase_sieve_bytes = 0;
   uint64_t write_batch_window_us = 0;
+  // LIBOMPFILE_OPT_WRITE_BATCH_WINDOW_ADAPTIVE=1: a leader skips the window
+  // when it is the only thread in writeAtBatched and nothing else is queued,
+  // since no follower can arrive to join the batch. Default off.
+  bool write_batch_window_adaptive = false;
+  std::atomic<uint32_t> write_batch_active_writers{0};
   uint64_t write_batch_max_batch_bytes = 0;
   std::atomic<uint64_t> pread_request_count{0};
   std::atomic<uint64_t> remote_pread_event_count{0};

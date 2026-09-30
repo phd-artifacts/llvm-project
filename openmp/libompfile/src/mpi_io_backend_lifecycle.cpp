@@ -185,6 +185,10 @@ MPIIOBackend::MPIIOBackend() {
   write_batch_window_us =
       parseUint64Env("LIBOMPFILE_OPT_WRITE_BATCH_WINDOW_US",
                      write_batch_enabled ? kDefaultWriteBatchWindowUs : 0);
+  write_batch_window_adaptive =
+      parseBoolEnv("LIBOMPFILE_OPT_WRITE_BATCH_WINDOW_ADAPTIVE", false);
+  io_log("libompfile write_batch_window_adaptive=%d\n",
+         static_cast<int>(write_batch_window_adaptive));
   write_batch_max_batch_bytes =
       parseUint64Env("LIBOMPFILE_OPT_WRITE_BATCH_MAX_BATCH_BYTES",
                      write_batch_enabled ? kDefaultWriteBatchMaxBatchBytes : 0);

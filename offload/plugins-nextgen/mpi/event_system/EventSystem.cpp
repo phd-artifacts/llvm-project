@@ -154,6 +154,20 @@ bool ompfileTraceEnabled() {
   return Enabled;
 }
 
+// LIBOMPFILE_MPP_ASYNC_PWRITE_SEND=1: the pwrite payload leaves as
+// non-blocking fragments the event awaits, instead of a blocking MPI_Send on
+// whichever thread resumes the event. Default off. The blocking send dates
+// from May 2026 (a1461b1), a workaround for internal_Testall aborts from the
+// era of MPI_Testall polling; request polling has used MPI_Testany since
+// 494c060, which is what this knob exists to re-prove.
+bool ompfileAsyncPwriteSendEnabled() {
+  static const bool Enabled = []() {
+    const char *Env = std::getenv("LIBOMPFILE_MPP_ASYNC_PWRITE_SEND");
+    return Env && Env[0] == '1' && Env[1] == '\0';
+  }();
+  return Enabled;
+}
+
 bool ompfileMpiErrorsReturnEnabled() {
   static const bool Enabled = []() {
     const char *Env = std::getenv("LIBOMPFILE_DEBUG_MPI_ERRORS_RETURN");
@@ -1159,15 +1173,27 @@ EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
   RequestManager.send(&Offset, 1, MPI_INT64_T);
   RequestManager.send(&Size, 1, MPI_UINT64_T);
 
-  // Complete local ownership of the control sends before the blocking payload
-  // send. The proxy receives the control header before posting its matching
-  // blocking payload receive, so this keeps the payload path out of Testall.
+  // Complete local ownership of the control sends before the payload. The
+  // proxy receives the control header before posting its payload receive, so
+  // the payload never shares a wait with the header.
   if (auto Error = co_await RequestManager; Error)
     co_return Error;
 
   if (Size > 0) {
-    if (auto Error = RequestManager.sendInBatchsBlocking(Buffer, Size))
+    if (ompfileAsyncPwriteSendEnabled()) {
+      // Non-blocking fragments on this event's tag, awaited on their own
+      // before the completion receives are posted (never mix the payload and
+      // the completion in one wait). The event suspends here instead of
+      // holding the resuming thread for the rendezvous. The caller's buffer
+      // outlives the event: a synchronous pwrite waits for it, and the async
+      // engine owns its copy until the write completes.
+      RequestManager.sendInBatchs(const_cast<void *>(Buffer),
+                                  static_cast<int64_t>(Size));
+      if (auto Error = co_await RequestManager; Error)
+        co_return Error;
+    } else if (auto Error = RequestManager.sendInBatchsBlocking(Buffer, Size)) {
       co_return Error;
+    }
   }
 
   RequestManager.receive(IoRet, 1, MPI_INT);
