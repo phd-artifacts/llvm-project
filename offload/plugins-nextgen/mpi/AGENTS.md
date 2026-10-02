@@ -152,6 +152,15 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   (`freshnessQueryOnHeadnode`, `freshnessWriteCommitOnHeadnode`,
   `completeDirtyFlushOnHeadnode`), i.e. under write-back staging on a
   non-headnode rank. Keep it that way, or make the new wait a `co_await`.
+- The coherent read refresh (`refreshTrackedOmpFileFdForRead`: re-open +
+  `dup2` over the shared `O_RDWR` fd before a read) closes the old open file
+  description, and NFS flushes the inode's dirty pages on every close. With
+  unsynced writes outstanding (fsync policy `close`, no commit yet) every
+  restore read pays the previous store's write-back - 1.8 s per proxy over
+  320 reads on the rtm lane, the whole "restores slower after a close-policy
+  flush run" term. `LIBOMPFILE_OPT_COHERENT_READ_REFRESH=0` skips it; safe
+  only when every writer of a file is its owner proxy. Anything that wants
+  cheaper revalidation must avoid closing a descriptor on a dirty inode.
 
 ## Debug checklist
 

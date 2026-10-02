@@ -189,6 +189,18 @@ MPIIOBackend::MPIIOBackend() {
       parseBoolEnv("LIBOMPFILE_OPT_WRITE_BATCH_WINDOW_ADAPTIVE", false);
   io_log("libompfile write_batch_window_adaptive=%d\n",
          static_cast<int>(write_batch_window_adaptive));
+  two_phase_window_adaptive =
+      parseBoolEnv("LIBOMPFILE_OPT_TWO_PHASE_WINDOW_ADAPTIVE", false);
+  {
+    const char *stage_mode = std::getenv("LIBOMPFILE_STAGE_MODE");
+    const bool stage_off =
+        !stage_mode || !*stage_mode || std::strcmp(stage_mode, "off") == 0;
+    sched_once_per_handle =
+        parseBoolEnv("LIBOMPFILE_OPT_SCHED_ONCE_PER_HANDLE", false) && stage_off;
+  }
+  io_log("libompfile two_phase_window_adaptive=%d sched_once_per_handle=%d\n",
+         static_cast<int>(two_phase_window_adaptive),
+         static_cast<int>(sched_once_per_handle));
   write_batch_max_batch_bytes =
       parseUint64Env("LIBOMPFILE_OPT_WRITE_BATCH_MAX_BATCH_BYTES",
                      write_batch_enabled ? kDefaultWriteBatchMaxBatchBytes : 0);

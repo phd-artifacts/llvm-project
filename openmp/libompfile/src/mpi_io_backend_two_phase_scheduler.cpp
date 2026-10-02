@@ -44,6 +44,16 @@ int MPIIOBackend::readAtTwoPhase(
   request.HasPathKey = true;
   request.Hint = context.Hint;
 
+  // Counts the threads inside the two-phase read path, so an adaptive leader
+  // can tell whether any follower could still arrive.
+  struct ActiveReaderGuard {
+    std::atomic<uint32_t> &count;
+    explicit ActiveReaderGuard(std::atomic<uint32_t> &c) : count(c) {
+      count.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~ActiveReaderGuard() { count.fetch_sub(1, std::memory_order_acq_rel); }
+  } active_reader(two_phase_active_readers);
+
   const auto enqueue_ts = std::chrono::steady_clock::now();
   std::vector<TwoPhaseReadRequest *> batch;
   std::unique_lock<std::mutex> lock(two_phase_mutex);
@@ -68,7 +78,10 @@ int MPIIOBackend::readAtTwoPhase(
                two_phase_queue.size(),
                static_cast<unsigned long long>(two_phase_window_us));
 
-      if (two_phase_window_us > 0) {
+      const bool nobody_can_join =
+          two_phase_window_adaptive && two_phase_queue.size() <= 1 &&
+          two_phase_active_readers.load(std::memory_order_acquire) <= 1;
+      if (two_phase_window_us > 0 && !nobody_can_join) {
         const auto window_wait_begin = std::chrono::steady_clock::now();
         waitForTwoPhaseCollectionWindow(lock, two_phase_window_us);
         const auto window_wait_end = std::chrono::steady_clock::now();
@@ -319,8 +332,15 @@ void MPIIOBackend::processTwoPhaseGroup(
            "batch_id=%llu\n",
            coalesced.size(),
            static_cast<unsigned long long>(batch_request.BatchId));
-  if (ompfile::mpp::schedBatchRequest(batch_request, batch_segments, batch_plan,
-                                      batch_entries)) {
+  if (sched_once_per_handle) {
+    // No planner round trip: every segment continues on the opened-handle
+    // owner path, which is what the client does with a non-rebalanced plan
+    // anyway. Nothing to record; `planner_batches=` stays at 0 as evidence.
+    io_trace("MPIIOBackend::processTwoPhaseGroup planner skipped batch_id=%llu "
+             "(sched_once_per_handle)\n",
+             static_cast<unsigned long long>(batch_request.BatchId));
+  } else if (ompfile::mpp::schedBatchRequest(batch_request, batch_segments,
+                                             batch_plan, batch_entries)) {
     two_phase_planner_batch_count.fetch_add(1, std::memory_order_relaxed);
     two_phase_planner_segment_count.fetch_add(batch_entries.size(),
                                               std::memory_order_relaxed);

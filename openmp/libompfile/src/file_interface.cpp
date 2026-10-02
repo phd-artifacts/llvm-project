@@ -185,6 +185,24 @@ static bool localDisjointExpressEnabled() {
   return enabled;
 }
 
+// LIBOMPFILE_OPT_SCHED_ONCE_PER_HANDLE=1: the same skip of the per-op PWRITE /
+// scalar-PREAD round trips, without asserting the disjoint-access contract.
+// The owner is fixed at open and the client routes by the opened handle; what
+// the per-write trip adds on the headnode is freshness-version bookkeeping for
+// staged coherence, so the knob is honoured only with the stage off.
+static bool perOpSchedulingSkipped() {
+  static const bool skipped = [] {
+    if (localDisjointExpressEnabled())
+      return true;
+    const char *env = std::getenv("LIBOMPFILE_OPT_SCHED_ONCE_PER_HANDLE");
+    if (!(env && env[0] == '1' && env[1] == '\0'))
+      return false;
+    const char *stage_mode = std::getenv("LIBOMPFILE_STAGE_MODE");
+    return !stage_mode || !*stage_mode || std::strcmp(stage_mode, "off") == 0;
+  }();
+  return skipped;
+}
+
 class HeadnodeScheduler final : public IOScheduler {
 public:
   explicit HeadnodeScheduler(IOBackend &backend)
@@ -279,7 +297,7 @@ public:
         return -1;
       return backend.readAt(file_handle, offset, data, size);
     }
-    if (localDisjointExpressEnabled())
+    if (perOpSchedulingSkipped())
       return backend.readAt(file_handle, offset, data, size);
     ompfile::OmpFileReadRequestContext context{};
     if (!buildReadContext(file_handle, offset, size, nullptr, context))
@@ -302,7 +320,7 @@ public:
         return -1;
       return backend.writeAt(file_handle, offset, data, size);
     }
-    if (!localDisjointExpressEnabled() &&
+    if (!perOpSchedulingSkipped() &&
         !scheduleWrite(file_handle, offset, size, nullptr))
       return failStrict("writeAt");
     return backend.writeAt(file_handle, offset, data, size);
@@ -318,7 +336,7 @@ public:
         return -1;
       return backend.writeAtWithContext(context, data, size);
     }
-    if (mpp_sched_active && !localDisjointExpressEnabled() &&
+    if (mpp_sched_active && !perOpSchedulingSkipped() &&
         !scheduleWrite(file_handle, offset, size, hint))
       return failStrict("writeAtHint");
     return backend.writeAtWithContext(context, data, size);
@@ -565,7 +583,7 @@ private:
                  0,
              static_cast<unsigned long long>(context.PathKey));
 
-    if (two_phase_batch_preferred || localDisjointExpressEnabled()) {
+    if (two_phase_batch_preferred || perOpSchedulingSkipped()) {
       io_trace("HeadnodeScheduler::buildReadContext skip-scalar req_id=%llu "
                "file=%d offset=%lld size=%llu\n",
                static_cast<unsigned long long>(context.RequestId), file_handle,

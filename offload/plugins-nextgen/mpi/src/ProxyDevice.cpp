@@ -874,6 +874,8 @@ struct ProxyDevice {
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE", false)),
         OmpFileLocalDisjointRead(envBoolOrDefault(
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_READ", false)),
+        OmpFileCoherentReadRefresh(envBoolOrDefault(
+            "LIBOMPFILE_OPT_COHERENT_READ_REFRESH", true)),
         OmpFileLocalDisjointWriteCombine(envUint64OrDefault(
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_COMBINE", 0)),
         OmpFileLocalDisjointReadahead(envUint64OrDefault(
@@ -968,11 +970,13 @@ struct ProxyDevice {
     if (OmpFileOptStats || OmpFileOpenCacheEnable) {
       fprintf(stderr,
               "MPIProxyDevice --> OMPFile cache config rank=%d enabled=%d "
-              "keep_open=%d stats=%d blocking_pwrite=%d fragment_size=%lld\n",
+              "keep_open=%d stats=%d blocking_pwrite=%d fragment_size=%lld "
+              "coherent_read_refresh=%d\n",
               EventSystem.LocalRank, (int)OmpFileOpenCacheEnable.get(),
               (int)OmpFileOpenCacheKeepOpen.get(), (int)OmpFileOptStats.get(),
               (int)OmpFileForceBlockingPwrite.get(),
-              static_cast<long long>(OmpFileMPIFragmentSize.get()));
+              static_cast<long long>(OmpFileMPIFragmentSize.get()),
+              (int)OmpFileCoherentReadRefresh);
     }
     if (OmpFileOptStats || OmpFileOpenCacheEnable ||
         OmpFileStageMode != "off" || !OmpFileTopologyFile.empty()) {
@@ -2932,6 +2936,8 @@ struct ProxyDevice {
 
   bool shouldRefreshTrackedOmpFileFdForRead(
       const OmpFileTrackedFdEntry &Entry) const {
+    if (!OmpFileCoherentReadRefresh)
+      return false;
     if (!OmpFileHeadnodeScheduler)
       return false;
     if (Entry.Path.empty())
@@ -7876,6 +7882,15 @@ private:
   // (disjoint accesses, data visible in the PFS); fail-closed to the forward
   // path on open failure, error, or short read.
   bool OmpFileLocalDisjointRead = false;
+  // LIBOMPFILE_OPT_COHERENT_READ_REFRESH (default on): re-open + dup2 a shared
+  // O_RDWR descriptor before each read so it observes another NFS client's
+  // writes (close-to-open). The dup2 closes the old description, and NFS
+  // flushes the inode's dirty pages on every close, so with unsynced writes
+  // (fsync policy "close", no commit yet) each restore read pays the previous
+  // store's write-back: 1.8 s per proxy over 320 reads on the rtm lane
+  // against 37 ms with nothing dirty. Off is safe only when every writer of
+  // a file is its owner proxy (no owner-bypass, no out-of-band writers).
+  bool OmpFileCoherentReadRefresh = true;
   std::mutex OmpFileLocalReadFdMutex;
   std::unordered_map<std::string, int> OmpFileLocalReadFds; // path -> O_RDONLY fd
   std::atomic<uint64_t> OmpFileStatsLocalDisjointReads{0};

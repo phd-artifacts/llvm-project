@@ -129,6 +129,18 @@ private:
   // since no follower can arrive to join the batch. Default off.
   bool write_batch_window_adaptive = false;
   std::atomic<uint32_t> write_batch_active_writers{0};
+  // LIBOMPFILE_OPT_TWO_PHASE_WINDOW_ADAPTIVE=1: the two-phase read leader
+  // skips its collection window when it is the only thread in readAtTwoPhase
+  // and nothing else is queued. Default off.
+  bool two_phase_window_adaptive = false;
+  std::atomic<uint32_t> two_phase_active_readers{0};
+  // LIBOMPFILE_OPT_SCHED_ONCE_PER_HANDLE=1: no scheduler round trip per read
+  // batch (the two-phase planner) - the owner was fixed at open and the client
+  // routes by the opened handle anyway. Only honoured with the stage off,
+  // since the planner's answer is also where rebalanced/dirty-owner routing
+  // comes from. The per-write round trip is skipped on the scheduler side
+  // (file_interface.cpp) under the same knob. Default off.
+  bool sched_once_per_handle = false;
   uint64_t write_batch_max_batch_bytes = 0;
   std::atomic<uint64_t> pread_request_count{0};
   std::atomic<uint64_t> remote_pread_event_count{0};
