@@ -7,8 +7,6 @@
 #include "ompfile_trace.h"
 #include "mpi.h"
 #include "mpi_io_backend.h"
-#include "posix_backend.h"
-#include "io_uring_io_backend.h"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -51,20 +49,6 @@ static const char *schedulerOpToString(ompfile::OmpFileIOOp op) {
   return "UNKNOWN";
 }
 
-static const char *backendTypeToString(IOBackendTy backend_type) {
-  switch (backend_type) {
-  case IOBackendTy::MPI:
-    return "MPI";
-  case IOBackendTy::POSIX:
-    return "POSIX";
-  case IOBackendTy::IO_URING:
-    return "IO_URING";
-  case IOBackendTy::HDF5:
-    return "HDF5";
-  }
-  return "UNKNOWN";
-}
-
 static bool envFlagEnabled(const char *name) {
   return ompfile::env::flag(name);
 }
@@ -79,11 +63,6 @@ static bool asyncReadWaitIsRange() {
     return value && std::string(value) == "range";
   }();
   return range;
-}
-
-static bool isMppRemoteOnlyEnabled() {
-  return MPIIOBackend::parseBoolEnv("LIBOMPFILE_MPP_OPEN", false) &&
-         MPIIOBackend::parseBoolEnv("LIBOMPFILE_MPP_IO", false);
 }
 
 static void applyIoHint(ompfile::OmpFileIOHint &dst,
@@ -207,24 +186,17 @@ class HeadnodeScheduler final : public IOScheduler {
 public:
   explicit HeadnodeScheduler(IOBackend &backend)
       : backend(backend), client_rank(resolveClientRank()),
-        mpp_remote_only_enabled(isMppRemoteOnlyEnabled()),
-        allow_fallback(envFlagEnabled("LIBOMPFILE_ALLOWFALLBACK")),
-        strict_mpp_required(mpp_remote_only_enabled && !allow_fallback),
+        mpp_remote_only_enabled(ompfile::env::rejectedModeKnobs().empty()),
         mpp_sched_active(mpp_remote_only_enabled && ompfile::mpp::init()),
         two_phase_batch_preferred(mpp_sched_active &&
                                   shouldPreferBatchReadPlanner()) {
     if (!mpp_remote_only_enabled) {
-      io_log("HEADNODE scheduler requested but MPP remote-only mode is "
-             "disabled (requires LIBOMPFILE_MPP_OPEN=1 and "
-             "LIBOMPFILE_MPP_IO=1); using LOCAL dispatch.\n");
+      io_log("HEADNODE scheduler requested but a removed libompfile mode was "
+             "requested (see the 'libompfile init failed' line); all "
+             "scheduler operations will fail.\n");
     } else if (!mpp_sched_active) {
-      if (allow_fallback) {
-        io_log("HEADNODE scheduler requested but MPP init failed; "
-               "LIBOMPFILE_ALLOWFALLBACK=1, using LOCAL dispatch.\n");
-      } else {
-      io_log("HEADNODE scheduler requested but MPP init failed; fallback is "
-             "disabled, all scheduler operations will fail.\n");
-      }
+      io_log("HEADNODE scheduler requested but MPP init failed; all scheduler "
+             "operations will fail.\n");
     }
     if (two_phase_batch_preferred) {
       io_log("HEADNODE scheduler: two-phase batch planner active; skipping "
@@ -244,8 +216,15 @@ public:
         open_plan_ptr = &open_plan;
     }
     const int file_handle = backend.openWithPlan(filename, open_plan_ptr);
-    if (file_handle >= 0 && filename)
-      rememberOpenPath(file_handle, filename);
+    if (file_handle >= 0 && filename) {
+      rememberOpenPath(file_handle, filename,
+                       open_plan_ptr ? open_plan_ptr->AggregatorRank : -1);
+    } else if (file_handle < 0 && open_plan_ptr) {
+      // The headnode counted this open and nothing will close it.
+      const int saved_errno = errno;
+      (void)scheduleClose(/*file_handle=*/-1, open_plan_ptr->AggregatorRank);
+      errno = saved_errno;
+    }
     return file_handle;
   }
 
@@ -267,8 +246,9 @@ public:
     return backend.read(file_handle, data, size);
   }
 
-  // Commit needs no scheduler round trip: it changes no open/close state and
-  // the backend owns the headnode dirty-tile flush protocol it delegates to.
+  // Commit needs no scheduler round trip: it changes no open/close state.
+  // The backend broadcasts a version-free stage flush for the file
+  // (commitStagePathKey), not the headnode dirty-tile flush protocol.
   int commit(int file_handle) override { return backend.commit(file_handle); }
 
   int close(int file_handle) override {
@@ -276,11 +256,11 @@ public:
     if (!ensureSchedulerReady("close", /*log_once=*/true))
       schedule_ok = false;
     if (mpp_sched_active)
-      schedule_ok = scheduleClose(file_handle);
+      schedule_ok = scheduleClose(file_handle, takePlannedRank(file_handle));
     const int rc = backend.close(file_handle);
     if (rc == 0)
       forgetOpenPath(file_handle);
-    if (!schedule_ok && strict_mpp_required)
+    if (!schedule_ok)
       return failStrict("close");
     return rc;
   }
@@ -292,11 +272,8 @@ public:
   }
 
   int readAt(int file_handle, long offset, void *data, size_t size) override {
-    if (!mpp_sched_active) {
-      if (!ensureSchedulerReady("readAt", /*log_once=*/true))
-        return -1;
-      return backend.readAt(file_handle, offset, data, size);
-    }
+    if (!ensureSchedulerReady("readAt", /*log_once=*/true))
+      return -1;
     if (perOpSchedulingSkipped())
       return backend.readAt(file_handle, offset, data, size);
     ompfile::OmpFileReadRequestContext context{};
@@ -315,11 +292,8 @@ public:
 
   int writeAt(int file_handle, long offset, const void *data,
               size_t size) override {
-    if (!mpp_sched_active) {
-      if (!ensureSchedulerReady("writeAt", /*log_once=*/true))
-        return -1;
-      return backend.writeAt(file_handle, offset, data, size);
-    }
+    if (!ensureSchedulerReady("writeAt", /*log_once=*/true))
+      return -1;
     if (!perOpSchedulingSkipped() &&
         !scheduleWrite(file_handle, offset, size, nullptr))
       return failStrict("writeAt");
@@ -331,12 +305,9 @@ public:
     ompfile::OmpFileWriteRequestContext context{};
     if (!buildWriteContext(file_handle, offset, size, hint, context))
       return -1;
-    if (!mpp_sched_active) {
-      if (!ensureSchedulerReady("writeAtHint", /*log_once=*/true))
-        return -1;
-      return backend.writeAtWithContext(context, data, size);
-    }
-    if (mpp_sched_active && !perOpSchedulingSkipped() &&
+    if (!ensureSchedulerReady("writeAtHint", /*log_once=*/true))
+      return -1;
+    if (!perOpSchedulingSkipped() &&
         !scheduleWrite(file_handle, offset, size, hint))
       return failStrict("writeAtHint");
     return backend.writeAtWithContext(context, data, size);
@@ -346,13 +317,14 @@ private:
   struct TrackedFileMetadata {
     std::string Path;
     uint64_t PathKey = 0;
+    // AggregatorRank of the OPEN plan that counted this handle on the
+    // headnode, sent back with its CLOSE; -1 once released or if unplanned.
+    int PlannedRank = -1;
   };
 
   IOBackend &backend;
   int client_rank = -1;
   const bool mpp_remote_only_enabled = false;
-  const bool allow_fallback = false;
-  const bool strict_mpp_required = false;
   const bool mpp_sched_active = false;
   const bool two_phase_batch_preferred = false;
   std::atomic<uint64_t> request_id{1};
@@ -397,9 +369,8 @@ private:
   int failStrict(const char *op_name) {
     errno = EIO;
     if (!strict_failure_logged.exchange(true, std::memory_order_relaxed)) {
-      io_log("HEADNODE scheduler operation '%s' failed because MPP is required "
-             "and fallback is disabled. Set LIBOMPFILE_ALLOWFALLBACK=1 to "
-             "restore local fallback.\n",
+      io_log("HEADNODE scheduler operation '%s' failed: MPP is not available "
+             "(remote-only MPP is libompfile's only mode).\n",
              op_name ? op_name : "(unknown)");
     }
     io_trace("HeadnodeScheduler::failStrict scheduler=%p op=%s\n",
@@ -408,15 +379,12 @@ private:
   }
 
   bool ensureSchedulerReady(const char *op_name, bool log_once) {
-    if (!strict_mpp_required)
-      return true;
     if (mpp_sched_active)
       return true;
     if (!log_once || !strict_failure_logged.load(std::memory_order_relaxed)) {
       io_trace("HeadnodeScheduler::ensureSchedulerReady fail scheduler=%p op=%s "
-               "strict=%d mpp_remote_only=%d mpp_sched_active=%d\n",
+               "mpp_remote_only_enabled=%d mpp_sched_active=%d\n",
                static_cast<void *>(this), op_name ? op_name : "(unknown)",
-               static_cast<int>(strict_mpp_required),
                static_cast<int>(mpp_remote_only_enabled),
                static_cast<int>(mpp_sched_active));
     }
@@ -441,12 +409,13 @@ private:
     return hash;
   }
 
-  void rememberOpenPath(int file_handle, const char *path) {
+  void rememberOpenPath(int file_handle, const char *path, int planned_rank) {
     if (!path)
       return;
     TrackedFileMetadata metadata{};
     metadata.Path = path;
     metadata.PathKey = computePathKey(path);
+    metadata.PlannedRank = planned_rank;
     const std::lock_guard<std::mutex> lock(tracked_file_mutex);
     tracked_file_map[file_handle] = std::move(metadata);
   }
@@ -454,6 +423,18 @@ private:
   void forgetOpenPath(int file_handle) {
     const std::lock_guard<std::mutex> lock(tracked_file_mutex);
     tracked_file_map.erase(file_handle);
+  }
+
+  // The planned rank recorded at open, cleared so a retried close of the
+  // same handle cannot release the headnode count twice.
+  int takePlannedRank(int file_handle) {
+    const std::lock_guard<std::mutex> lock(tracked_file_mutex);
+    auto it = tracked_file_map.find(file_handle);
+    if (it == tracked_file_map.end())
+      return -1;
+    const int rank = it->second.PlannedRank;
+    it->second.PlannedRank = -1;
+    return rank;
   }
 
   bool getTrackedPath(int file_handle, std::string &path_out,
@@ -484,14 +465,9 @@ private:
     {
       const std::lock_guard<std::mutex> lock(sched_request_mutex);
       if (!ompfile::mpp::schedRequest(req, path, plan)) {
-        if (strict_mpp_required) {
-          errno = EIO;
-          io_log("HEADNODE scheduler request failed (global manager "
-                 "unavailable); fallback is disabled.\n");
-        } else {
-          io_log("HEADNODE scheduler request failed (global manager "
-                 "unavailable); falling back to LOCAL.\n");
-        }
+        errno = EIO;
+        io_log("HEADNODE scheduler request failed (global manager "
+               "unavailable).\n");
         io_trace("HeadnodeScheduler::schedRequest mpp call failed req_id=%llu\n",
                  static_cast<unsigned long long>(req.RequestId));
         return false;
@@ -527,20 +503,22 @@ private:
     io_trace("HeadnodeScheduler::scheduleOpen scheduler=%p req_id=%llu path=%s\n",
              static_cast<void *>(this),
              static_cast<unsigned long long>(req.RequestId), path);
-    return schedRequest(req, path, plan_out) || !strict_mpp_required;
+    return schedRequest(req, path, plan_out);
   }
 
-  bool scheduleClose(int file_handle) {
+  bool scheduleClose(int file_handle, int planned_rank) {
     ompfile::OmpFileIORequest req{};
     req.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
     req.Op = ompfile::OmpFileIOOp::CLOSE;
     req.ClientRank = client_rank;
     req.FileHandle = file_handle;
+    req.AggregatorRank = planned_rank;
     io_trace("HeadnodeScheduler::scheduleClose scheduler=%p req_id=%llu "
-             "file=%d\n",
+             "file=%d planned_rank=%d\n",
              static_cast<void *>(this),
-             static_cast<unsigned long long>(req.RequestId), file_handle);
-    return schedRequest(req, nullptr, nullptr) || !strict_mpp_required;
+             static_cast<unsigned long long>(req.RequestId), file_handle,
+             planned_rank);
+    return schedRequest(req, nullptr, nullptr);
   }
 
   bool buildReadContext(int file_handle, long offset, size_t size,
@@ -594,7 +572,7 @@ private:
 
     ompfile::OmpFileIOPlan plan{};
     if (!schedRequest(req, nullptr, &plan))
-      return !strict_mpp_required;
+      return false;
 
     context.ContextFlags |= ompfile::OMPFILE_READ_CTX_HAS_PLAN;
     context.Plan = plan;
@@ -630,8 +608,7 @@ private:
       req.PathSize = static_cast<uint32_t>(tracked_path.size() + 1);
 
     return schedRequest(req, has_path ? tracked_path.c_str() : nullptr,
-                        nullptr) ||
-           !strict_mpp_required;
+                        nullptr);
   }
 
   bool buildWriteContext(int file_handle, long offset, size_t size,
@@ -685,21 +662,14 @@ static int resolveDefaultIOTokens() {
 }
 
 static IOSchedulerTy getSchedulerType() {
-  const char *env = std::getenv("LIBOMPFILE_SCHEDULER");
-  if (!env) {
-    return IOSchedulerTy::LOCAL;
+  bool unknown = false;
+  const bool headnode = ompfile::env::schedulerIsHeadnode(&unknown);
+  if (unknown) {
+    const char *env = std::getenv("LIBOMPFILE_SCHEDULER");
+    io_log("Unknown LIBOMPFILE_SCHEDULER '%s', defaulting to HEADNODE\n",
+           env ? env : "");
   }
-
-  std::string envStr(env);
-  if (envStr == "LOCAL") {
-    return IOSchedulerTy::LOCAL;
-  }
-  if (envStr == "HEADNODE") {
-    return IOSchedulerTy::HEADNODE;
-  }
-
-  io_log("Unknown LIBOMPFILE_SCHEDULER '%s', defaulting to LOCAL\n", env);
-  return IOSchedulerTy::LOCAL;
+  return headnode ? IOSchedulerTy::HEADNODE : IOSchedulerTy::LOCAL;
 }
 
 static std::mutex &getClientContextInitMutex() {
@@ -715,15 +685,12 @@ static std::mutex &getClientContextInitMutex() {
 // overlaps the drain of write N instead of stalling behind it.
 //
 // Safety: the proxy initializes MPI at MPI_THREAD_MULTIPLE, so the worker may
-// call MPI concurrently. By default there is exactly one worker, and the
-// issuing thread never touches the scheduler while writes are queued: it only
-// enqueues during a write wave and drains the engine at every sync point
-// (open/close/read/seek). LIBOMPFILE_ASYNC_WRITE_WORKERS > 1 lets several
-// queued writes run at once — the write path already serves concurrent
-// synchronous writers (two host threads, the write batcher's leader/follower)
-// — while writes whose byte ranges overlap still run one at a time in issue
-// order. If the runtime is ever initialized below MPI_THREAD_SERIALIZED, async
-// falls back to synchronous execution.
+// call MPI concurrently. Even so, we keep exactly one worker and never let the
+// issuing thread touch the scheduler while writes are queued: it only enqueues
+// during a write wave and drains the engine at every sync point (open/close/
+// read/seek). That keeps scheduler/headnode state single-threaded in practice
+// while still overlapping issue with drain. If the runtime is ever initialized
+// below MPI_THREAD_SERIALIZED, async falls back to synchronous execution.
 class AsyncWriteEngine {
 public:
   struct Task {
@@ -785,7 +752,6 @@ public:
   void configure(Executor exec) {
     executor_ = std::move(exec);
     max_depth_ = resolveDepth();
-    num_workers_ = resolveWorkers();
   }
 
   // Lazily decides (once) whether the async worker path is usable. When it
@@ -847,7 +813,7 @@ public:
 
   bool active() {
     std::lock_guard<std::mutex> lock(mtx_);
-    return worker_started_ && (!queue_.empty() || !in_flight_.empty());
+    return worker_started_ && (!queue_.empty() || busy_);
   }
 
   // Waits until every queued write for `handle` has drained, then reports
@@ -922,9 +888,10 @@ public:
       return lo < offset + static_cast<long>(size) && offset < hi;
     };
     const auto pending = [&] {
-      for (const InFlight &f : in_flight_)
-        if (covers(f.handle, f.has_offset, f.offset, f.size))
-          return true;
+      if (current_.active &&
+          covers(current_.handle, current_.has_offset, current_.offset,
+                 current_.size))
+        return true;
       for (const Task &t : queue_)
         if (covers(t.handle, t.has_offset, t.offset, t.payloadSize()))
           return true;
@@ -933,7 +900,7 @@ public:
     if (!pending()) {
       // Counted only when something was outstanding: these are the reads a
       // drain would have stalled and this wait let through.
-      if (!in_flight_.empty() || !queue_.empty())
+      if (current_.active || !queue_.empty())
         ++range_wait_free_;
       return;
     }
@@ -953,7 +920,7 @@ public:
     if (!worker_started_)
       return sticky_error_;
     ++drain_calls_;
-    idle_.wait(lock, [&] { return queue_.empty() && in_flight_.empty(); });
+    idle_.wait(lock, [&] { return queue_.empty() && !busy_; });
     drain_wait_ns_ += static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start)
@@ -968,23 +935,21 @@ public:
       has_work_.notify_all();
       not_full_.notify_all();
     }
-    for (std::thread &worker : workers_)
-      if (worker.joinable())
-        worker.join();
-    // Under LIBOMPFILE_OPT_STATS as well as the trace flag, so a benchmark
+    if (worker_.joinable())
+      worker_.join();
+    // Under LIBOMPFILE_OPT_STATS, so a benchmark
     // lane can assert from its log that the owned (zero-copy) submit engaged.
     // Once only: shutdown runs from the client context's destructor and again
     // from this engine's own, and a lane sums the token over the log.
     if (stats_reported_)
       return;
     stats_reported_ = true;
-    if (envFlagEnabled("LIBOMPFILE_ASYNC_TRACE") ||
-        envFlagEnabled("LIBOMPFILE_OPT_STATS"))
+    if (envFlagEnabled("LIBOMPFILE_OPT_STATS"))
       io_report("Async IO stats: enqueued=%llu completed=%llu "
              "max_queue_depth=%zu drain_calls=%llu drain_wait_ns=%llu "
              "owned_enqueued=%llu owned_bytes=%llu range_waits=%llu "
              "range_wait_ns=%llu range_wait_free=%llu enqueue_waits=%llu "
-             "enqueue_wait_ns=%llu workers=%zu max_in_flight=%zu\n",
+             "enqueue_wait_ns=%llu\n",
              static_cast<unsigned long long>(enqueued_),
              static_cast<unsigned long long>(completed_), max_queue_depth_,
              static_cast<unsigned long long>(drain_calls_),
@@ -995,8 +960,7 @@ public:
              static_cast<unsigned long long>(range_wait_ns_),
              static_cast<unsigned long long>(range_wait_free_),
              static_cast<unsigned long long>(enqueue_waits_),
-             static_cast<unsigned long long>(enqueue_wait_ns_), num_workers_,
-             max_in_flight_);
+             static_cast<unsigned long long>(enqueue_wait_ns_));
   }
 
 private:
@@ -1011,29 +975,11 @@ private:
     return 2; // double-buffer: one draining, one queued ahead
   }
 
-  // LIBOMPFILE_ASYNC_WRITE_WORKERS: how many queued writes may be in flight at
-  // once (default 1, the historical single worker). Writes whose byte ranges
-  // overlap never run together and keep issue order; see nextDispatchable.
-  // Each running write holds an IO token, so keep this at or below
-  // LIBOMPFILE_IO_TOKENS or the extra workers only sleep in the token backoff.
-  static size_t resolveWorkers() {
-    const char *env = std::getenv("LIBOMPFILE_ASYNC_WRITE_WORKERS");
-    if (env && env[0]) {
-      char *end = nullptr;
-      long v = std::strtol(env, &end, 10);
-      if (end != env && v > 0)
-        return static_cast<size_t>(std::min<long>(v, 64));
-    }
-    return 1;
-  }
-
   static bool resolveEnabled() {
-    if (envFlagEnabled("LIBOMPFILE_ASYNC_DISABLE"))
-      return false;
     int initialized = 0;
     MPI_Initialized(&initialized);
     if (!initialized)
-      return true; // no MPI in flight => local backend, a worker is always safe
+      return true; // MPI not initialized (unit harness): no concurrent MPI caller to protect
     int level = MPI_THREAD_SINGLE;
     MPI_Query_thread(&level);
     if (level >= MPI_THREAD_SERIALIZED)
@@ -1053,67 +999,28 @@ private:
     if (worker_started_)
       return;
     worker_started_ = true;
-    for (size_t i = 0; i < num_workers_; ++i)
-      workers_.emplace_back([this] {
-        ompfile::trace::nameThisThread("ompfile-async-worker");
-        workerLoop();
-      });
-  }
-
-  static bool rangesOverlap(int handle_a, bool offset_a, long off_a,
-                            size_t size_a, int handle_b, bool offset_b,
-                            long off_b, size_t size_b) {
-    if (handle_a != handle_b)
-      return false;
-    if (!offset_a || !offset_b)
-      return true; // a cursor write has no known range: exclusive per handle
-    return off_a < off_b + static_cast<long>(size_b) &&
-           off_b < off_a + static_cast<long>(size_a);
-  }
-
-  // Index of the oldest queued task that may start now: it overlaps no write
-  // in flight and no older queued write, so writes to one range still land in
-  // issue order. Returns queue_.size() when none can.
-  size_t nextDispatchable() const {
-    for (size_t i = 0; i < queue_.size(); ++i) {
-      const Task &t = queue_[i];
-      bool blocked = false;
-      for (const InFlight &f : in_flight_)
-        if (rangesOverlap(t.handle, t.has_offset, t.offset, t.payloadSize(),
-                          f.handle, f.has_offset, f.offset, f.size)) {
-          blocked = true;
-          break;
-        }
-      for (size_t j = 0; !blocked && j < i; ++j) {
-        const Task &o = queue_[j];
-        if (rangesOverlap(t.handle, t.has_offset, t.offset, t.payloadSize(),
-                          o.handle, o.has_offset, o.offset, o.payloadSize()))
-          blocked = true;
-      }
-      if (!blocked)
-        return i;
-    }
-    return queue_.size();
+    worker_ = std::thread([this] {
+      ompfile::trace::nameThisThread("ompfile-async-worker");
+      workerLoop();
+    });
   }
 
   void workerLoop() {
     std::unique_lock<std::mutex> lock(mtx_);
     for (;;) {
-      size_t index = queue_.size();
-      has_work_.wait(lock, [&] {
-        index = nextDispatchable();
-        return index < queue_.size() || (stop_ && queue_.empty());
-      });
-      if (index >= queue_.size())
-        return; // stopping and nothing left to run
-      Task task = std::move(queue_[index]);
-      queue_.erase(queue_.begin() + static_cast<std::ptrdiff_t>(index));
-      // Keep the in-flight task's range visible to waitForRange and to the
-      // other workers while it is no longer in the queue.
-      const uint64_t flight_id = ++next_flight_id_;
-      in_flight_.push_back({flight_id, task.handle, task.has_offset,
-                            task.offset, task.payloadSize()});
-      max_in_flight_ = std::max(max_in_flight_, in_flight_.size());
+      has_work_.wait(lock, [&] { return !queue_.empty() || stop_; });
+      if (queue_.empty()) {
+        if (stop_)
+          return;
+        continue;
+      }
+      Task task = std::move(queue_.front());
+      queue_.pop_front();
+      busy_ = true;
+      // Keep the in-flight task's range visible to waitForRange while it is
+      // no longer in the queue.
+      current_ = {true, task.handle, task.has_offset, task.offset,
+                  task.payloadSize()};
       not_full_.notify_one();
       lock.unlock();
       int rc = -1;
@@ -1131,9 +1038,8 @@ private:
       // release still in flight.
       task.releaseOwned();
       lock.lock();
-      in_flight_.erase(std::find_if(
-          in_flight_.begin(), in_flight_.end(),
-          [&](const InFlight &f) { return f.id == flight_id; }));
+      busy_ = false;
+      current_.active = false;
       auto it = pending_.find(task.handle);
       if (it != pending_.end() && --it->second == 0)
         pending_.erase(it);
@@ -1158,8 +1064,6 @@ private:
       ++completed_;
       handle_done_.notify_all();
       idle_.notify_all();
-      // A queued write held back by this one's range may start now.
-      has_work_.notify_all();
     }
   }
 
@@ -1171,15 +1075,13 @@ private:
   std::condition_variable idle_;
   std::deque<Task> queue_;
   struct InFlight {
-    uint64_t id = 0;
+    bool active = false;
     int handle = -1;
     bool has_offset = false;
     long offset = 0;
     size_t size = 0;
   };
-  std::vector<InFlight> in_flight_;
-  uint64_t next_flight_id_ = 0;
-  size_t max_in_flight_ = 0;
+  InFlight current_;
   std::unordered_map<int, uint64_t> pending_;
   // First failing rc per handle; entries are dropped on close (see
   // forgetHandle) so a reused file id starts clean.
@@ -1188,12 +1090,12 @@ private:
   // a handle's whole epoch range in one pass; both stay small.
   std::map<EpochKey, uint64_t> pending_epoch_;
   std::map<EpochKey, int> epoch_error_;
-  std::vector<std::thread> workers_;
-  size_t num_workers_ = 1;
+  std::thread worker_;
   std::once_flag available_once_;
   size_t max_depth_ = 2;
   bool enabled_ = false;
   bool worker_started_ = false;
+  bool busy_ = false;
   bool stop_ = false;
   bool stats_reported_ = false;
   int sticky_error_ = 0;
@@ -1294,30 +1196,14 @@ private:
   };
 
 public:
-  OmpFileClientContext(IOBackendTy backend_type)
+  OmpFileClientContext()
       : io_resource_token(resolveDefaultIOTokens()) {
     io_log("IO resource slots set to %d\n", io_resource_token.load());
-    io_trace("OmpFileClientContext ctor enter this=%p backend=%s tokens=%d\n",
-             static_cast<void *>(this),
-             backendTypeToString(backend_type), io_resource_token.load());
+    io_trace("OmpFileClientContext ctor enter this=%p tokens=%d\n",
+             static_cast<void *>(this), io_resource_token.load());
 
-    switch (backend_type) {
-    case IOBackendTy::MPI:
-      io_log("MPI backend selected\n");
-      io_backend = std::make_unique<MPIIOBackend>();
-      break;
-    case IOBackendTy::POSIX:
-      io_log("POSIX backend selected\n");
-      io_backend = std::make_unique<POSIXIOBackend>();
-      break;
-    case IOBackendTy::IO_URING:
-      io_log("IO_URING selected\n");
-      io_backend = std::make_unique<IoUringIOBackend>();
-      break;
-    case IOBackendTy::HDF5:
-      io_log("HDF5 backend not implemented yet\n");
-      break;
-    }
+    io_log("MPI backend selected\n");
+    io_backend = std::make_unique<MPIIOBackend>();
 
     IOSchedulerTy scheduler_type = getSchedulerType();
     if (scheduler_type == IOSchedulerTy::HEADNODE) {
@@ -1367,26 +1253,7 @@ public:
     if (instance == nullptr) {
       io_log("Creating new libompfile client instance\n");
 
-      IOBackendTy backend = IOBackendTy::MPI; // Default
-      const char *env = std::getenv("LIBOMPFILE_BACKEND");
-      if (env) {
-        std::string envStr(env);
-        if (envStr == "MPI") {
-          backend = IOBackendTy::MPI;
-        } else if (envStr == "POSIX") {
-          backend = IOBackendTy::POSIX;
-        } else if (envStr == "IO_URING") {
-          backend = IOBackendTy::IO_URING;
-        } else if (envStr == "HDF5") {
-          backend = IOBackendTy::HDF5;
-        } else {
-          io_log("Unknown LIBOMPFILE_BACKEND '%s', defaulting to MPI\n", env);
-        }
-      } else {
-        io_log("LIBOMPFILE_BACKEND not set, defaulting to MPI\n");
-      }
-
-      instance = new OmpFileClientContext(backend);
+      instance = new OmpFileClientContext();
       io_trace_symbol_owner(
           "OmpFileClientContext::getInstance",
           reinterpret_cast<const void *>(&OmpFileClientContext::getInstance));
@@ -1721,8 +1588,6 @@ public:
              io_resource_token.load());
     return rc;
   }
-
-  int getFileHandle(int file_handle) { return file_handle; }
 
   static void finalize() {
     io_trace("OmpFileClientContext::finalize enter instance=%p\n",

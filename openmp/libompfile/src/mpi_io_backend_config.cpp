@@ -42,31 +42,6 @@ MPIIOBackend::parseTwoPhasePolicy(const char *env_value) {
   return TwoPhasePolicy::Disabled;
 }
 
-MPIIOBackend::ForecastMode
-MPIIOBackend::parseForecastMode(const char *env_value) {
-  if (!env_value || env_value[0] == '\0' || std::strcmp(env_value, "off") == 0 ||
-      std::strcmp(env_value, "OFF") == 0 || std::strcmp(env_value, "0") == 0) {
-    return ForecastMode::Off;
-  }
-
-  if (std::strcmp(env_value, "cholesky-oracle") == 0)
-    return ForecastMode::CholeskyOracle;
-
-  io_log("Invalid LIBOMPFILE_IO_FORECAST='%s'; using off mode.\n", env_value);
-  return ForecastMode::Off;
-}
-
-MPIIOBackend::StageAffinityMode
-MPIIOBackend::parseStageAffinityMode(const char *env_value) {
-  if (!env_value || env_value[0] == '\0' || std::strcmp(env_value, "off") == 0)
-    return StageAffinityMode::Off;
-  if (std::strcmp(env_value, "cholesky-oracle") == 0)
-    return StageAffinityMode::CholeskyOracle;
-  io_log("Invalid LIBOMPFILE_IO_STAGE_AFFINITY='%s'; using off mode.\n",
-         env_value);
-  return StageAffinityMode::Off;
-}
-
 const char *
 MPIIOBackend::twoPhasePolicyToString(TwoPhasePolicy policy) {
   switch (policy) {
@@ -78,26 +53,6 @@ MPIIOBackend::twoPhasePolicyToString(TwoPhasePolicy policy) {
     return "auto";
   }
   return "unknown";
-}
-
-const char *MPIIOBackend::forecastModeToString(ForecastMode mode) {
-  switch (mode) {
-  case ForecastMode::Off:
-    return "off";
-  case ForecastMode::CholeskyOracle:
-    return "cholesky-oracle";
-  }
-  return "unknown";
-}
-
-const char *MPIIOBackend::stageAffinityModeToString(StageAffinityMode mode) {
-  switch (mode) {
-  case StageAffinityMode::Off:
-    return "off";
-  case StageAffinityMode::CholeskyOracle:
-    return "cholesky-oracle";
-  }
-  return "off";
 }
 
 uint64_t MPIIOBackend::parseUint64Env(const char *name, uint64_t default_value) {

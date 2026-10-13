@@ -70,8 +70,8 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
 // nothing but the enqueue. It fits a buffer that is allocated per write and
 // would be freed right after it anyway.
 //
-// With no async worker available (LIBOMPFILE_ASYNC_DISABLE=1, or an MPI
-// thread level below SERIALIZED) the write runs synchronously under the same
+// With no async worker available (an MPI thread level below SERIALIZED)
+// the write runs synchronously under the same
 // rule: released and zero on success, left with the caller on failure.
 int omp_file_pwrite_owned(int file_handle, long offset, void *data,
                           size_t size, void (*release)(void *));
@@ -126,8 +126,8 @@ int omp_file_flush_epoch(int file_handle, uint64_t epoch);
 // Visibility boundary, as opposed to the queue boundary above. When this
 // returns zero, everything written on this handle has reached the source
 // filesystem and another rank, handle or process can observe it: queued async
-// writes are drained, a proxy write-back stage holding the bytes is pushed to
-// the source, and a local backend fdatasyncs the descriptor.
+// writes are drained and a proxy write-back stage holding the bytes is pushed
+// to the source.
 //
 // Use omp_file_flush when you only need the caller's buffer back, and this
 // when a consumer must read what was written. This one is the expensive call

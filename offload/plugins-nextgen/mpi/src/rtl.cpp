@@ -14,14 +14,12 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <list>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -210,26 +208,6 @@ static std::mutex &getOmpfileMppMutex() {
 static std::unordered_map<uint64_t, EventTy> &getOmpfileMppEvents() {
   static auto *Events = new std::unordered_map<uint64_t, EventTy>();
   return *Events;
-}
-
-// A write issued through the split-phase seam (ompfile_mpp_pwrite_submit /
-// ompfile_mpp_poll_ex). The event writes its result through pointers, so the
-// result slots live on the heap next to it and outlive the submit call.
-struct OmpfileMppPendingWrite {
-  std::optional<EventTy> Event;
-  int IoRet = -1;
-  int RemoteErrno = 0;
-  uint64_t Bytes = 0;
-  uint64_t Size = 0;
-};
-
-// Guarded by getOmpfileMppMutex(). A poll takes its entry out of the map for
-// the duration of the resume, so one event is never resumed by two threads.
-static std::unordered_map<uint64_t, std::unique_ptr<OmpfileMppPendingWrite>> &
-getOmpfileMppPendingWrites() {
-  static auto *Pending = new std::unordered_map<
-      uint64_t, std::unique_ptr<OmpfileMppPendingWrite>>();
-  return *Pending;
 }
 
 struct OmpfileMppHandleEntry {
@@ -2167,127 +2145,6 @@ int ompfile_mpp_pread_ex(int Handle, int64_t Offset, void *Buffer,
   return OFFLOAD_SUCCESS;
 }
 
-int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
-  uint64_t BytesRead = 0;
-  return ompfile_mpp_pread_ex(Handle, Offset, Buffer, Size, &BytesRead);
-}
-
-int ompfile_mpp_pread_no_stage_ex(int Handle, int64_t Offset, void *Buffer,
-                                  uint64_t Size, uint64_t *BytesRead) {
-  using namespace llvm::omp::target::plugin;
-  if (!Buffer && Size > 0)
-    return OFFLOAD_FAIL;
-  if (!BytesRead)
-    return OFFLOAD_FAIL;
-  *BytesRead = 0;
-
-  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
-  if (!Plugin)
-    return OFFLOAD_FAIL;
-
-  if (auto Err = Plugin->init())
-    return OFFLOAD_FAIL;
-
-  if (!Plugin->ensureEventSystemInitializedForOmpFile())
-    return OFFLOAD_FAIL;
-
-  OmpfileMppHandleEntry Entry{};
-  {
-    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
-    if (!findOmpfileMppHandle(Handle, Entry))
-      return OFFLOAD_FAIL;
-  }
-
-  int IoRet = -1;
-  int RemoteErrno = 0;
-  uint64_t Bytes = 0;
-  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
-      OriginEvents::ompfilePread, EventTypeTy::OMPFILE_PREAD_NO_STAGE,
-      /*DstDeviceID=*/Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
-      &IoRet, &RemoteErrno, &Bytes);
-  if (Event.empty())
-    return OFFLOAD_FAIL;
-
-  Event.wait();
-  if (auto Error = Event.getError())
-    return OFFLOAD_FAIL;
-
-  if (IoRet != 0) {
-    errno = RemoteErrno;
-    return OFFLOAD_FAIL;
-  }
-
-  if (Bytes > Size) {
-    errno = EPROTO;
-    return OFFLOAD_FAIL;
-  }
-  if (Bytes < Size)
-    std::memset(static_cast<char *>(Buffer) + Bytes, 0,
-                static_cast<size_t>(Size - Bytes));
-  *BytesRead = Bytes;
-
-  return OFFLOAD_SUCCESS;
-}
-
-
-int ompfile_mpp_dirty_owner_pread_ex(int Handle, int SourceRank,
-                                     uint64_t ExpectedVersion, int64_t Offset,
-                                     void *Buffer, uint64_t Size,
-                                     uint64_t *BytesRead) {
-  using namespace llvm::omp::target::plugin;
-  if ((!Buffer && Size > 0) || !BytesRead || SourceRank < 0)
-    return OFFLOAD_FAIL;
-  *BytesRead = 0;
-
-  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
-  if (!Plugin)
-    return OFFLOAD_FAIL;
-  if (auto Err = Plugin->init())
-    return OFFLOAD_FAIL;
-  if (!Plugin->ensureEventSystemInitializedForOmpFile())
-    return OFFLOAD_FAIL;
-
-  OmpfileMppHandleEntry Entry{};
-  {
-    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
-    if (!findOmpfileMppHandle(Handle, Entry))
-      return OFFLOAD_FAIL;
-  }
-
-  if (Entry.Rank != SourceRank) {
-    errno = EINVAL;
-    return OFFLOAD_FAIL;
-  }
-
-  int IoRet = -1;
-  int RemoteErrno = 0;
-  uint64_t Bytes = 0;
-  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
-      OriginEvents::ompfileDirtyOwnerPread,
-      EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD,
-      /*DstDeviceID=*/SourceRank, Entry.RemoteHandle, Offset, Buffer, Size,
-      ExpectedVersion, &IoRet, &RemoteErrno, &Bytes);
-  if (Event.empty())
-    return OFFLOAD_FAIL;
-
-  Event.wait();
-  if (auto Error = Event.getError())
-    return OFFLOAD_FAIL;
-  if (IoRet != 0) {
-    errno = RemoteErrno;
-    return OFFLOAD_FAIL;
-  }
-  if (Bytes > Size) {
-    errno = EPROTO;
-    return OFFLOAD_FAIL;
-  }
-  if (Bytes < Size)
-    std::memset(static_cast<char *>(Buffer) + Bytes, 0,
-                static_cast<size_t>(Size - Bytes));
-  *BytesRead = Bytes;
-  return OFFLOAD_SUCCESS;
-}
-
 int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
                           uint64_t Size, uint64_t *BytesWritten) {
   using namespace llvm::omp::target::plugin;
@@ -2339,123 +2196,6 @@ int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
   *BytesWritten = Bytes;
 
   return OFFLOAD_SUCCESS;
-}
-
-// Split-phase pwrite: create the event and return without waiting, so the
-// issuing thread is not consumed by EventTy::wait(); ompfile_mpp_poll_ex
-// advances it. Result semantics match ompfile_mpp_pwrite_ex (a short write is
-// reported, not failed; the caller loops).
-int ompfile_mpp_pwrite_submit(int Handle, int64_t Offset, const void *Buffer,
-                              uint64_t Size, uint64_t Token) {
-  using namespace llvm::omp::target::plugin;
-  if (!Buffer && Size > 0)
-    return OFFLOAD_FAIL;
-
-  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
-  if (!Plugin)
-    return OFFLOAD_FAIL;
-  if (auto Err = Plugin->init())
-    return OFFLOAD_FAIL;
-  if (!Plugin->ensureEventSystemInitializedForOmpFile())
-    return OFFLOAD_FAIL;
-
-  OmpfileMppHandleEntry Entry{};
-  {
-    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
-    if (!findOmpfileMppHandle(Handle, Entry))
-      return OFFLOAD_FAIL;
-    if (getOmpfileMppPendingWrites().count(Token)) {
-      errno = EEXIST;
-      return OFFLOAD_FAIL;
-    }
-  }
-
-  auto Pending = std::make_unique<OmpfileMppPendingWrite>();
-  Pending->Size = Size;
-  Pending->Event.emplace(Plugin->getEventSystemForOmpFile().createEvent(
-      OriginEvents::ompfilePwrite, EventTypeTy::OMPFILE_PWRITE,
-      /*DstDeviceID=*/Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
-      &Pending->IoRet, &Pending->RemoteErrno, &Pending->Bytes));
-  if (Pending->Event->empty())
-    return OFFLOAD_FAIL;
-
-  const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
-  getOmpfileMppPendingWrites().emplace(Token, std::move(Pending));
-  return OFFLOAD_SUCCESS;
-}
-
-int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,
-                       uint64_t Size) {
-  uint64_t BytesWritten = 0;
-  if (ompfile_mpp_pwrite_ex(Handle, Offset, Buffer, Size, &BytesWritten) !=
-      OFFLOAD_SUCCESS)
-    return OFFLOAD_FAIL;
-  if (BytesWritten != Size) {
-    errno = EIO;
-    return OFFLOAD_FAIL;
-  }
-  return OFFLOAD_SUCCESS;
-}
-
-int ompfile_mpp_stage_invalidate_path_key(uint64_t PathKey,
-                                          uint64_t Generation,
-                                          const char *Path) {
-  using namespace llvm::omp::target::plugin;
-  if (PathKey == 0 || !Path || Path[0] == '\0')
-    return ENOKEY;
-
-  const size_t PathSize = std::strlen(Path) + 1;
-  if (PathSize > static_cast<size_t>(INT_MAX) ||
-      PathSize > static_cast<size_t>(PATH_MAX) + 1)
-    return EOVERFLOW;
-
-  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
-  if (!Plugin)
-    return EHOSTDOWN;
-
-  if (auto Err = Plugin->init())
-    return EHOSTDOWN;
-
-  if (!Plugin->ensureEventSystemInitializedForOmpFile())
-    return EHOSTDOWN;
-
-  OmpFileStageInvalidateRequest Request{};
-  Request.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
-  Request.PathSize = static_cast<uint32_t>(PathSize);
-  Request.PathKey = PathKey;
-  Request.Generation = Generation;
-
-  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
-  int FirstErrno = 0;
-  for (int Rank = 0; Rank < EventSystem.getNumWorkers(); ++Rank) {
-    OmpFileStageInvalidateReply Reply{};
-    EventTy Event = EventSystem.createEvent(
-        OriginEvents::ompfileStageInvalidate,
-        EventTypeTy::OMPFILE_STAGE_INVALIDATE, /*DstDeviceID=*/Rank, &Request,
-        Path, &Reply);
-    if (Event.empty()) {
-      if (FirstErrno == 0)
-        FirstErrno = EIO;
-      continue;
-    }
-
-    Event.wait();
-    if (auto Error = Event.getError()) {
-      if (FirstErrno == 0)
-        FirstErrno = EIO;
-      continue;
-    }
-
-    if (Reply.AbiVersion != OMPFILE_STAGE_INVALIDATE_ABI_VERSION) {
-      if (FirstErrno == 0)
-        FirstErrno = EPROTO;
-      continue;
-    }
-    if (Reply.Status != 0 && FirstErrno == 0)
-      FirstErrno = Reply.Errno != 0 ? Reply.Errno : EIO;
-  }
-
-  return FirstErrno;
 }
 
 // Commit: push every proxy's dirty stage for this file to the source now.
@@ -2545,125 +2285,6 @@ int ompfile_mpp_freshness_query(const OmpFileFreshnessQueryRequest *Request,
   return OFFLOAD_SUCCESS;
 }
 
-int ompfile_mpp_dirty_owner_pread_batch_ex(
-    int Handle, int SourceRank,
-    const OmpFileDirtyOwnerPreadBatchSegment *Segments, uint64_t SegmentCount,
-    void *const *Buffers, uint64_t *BytesRead, int *Statuses, int *Errnos) {
-  using namespace llvm::omp::target::plugin;
-  if (!Segments || !Buffers || !BytesRead || !Statuses || !Errnos ||
-      SourceRank < 0 || SegmentCount == 0) {
-    errno = EINVAL;
-    return OFFLOAD_FAIL;
-  }
-  for (uint64_t I = 0; I < SegmentCount; ++I) {
-    BytesRead[I] = 0;
-    Statuses[I] = -1;
-    Errnos[I] = 0;
-  }
-
-  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
-  if (!Plugin)
-    return OFFLOAD_FAIL;
-  if (auto Err = Plugin->init())
-    return OFFLOAD_FAIL;
-  if (!Plugin->ensureEventSystemInitializedForOmpFile())
-    return OFFLOAD_FAIL;
-
-  OmpfileMppHandleEntry Entry{};
-  {
-    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
-    if (!findOmpfileMppHandle(Handle, Entry))
-      return OFFLOAD_FAIL;
-  }
-  if (Entry.Rank != SourceRank) {
-    errno = EINVAL;
-    return OFFLOAD_FAIL;
-  }
-
-  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
-      OriginEvents::ompfileDirtyOwnerPreadBatch,
-      EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD_BATCH,
-      /*DstDeviceID=*/SourceRank, Entry.RemoteHandle, Segments, SegmentCount,
-      Buffers, Statuses, Errnos, BytesRead);
-  if (Event.empty())
-    return OFFLOAD_FAIL;
-  Event.wait();
-  if (auto Error = Event.getError())
-    return OFFLOAD_FAIL;
-
-  bool AnyFailure = false;
-  for (uint64_t I = 0; I < SegmentCount; ++I) {
-    if (Statuses[I] != 0) {
-      AnyFailure = true;
-      continue;
-    }
-    if (BytesRead[I] > Segments[I].Size) {
-      Statuses[I] = -1;
-      Errnos[I] = EPROTO;
-      AnyFailure = true;
-      continue;
-    }
-    if (BytesRead[I] < Segments[I].Size)
-      std::memset(static_cast<char *>(Buffers[I]) + BytesRead[I], 0,
-                  static_cast<size_t>(Segments[I].Size - BytesRead[I]));
-  }
-  if (AnyFailure) {
-    errno = EIO;
-    return OFFLOAD_FAIL;
-  }
-  return OFFLOAD_SUCCESS;
-}
-
-int ompfile_mpp_dirty_owner_query_ex(int Handle, int SourceRank,
-                                     uint64_t ExpectedVersion, int64_t Offset,
-                                     uint64_t Size, int *StateOut) {
-  using namespace llvm::omp::target::plugin;
-  if (!StateOut || SourceRank < 0)
-    return OFFLOAD_FAIL;
-  *StateOut = -1;
-
-  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
-  if (!Plugin)
-    return OFFLOAD_FAIL;
-  if (auto Err = Plugin->init())
-    return OFFLOAD_FAIL;
-  if (!Plugin->ensureEventSystemInitializedForOmpFile())
-    return OFFLOAD_FAIL;
-
-  OmpfileMppHandleEntry Entry{};
-  {
-    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
-    if (!findOmpfileMppHandle(Handle, Entry))
-      return OFFLOAD_FAIL;
-  }
-
-  if (Entry.Rank != SourceRank) {
-    errno = EINVAL;
-    return OFFLOAD_FAIL;
-  }
-
-  int IoRet = -1;
-  int RemoteErrno = 0;
-  int State = -1;
-  EventTy Event = Plugin->getEventSystemForOmpFile().createEvent(
-      OriginEvents::ompfileDirtyOwnerQuery,
-      EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY,
-      /*DstDeviceID=*/SourceRank, Entry.RemoteHandle, Offset, Size,
-      ExpectedVersion, &IoRet, &RemoteErrno, &State);
-  if (Event.empty())
-    return OFFLOAD_FAIL;
-
-  Event.wait();
-  if (auto Error = Event.getError())
-    return OFFLOAD_FAIL;
-  if (IoRet != 0) {
-    errno = RemoteErrno;
-    return OFFLOAD_FAIL;
-  }
-  *StateOut = State;
-  return OFFLOAD_SUCCESS;
-}
-
 int ompfile_mpp_freshness_write_commit(uint64_t PathKey, int WriterRank,
                                        uint64_t TileId, int WriteThroughMode,
                                        uint64_t *CommittedVersion) {
@@ -2702,103 +2323,6 @@ int ompfile_mpp_freshness_write_commit(uint64_t PathKey, int WriterRank,
   if (Reply.Status != 0)
     return Reply.Errno != 0 ? Reply.Errno : EIO;
   *CommittedVersion = Reply.CommittedVersion;
-  return OFFLOAD_SUCCESS;
-}
-
-int ompfile_mpp_proxy_copy_tile(uint64_t PathKey, uint64_t TileId,
-                                int SourceRank, int DestRank,
-                                uint64_t Version) {
-  using namespace llvm::omp::target::plugin;
-  if (PathKey == 0 || SourceRank < 0 || DestRank < 0 || Version == 0)
-    return EINVAL;
-
-  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
-  if (!Plugin)
-    return EHOSTDOWN;
-  if (auto Err = Plugin->init())
-    return EHOSTDOWN;
-  if (!Plugin->ensureEventSystemInitializedForOmpFile())
-    return EHOSTDOWN;
-
-  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
-  if (SourceRank >= EventSystem.getNumWorkers() ||
-      DestRank >= EventSystem.getNumWorkers())
-    return EINVAL;
-
-  OmpFileProxyCopyTileRequest Request{};
-  Request.PathKey = PathKey;
-  Request.TileId = TileId;
-  Request.SourceRank = SourceRank;
-  Request.DestRank = DestRank;
-  Request.Version = Version;
-
-  OmpFileProxyCopyTileReply HeadnodeReply{};
-  EventTy HeadnodeEvent = EventSystem.createEvent(
-      OriginEvents::ompfileProxyCopyTile, EventTypeTy::OMPFILE_PROXY_COPY_TILE,
-      /*DstDeviceID=*/0, &Request, &HeadnodeReply);
-  if (HeadnodeEvent.empty())
-    return EIO;
-  HeadnodeEvent.wait();
-  if (auto Error = HeadnodeEvent.getError())
-    return EIO;
-  if (HeadnodeReply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
-    return EPROTO;
-  if (HeadnodeReply.Status != 0)
-    return HeadnodeReply.Errno != 0 ? HeadnodeReply.Errno : EIO;
-
-  if (SourceRank == DestRank)
-    return OFFLOAD_SUCCESS;
-
-  OmpFileProxyCopyTileReply Reply{};
-  EventTy Event = EventSystem.createEvent(
-      OriginEvents::ompfileProxyCopyTile, EventTypeTy::OMPFILE_PROXY_COPY_TILE,
-      /*DstDeviceID=*/DestRank, &Request, &Reply);
-  if (Event.empty())
-    return EIO;
-  Event.wait();
-  if (auto Error = Event.getError())
-    return EIO;
-  if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
-    return EPROTO;
-  if (Reply.Status != 0)
-    return Reply.Errno != 0 ? Reply.Errno : EIO;
-  return OFFLOAD_SUCCESS;
-}
-
-int ompfile_mpp_freshness_mark_fresh(uint64_t PathKey, int Rank,
-                                     uint64_t Version) {
-  using namespace llvm::omp::target::plugin;
-  if (PathKey == 0 || Rank < 0 || Version == 0)
-    return EINVAL;
-
-  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
-  if (!Plugin)
-    return EHOSTDOWN;
-  if (auto Err = Plugin->init())
-    return EHOSTDOWN;
-  if (!Plugin->ensureEventSystemInitializedForOmpFile())
-    return EHOSTDOWN;
-
-  OmpFileFreshnessMarkFreshRequest Request{};
-  Request.PathKey = PathKey;
-  Request.Rank = Rank;
-  Request.Version = Version;
-  OmpFileFreshnessMarkFreshReply Reply{};
-
-  EventSystemTy &EventSystem = Plugin->getEventSystemForOmpFile();
-  EventTy Event = EventSystem.createEvent(
-      OriginEvents::ompfileFreshnessMarkFresh,
-      EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH, /*DstDeviceID=*/0, &Request,
-      &Reply);
-  if (Event.empty())
-    return EIO;
-  Event.wait();
-  if (auto Error = Event.getError())
-    return EIO;
-  if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION)
-    return EPROTO;
-  if (Reply.Status != 0)
-    return Reply.Errno != 0 ? Reply.Errno : EIO;
   return OFFLOAD_SUCCESS;
 }
 
@@ -2912,60 +2436,12 @@ int ompfile_mpp_poll(uint64_t Token, int *Done) {
   return OFFLOAD_SUCCESS;
 }
 
-// Advance a split-phase write once (resume, no sleep: the caller owns the
-// backoff). Done=0 leaves it pending; Done=1 retires the token and reports.
-int ompfile_mpp_poll_ex(uint64_t Token, int *Done, uint64_t *Bytes) {
-  using namespace llvm::omp::target::plugin;
-  if (!Done || !Bytes)
-    return OFFLOAD_FAIL;
-  *Done = 0;
-  *Bytes = 0;
-
-  std::unique_ptr<OmpfileMppPendingWrite> Pending;
-  {
-    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
-    auto &Map = getOmpfileMppPendingWrites();
-    auto It = Map.find(Token);
-    if (It == Map.end()) {
-      errno = ENOENT;
-      return OFFLOAD_FAIL;
-    }
-    Pending = std::move(It->second);
-    Map.erase(It);
-  }
-
-  Pending->Event->resume();
-  if (!Pending->Event->done()) {
-    const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
-    getOmpfileMppPendingWrites().emplace(Token, std::move(Pending));
-    return OFFLOAD_SUCCESS;
-  }
-
-  *Done = 1;
-  if (auto Error = Pending->Event->getError()) {
-    llvm::consumeError(std::move(Error));
-    errno = EIO;
-    return OFFLOAD_FAIL;
-  }
-  if (Pending->IoRet != 0) {
-    errno = Pending->RemoteErrno;
-    return OFFLOAD_FAIL;
-  }
-  if (Pending->Bytes > Pending->Size) {
-    errno = EPROTO;
-    return OFFLOAD_FAIL;
-  }
-  *Bytes = Pending->Bytes;
-  return OFFLOAD_SUCCESS;
-}
-
 int ompfile_mpp_finalize() {
   using namespace llvm::omp::target::plugin;
   auto &Events = getOmpfileMppEvents();
   auto &Handles = getOmpfileMppHandles();
   const std::lock_guard<std::mutex> Lock(getOmpfileMppMutex());
   Events.clear();
-  getOmpfileMppPendingWrites().clear();
   Handles.clear();
   return OFFLOAD_SUCCESS;
 }

@@ -8,7 +8,11 @@
 //
 // Headnode-only global OMPFile control plane. Tracks:
 // - Global file table.
-// - Flightplan table.
+// - Per-rank counts: the cumulative plan counts that every pick, OPEN
+//   included, weighs as the rank's load, and live open handles, kept for
+//   accounting only (an OPEN plan adds one on the rank it names; the CLOSE
+//   carrying that rank in OmpFileIORequest::AggregatorRank removes it); no
+//   pick weighs them.
 // - Aggregator selection policy.
 //
 //===----------------------------------------------------------------------===//
@@ -31,7 +35,18 @@ class OmpFileHeadnodeManager {
 public:
   struct HandlerInfo {
     int Rank = -1;
-    uint64_t InFlight = 0;
+    // Accounting only, never a pick's load: OPEN plans placed on this rank
+    // whose CLOSE has not arrived. A PLACEMENT_ONLY OPEN adds none. Read by
+    // the LIBOMPFILE_DEBUG_TRACE lines and the tests; a future scheduler
+    // signal.
+    uint64_t OpenHandles = 0;
+    // The load of every pick by default (scalar OPEN/PREAD/PWRITE/CLOSE,
+    // batch segments): scalar plans placed on this rank, every OPEN included,
+    // batch segments not; monotonic.
+    uint64_t PlansIssued = 0;
+    // Every plan placed on this rank (any scalar op, plus one per batch
+    // segment); monotonic. The load of every pick under
+    // LIBOMPFILE_SCHED_USE_PLANNED_LOAD_FOR_SKEW=1.
     uint64_t PlannedTotal = 0;
   };
 
@@ -93,10 +108,6 @@ public:
   bool commitTileFreshnessWrite(uint64_t PathKey, int WriterRank,
                                 bool WriteThroughMode,
                                 uint64_t &CommittedVersionOut);
-  bool markTileFresh(uint64_t PathKey, int Rank, uint64_t Version);
-  bool registerTileCopy(uint64_t PathKey, int SourceRank, int DestRank,
-                        uint64_t Version);
-  bool markTileFreshFromCopy(uint64_t PathKey, int Rank, uint64_t Version);
   bool flushDirtyTile(uint64_t PathKey, int &SourceRankOut,
                       uint64_t &FlushedVersionOut);
   bool completeDirtyFlush(uint64_t PathKey, int SourceRank, uint64_t Version,
@@ -105,8 +116,6 @@ public:
   bool handleFreshnessQueryRequest(
       const OmpFileFreshnessQueryRequest &Request,
       OmpFileFreshnessQueryReply &Reply);
-
-  void completeRequest(const OmpFileIOPlan &Plan);
 
 #if defined(OMPFILE_ENABLE_TEST_ACCESS)
   // Direct-linked regression seam; omitted from production plugin builds.
@@ -135,7 +144,6 @@ private:
   static uint64_t computePathKey(std::string_view Path);
   static uint64_t parseUint64Env(const char *Name, uint64_t DefaultValue);
   static bool parseBoolEnv(const char *Name, bool DefaultValue);
-  void freshnessTraceLogUnlocked(const char *Format, ...) const;
   bool segmentRangesOverlap(int64_t ReadOffset, uint64_t ReadSize,
                             int64_t WriteOffset, uint64_t WriteSize) const;
   uint64_t nextWriteSequenceUnlocked();
@@ -146,20 +154,19 @@ private:
                                     int &ReasonErrno) const;
   bool isWorkerRankUnlocked(int Rank) const;
   bool isHeadnodeRequestUnlocked(int LocalRank) const;
+  // Every pick weighs PlansIssued (PlannedTotal under
+  // LIBOMPFILE_SCHED_USE_PLANNED_LOAD_FOR_SKEW); OpenHandles is accounting
+  // only and never steers placement.
   uint64_t effectiveLoadUnlocked(const HandlerInfo &H) const;
-  uint64_t minInFlightUnlocked() const;
-  uint64_t inFlightForRankUnlocked(int Rank) const;
-  void bumpHandlerLoadUnlocked(int Rank);
-  void noteBatchPlanUnlocked(int Rank);
+  uint64_t loadForRankUnlocked(int Rank) const;
+  void noteScalarPlanUnlocked(int Rank);
+  void notePlannedUnlocked(int Rank);
+  void addOpenHandleUnlocked(int Rank);
+  void releaseOpenHandleUnlocked(int Rank);
   void registerPathAffinityUnlocked(uint64_t PathKey, int Rank);
   bool commitTileFreshnessWriteUnlocked(uint64_t PathKey, int WriterRank,
                                         bool WriteThroughMode,
                                         uint64_t &CommittedVersionOut);
-  bool markTileFreshUnlocked(uint64_t PathKey, int Rank, uint64_t Version);
-  bool registerTileCopyUnlocked(uint64_t PathKey, int SourceRank, int DestRank,
-                                uint64_t Version);
-  bool markTileFreshFromCopyUnlocked(uint64_t PathKey, int Rank,
-                                     uint64_t Version);
   bool flushDirtyTileUnlocked(uint64_t PathKey, int &SourceRankOut,
                               uint64_t &FlushedVersionOut);
   bool completeDirtyFlushUnlocked(uint64_t PathKey, int SourceRank,
@@ -184,18 +191,13 @@ private:
   bool UsePlannedLoadForSkew = false;
   bool SpreadSamePathOpens = false;
   bool FreshnessTraceEnabled = false;
+  // LIBOMPFILE_DEBUG_TRACE=1: the [ompfile-mpp][sched] open-handles lines.
+  bool SchedTraceEnabled = false;
 
-  std::unordered_map<uint64_t, OmpFileIOPlan> FlightplanTable;
   std::unordered_map<std::string, GlobalFileEntry> GlobalFileTable;
   std::unordered_map<uint64_t, int> PathAffinityTable;
   std::unordered_map<uint64_t, std::vector<WriteVersionEntry>> PathWriteVersions;
   std::unordered_map<uint64_t, TileFreshnessEntry> TileFreshnessTable;
-  struct PendingTileCopy {
-    int SourceRank = -1;
-    int DestRank = -1;
-    uint64_t Version = 0;
-  };
-  std::unordered_map<uint64_t, std::vector<PendingTileCopy>> PendingTileCopies;
   std::vector<HandlerInfo> Handlers;
   BatchPlanStats Stats;
   uint64_t NextGlobalFileId = 1;

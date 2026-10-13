@@ -83,3 +83,72 @@ OMPFILE_TEST(stage_write_mode_is_normalized_the_same_on_both_sides) {
   OMPFILE_CHECK(!isWriteBackMode("write-through"));
   OMPFILE_CHECK(!isWriteBackMode(nullptr));
 }
+
+OMPFILE_TEST(mode_knobs_accept_only_remote_only_mpp) {
+  {
+    ScopedEnv B("LIBOMPFILE_BACKEND", nullptr);
+    ScopedEnv O("LIBOMPFILE_MPP_OPEN", nullptr);
+    ScopedEnv I("LIBOMPFILE_MPP_IO", nullptr);
+    OMPFILE_CHECK(rejectedModeKnobs().empty());
+  }
+  {
+    ScopedEnv B("LIBOMPFILE_BACKEND", "MPI");
+    ScopedEnv O("LIBOMPFILE_MPP_OPEN", "1");
+    ScopedEnv I("LIBOMPFILE_MPP_IO", "1");
+    OMPFILE_CHECK(rejectedModeKnobs().empty());
+  }
+  {
+    ScopedEnv B("LIBOMPFILE_BACKEND", "");
+    ScopedEnv O("LIBOMPFILE_MPP_OPEN", "");
+    ScopedEnv I("LIBOMPFILE_MPP_IO", nullptr);
+    OMPFILE_CHECK(rejectedModeKnobs().empty());
+  }
+  {
+    ScopedEnv B("LIBOMPFILE_BACKEND", "POSIX");
+    ScopedEnv O("LIBOMPFILE_MPP_OPEN", "0");
+    ScopedEnv I("LIBOMPFILE_MPP_IO", "1");
+    const std::string R = rejectedModeKnobs();
+    OMPFILE_CHECK(R.find("LIBOMPFILE_BACKEND='POSIX'") != std::string::npos);
+    OMPFILE_CHECK(R.find("LIBOMPFILE_MPP_OPEN='0'") != std::string::npos);
+    OMPFILE_CHECK(R.find("LIBOMPFILE_MPP_IO") == std::string::npos);
+  }
+  {
+    ScopedEnv B("LIBOMPFILE_BACKEND", "IO_URING");
+    ScopedEnv O("LIBOMPFILE_MPP_OPEN", nullptr);
+    ScopedEnv I("LIBOMPFILE_MPP_IO", "0");
+    OMPFILE_CHECK(!rejectedModeKnobs().empty());
+  }
+}
+
+OMPFILE_TEST(removed_knobs_set_lists_only_present_names) {
+  ScopedEnv A("LIBOMPFILE_ALLOWFALLBACK", "1");
+  ScopedEnv C("LIBOMPFILE_MPI_COMM_SELF", nullptr);
+  ScopedEnv T("LIBOMPFILE_ASYNC_TRACE", "");
+  const std::string R = removedKnobsSet();
+  OMPFILE_CHECK(R.find("LIBOMPFILE_ALLOWFALLBACK") != std::string::npos);
+  OMPFILE_CHECK(R.find("LIBOMPFILE_MPI_COMM_SELF") == std::string::npos);
+  OMPFILE_CHECK(R.find("LIBOMPFILE_ASYNC_TRACE") == std::string::npos);
+}
+
+OMPFILE_TEST(scheduler_defaults_to_headnode) {
+  bool Unknown = true;
+  { ScopedEnv E("LIBOMPFILE_SCHEDULER", nullptr); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
+  { ScopedEnv E("LIBOMPFILE_SCHEDULER", ""); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
+  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "HEADNODE"); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
+  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "headnode"); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
+  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "LOCAL"); OMPFILE_CHECK(!schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
+  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "Local"); OMPFILE_CHECK(!schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
+  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "HEADNODEX"); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(Unknown); }
+  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "LOC"); OMPFILE_CHECK(schedulerIsHeadnode()); }
+}
+
+OMPFILE_TEST(writeback_distribute_needs_writes_and_ranks) {
+  const char *W = "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES";
+  const char *R = "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS";
+  bool Bad = true;
+  { ScopedEnv EW(W, nullptr); ScopedEnv ER(R, "4"); OMPFILE_CHECK(!writebackDistributeActive(&Bad)); OMPFILE_CHECK(!Bad); OMPFILE_CHECK_EQ(writebackDistributeRankCount(), 4u); }
+  { ScopedEnv EW(W, "1"); ScopedEnv ER(R, "4"); OMPFILE_CHECK(writebackDistributeActive(&Bad)); OMPFILE_CHECK(!Bad); }
+  { ScopedEnv EW(W, "1"); ScopedEnv ER(R, "1"); OMPFILE_CHECK(!writebackDistributeActive(&Bad)); OMPFILE_CHECK(Bad); }
+  { ScopedEnv EW(W, "1"); ScopedEnv ER(R, nullptr); OMPFILE_CHECK(!writebackDistributeActive(&Bad)); OMPFILE_CHECK(Bad); OMPFILE_CHECK_EQ(writebackDistributeRankCount(), 0u); }
+  { ScopedEnv EW(W, "true"); ScopedEnv ER(R, "4"); OMPFILE_CHECK(!writebackDistributeActive(&Bad)); OMPFILE_CHECK(!Bad); }
+}

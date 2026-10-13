@@ -2,7 +2,7 @@
 # the default target so every runtime build compiles and links it (that alone
 # catches a wire-struct or helper signature drift); the build jobs run the
 # binary after the build, and `ctest --test-dir <build>/openmp/libompfile`
-# runs it by hand. No MPI, no liburing, no libompfile link.
+# runs it by hand. No MPI, no libompfile link.
 
 add_executable(ompfile_unit_tests
     ompfile_unit_tests_main.cpp

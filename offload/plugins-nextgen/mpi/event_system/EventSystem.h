@@ -164,15 +164,18 @@ enum class EventTypeTy : unsigned int {
   OMPFILE_PWRITE, // Write to a file on the remote worker.
   OMPFILE_SCHED_REQUEST, // Scheduler request (client -> scheduler).
   OMPFILE_SCHED_REQUEST_BATCH, // Batch scheduler request (client -> scheduler).
-  OMPFILE_SCHED_PLAN, // Scheduler plan (scheduler -> aggregator).
+  // 33 is reserved: it was OMPFILE_SCHED_PLAN, which nothing ever sent
+  // (removed Oct 2026). Do not reuse it.
 
   // Local event used to wait on other events.
-  SYNC,
-  OMPFILE_STAGE_INVALIDATE = 36, // Invalidate staged data for a file on a proxy.
+  SYNC = 34,
+  // 36 is reserved: it was OMPFILE_STAGE_INVALIDATE (removed Oct 2026).
+  // Never reuse it.
   OMPFILE_PREAD_NO_STAGE = 37, // Read from a proxy while bypassing staging.
   OMPFILE_FRESHNESS_QUERY = 38, // Query freshness decision from headnode.
-  OMPFILE_PROXY_COPY_TILE = 39, // Copy a tile from source rank to destination rank.
-  OMPFILE_FRESHNESS_MARK_FRESH = 40, // Mark destination rank fresh for version.
+  // 39 and 40 are reserved: they were OMPFILE_PROXY_COPY_TILE and
+  // OMPFILE_FRESHNESS_MARK_FRESH (removed Oct 2026, no production sender).
+  // Never reuse them.
   OMPFILE_FRESHNESS_WRITE_COMMIT = 41, // Report a successful tile write.
   OMPFILE_FLUSH_DIRTY_TILE = 42, // Flush dirty tile metadata on headnode.
   OMPFILE_DIRTY_OWNER_PREAD = 43, // Read dirty staged bytes from owner proxy.
@@ -187,20 +190,15 @@ static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_SCHED_REQUEST) ==
               31);
 static_assert(
     static_cast<unsigned int>(EventTypeTy::OMPFILE_SCHED_REQUEST_BATCH) == 32);
-static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_SCHED_PLAN) == 33);
+// 33: reserved (formerly OMPFILE_SCHED_PLAN); SYNC below stays pinned at 34.
 static_assert(static_cast<unsigned int>(EventTypeTy::SYNC) == 34);
 static_assert(static_cast<unsigned int>(EventTypeTy::EXIT) == 35);
-static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_STAGE_INVALIDATE) ==
-              36);
+// 36: reserved (formerly OMPFILE_STAGE_INVALIDATE).
 static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_PREAD_NO_STAGE) ==
               37);
 static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_FRESHNESS_QUERY) ==
               38);
-static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_PROXY_COPY_TILE) ==
-              39);
-static_assert(
-    static_cast<unsigned int>(EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH) ==
-    40);
+// 39, 40: reserved (formerly OMPFILE_PROXY_COPY_TILE / _FRESHNESS_MARK_FRESH).
 static_assert(
     static_cast<unsigned int>(EventTypeTy::OMPFILE_FRESHNESS_WRITE_COMMIT) ==
     41);
@@ -230,12 +228,8 @@ constexpr bool isFileIoEvent(EventTypeTy Type) {
   case EventTypeTy::OMPFILE_PWRITE:
   case EventTypeTy::OMPFILE_SCHED_REQUEST:
   case EventTypeTy::OMPFILE_SCHED_REQUEST_BATCH:
-  case EventTypeTy::OMPFILE_SCHED_PLAN:
-  case EventTypeTy::OMPFILE_STAGE_INVALIDATE:
   case EventTypeTy::OMPFILE_FRESHNESS_QUERY:
-  case EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH:
   case EventTypeTy::OMPFILE_FRESHNESS_WRITE_COMMIT:
-  case EventTypeTy::OMPFILE_PROXY_COPY_TILE:
   case EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE:
   case EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD:
   case EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY:
@@ -252,40 +246,6 @@ using OmpFileFreshnessQueryReply = ompfile::OmpFileFreshnessQueryReply;
 
 constexpr uint32_t OMPFILE_FRESHNESS_QUERY_ABI_VERSION =
     ompfile::OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
-
-struct OmpFileProxyCopyTileRequest {
-  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
-  uint32_t Reserved0 = 0;
-  uint64_t PathKey = 0;
-  uint64_t TileId = 0;
-  int32_t SourceRank = -1;
-  int32_t DestRank = -1;
-  uint64_t Version = 0;
-};
-
-struct OmpFileProxyCopyTileReply {
-  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
-  int32_t Status = 0;
-  int32_t Errno = 0;
-  int32_t Reserved0 = 0;
-  uint64_t BytesCopied = 0;
-};
-
-struct OmpFileFreshnessMarkFreshRequest {
-  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
-  uint32_t Reserved0 = 0;
-  uint64_t PathKey = 0;
-  uint64_t Version = 0;
-  int32_t Rank = -1;
-  int32_t Reserved1 = 0;
-};
-
-struct OmpFileFreshnessMarkFreshReply {
-  uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
-  int32_t Status = 0;
-  int32_t Errno = 0;
-  int32_t Reserved0 = 0;
-};
 
 struct OmpFileFreshnessWriteCommitRequest {
   uint32_t AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
@@ -386,6 +346,8 @@ using ompfile::OMPFILE_IO_HINT_HAS_STREAM;
 using ompfile::OMPFILE_IO_HINT_HAS_TILE;
 using ompfile::OMPFILE_IO_HINT_HAS_ROLE;
 using ompfile::OmpFileIOHint;
+using ompfile::OmpFileIORequestFlags;
+using ompfile::OMPFILE_IO_REQUEST_PLACEMENT_ONLY;
 using ompfile::OmpFileIORequest;
 using ompfile::OmpFileIOPlan;
 using ompfile::OMPFILE_SCHED_BATCH_ABI_VERSION;
@@ -402,32 +364,6 @@ using ompfile::OmpFileIOBatchRequest;
 using ompfile::OmpFileIOBatchPlanEntry;
 using ompfile::OmpFileIOBatchPlan;
 
-struct OmpFileIOCompletion {
-  uint64_t RequestId = 0;
-  int32_t Status = 0;
-  int32_t Errno = 0;
-  uint64_t Bytes = 0;
-};
-
-constexpr uint32_t OMPFILE_STAGE_INVALIDATE_ABI_VERSION = 1u;
-
-struct OmpFileStageInvalidateRequest {
-  uint32_t AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
-  uint32_t PathSize = 0;
-  uint64_t PathKey = 0;
-  uint64_t Generation = 0;
-};
-
-struct OmpFileStageInvalidateReply {
-  uint32_t AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
-  int32_t Status = 0;
-  int32_t Errno = 0;
-  uint32_t InvalidatedEntries = 0;
-  uint32_t Reserved0 = 0;
-  uint32_t Reserved1 = 0;
-  uint64_t InvalidatedBytes = 0;
-};
-
 static_assert(std::is_standard_layout_v<OmpFileIORequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOPlan>);
 static_assert(std::is_standard_layout_v<OmpFileIOHint>);
@@ -435,9 +371,6 @@ static_assert(std::is_standard_layout_v<OmpFileIOBatchSegment>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchRequest>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchPlanEntry>);
 static_assert(std::is_standard_layout_v<OmpFileIOBatchPlan>);
-static_assert(std::is_standard_layout_v<OmpFileIOCompletion>);
-static_assert(std::is_standard_layout_v<OmpFileStageInvalidateRequest>);
-static_assert(std::is_standard_layout_v<OmpFileStageInvalidateReply>);
 static_assert(std::is_standard_layout_v<OmpFileFreshnessQueryRequest>);
 static_assert(std::is_standard_layout_v<OmpFileFreshnessQueryReply>);
 // Wire types cross the MPI transport by memcpy: trivially copyable, always.
@@ -447,25 +380,9 @@ static_assert(std::is_trivially_copyable_v<OmpFileIOBatchSegment>);
 static_assert(std::is_trivially_copyable_v<OmpFileIOBatchRequest>);
 static_assert(std::is_trivially_copyable_v<OmpFileIOBatchPlanEntry>);
 static_assert(std::is_trivially_copyable_v<OmpFileIOBatchPlan>);
-static_assert(std::is_trivially_copyable_v<OmpFileIOCompletion>);
-static_assert(std::is_trivially_copyable_v<OmpFileStageInvalidateRequest>);
-static_assert(std::is_trivially_copyable_v<OmpFileStageInvalidateReply>);
 static_assert(std::is_trivially_copyable_v<OmpFileFreshnessQueryRequest>);
 static_assert(std::is_trivially_copyable_v<OmpFileFreshnessQueryReply>);
 static_assert(std::is_trivially_copyable_v<OmpFileDirtyOwnerPreadBatchSegment>);
-static_assert(sizeof(OmpFileStageInvalidateRequest) == 24);
-static_assert(offsetof(OmpFileStageInvalidateRequest, AbiVersion) == 0);
-static_assert(offsetof(OmpFileStageInvalidateRequest, PathSize) == 4);
-static_assert(offsetof(OmpFileStageInvalidateRequest, PathKey) == 8);
-static_assert(offsetof(OmpFileStageInvalidateRequest, Generation) == 16);
-static_assert(sizeof(OmpFileStageInvalidateReply) == 32);
-static_assert(offsetof(OmpFileStageInvalidateReply, AbiVersion) == 0);
-static_assert(offsetof(OmpFileStageInvalidateReply, Status) == 4);
-static_assert(offsetof(OmpFileStageInvalidateReply, Errno) == 8);
-static_assert(offsetof(OmpFileStageInvalidateReply, InvalidatedEntries) == 12);
-static_assert(offsetof(OmpFileStageInvalidateReply, Reserved0) == 16);
-static_assert(offsetof(OmpFileStageInvalidateReply, Reserved1) == 20);
-static_assert(offsetof(OmpFileStageInvalidateReply, InvalidatedBytes) == 24);
 static_assert(sizeof(OmpFileFreshnessQueryRequest) == 32);
 static_assert(offsetof(OmpFileFreshnessQueryRequest, AbiVersion) == 0);
 static_assert(offsetof(OmpFileFreshnessQueryRequest, PathKey) == 8);
@@ -810,10 +727,6 @@ EventTy ompfileDirtyOwnerQuery(MPIRequestManagerTy RequestManager,
 EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
                       int64_t Offset, const void *Buffer, uint64_t Size,
                       int *IoRet, int *RemoteErrno, uint64_t *Bytes);
-EventTy ompfileStageInvalidate(MPIRequestManagerTy RequestManager,
-                               const OmpFileStageInvalidateRequest *Request,
-                               const char *Path,
-                               OmpFileStageInvalidateReply *Reply);
 EventTy ompfileFreshnessQuery(MPIRequestManagerTy RequestManager,
                                const OmpFileFreshnessQueryRequest *Request,
                                OmpFileFreshnessQueryReply *Reply);
@@ -821,13 +734,6 @@ EventTy ompfileFreshnessWriteCommit(
     MPIRequestManagerTy RequestManager,
     const OmpFileFreshnessWriteCommitRequest *Request,
     OmpFileFreshnessWriteCommitReply *Reply);
-EventTy ompfileProxyCopyTile(MPIRequestManagerTy RequestManager,
-                             const OmpFileProxyCopyTileRequest *Request,
-                             OmpFileProxyCopyTileReply *Reply);
-EventTy ompfileFreshnessMarkFresh(
-    MPIRequestManagerTy RequestManager,
-    const OmpFileFreshnessMarkFreshRequest *Request,
-    OmpFileFreshnessMarkFreshReply *Reply);
 EventTy ompfileFlushDirtyTile(MPIRequestManagerTy RequestManager,
                               const OmpFileFlushDirtyTileRequest *Request,
                               OmpFileFlushDirtyTileReply *Reply);
@@ -841,9 +747,6 @@ EventTy ompfileSchedBatchRequest(MPIRequestManagerTy RequestManager,
                                  OmpFileIOBatchPlan *Plan, void *PlanPayload,
                                  uint64_t PlanPayloadCapBytes,
                                  uint64_t *PlanPayloadOutBytes);
-EventTy ompfileSchedPlan(MPIRequestManagerTy RequestManager,
-                         const OmpFileIOPlan *Plan,
-                         OmpFileIOCompletion *Completion);
 EventTy sync(EventTy Event);
 EventTy loadBinary(MPIRequestManagerTy RequestManager,
                    const __tgt_device_image *Image,
@@ -962,13 +865,18 @@ class EventSystemTy {
   ///   transfers or file I/O.
   /// - Io: every type isFileIoEvent() accepts. File I/O has its own queue and
   ///   pool so it never occupies the kernel pool and so it can be scheduled as
-  ///   a domain of its own. Its handlers may block: the owner-forwarding paths
-  ///   (ProxyDevice openOnRank / preadOnRank / pwriteOnRank / closeOnRank) wait
-  ///   on a forwarded event with EventTy::wait(), which is why the pool defaults
-  ///   to more than one thread (OMPTARGET_NUM_IO_EVENT_HANDLERS). With a single
-  ///   io thread, two proxies forwarding to each other would each hold their
-  ///   only io thread waiting for the other. Turning those waits into co_await
-  ///   is what would let the pool go back to one.
+  ///   a domain of its own. A handler here blocks in EventTy::wait() on one
+  ///   kind of path only: the headnode coherence round trips (ProxyDevice
+  ///   freshnessQueryOnHeadnode / freshnessWriteCommitOnHeadnode /
+  ///   completeDirtyFlushOnHeadnode, also via
+  ///   completeDerivedTileFlushesOnHeadnode) that the stage read/write/flush
+  ///   paths make under write-back staging on a rank other than the headnode.
+  ///   The owner-forwarding helpers (openOnRank / preadOnRank / pwriteOnRank /
+  ///   closeOnRank) wait too, but only on kernel threads through the mpp*
+  ///   bridges, never on an io handler. The pool defaults to more than one
+  ///   thread (OMPTARGET_NUM_IO_EVENT_HANDLERS=4) as a margin for those
+  ///   coherence waits; turning them into co_await is what would let it go
+  ///   back to one.
   /// - Data: everything else, which is all done in a non-blocking fashion.
   EventQueue ExecEventQueue{};
   EventQueue DataEventQueue{};
@@ -1089,7 +997,6 @@ EventTy EventSystemTy::NotificationEvent(EventFuncTy EventFunc, EventTypeTy Even
 
   if (EventType != EventTypeTy::IS_PLUGIN_COMPATIBLE &&
       EventType != EventTypeTy::RETRIEVE_NUM_DEVICES &&
-      EventType != EventTypeTy::OMPFILE_STAGE_INVALIDATE &&
       EventType != EventTypeTy::EXIT)
     std::tie(RemoteRank, RemoteDeviceId) = mapDeviceId(DstDeviceID);
 

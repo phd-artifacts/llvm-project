@@ -31,22 +31,7 @@ bool writebackCoherenceReadsRequireScalarOracle() {
 }
 
 bool distributedWritebackRoutingEnabled() {
-  return envEquals("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES", "1");
-}
-
-bool remoteDirtyOwnerPfsRebalanceEnabled() {
-  return envEquals("LIBOMPFILE_OPT_REMOTE_DIRTY_OWNER_PFS_REBALANCE", "1");
-}
-
-unsigned parsePositiveEnv(const char *Name) {
-  return ompfile::env::positiveOr(Name);
-}
-
-uint64_t dirtyOwnerReadAheadBytes() {
-  if (const unsigned Value = parsePositiveEnv(
-          "LIBOMPFILE_OPT_DIRTY_OWNER_READAHEAD_BYTES"))
-    return Value;
-  return 0;
+  return ompfile::env::writebackDistributeActive();
 }
 
 bool dirtyOwnerBatchEnabled() {
@@ -54,32 +39,21 @@ bool dirtyOwnerBatchEnabled() {
 }
 
 unsigned dirtyOwnerBatchMaxSegments() {
-  if (const unsigned Value = parsePositiveEnv(
+  if (const unsigned Value = ompfile::env::positiveOr(
           "LIBOMPFILE_OPT_DIRTY_OWNER_BATCH_MAX_SEGS"))
     return std::max(1u, Value);
   return 16;
 }
 
 unsigned dirtyOwnerBatchWindowUs() {
-  if (const unsigned Value = parsePositiveEnv(
+  if (const unsigned Value = ompfile::env::positiveOr(
           "LIBOMPFILE_OPT_DIRTY_OWNER_BATCH_WINDOW_US"))
     return Value;
   return 0;
 }
 
-unsigned distributedWritebackRankCount() {
-  if (const unsigned Explicit =
-          parsePositiveEnv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS"))
-    return Explicit;
-  if (const unsigned Workers = parsePositiveEnv("OMPFILE_CHOLESKY_WORKER_NODES"))
-    return Workers;
-  if (const unsigned Targets = parsePositiveEnv("OMPFILE_CHOLESKY_TARGET_REGIONS"))
-    return Targets;
-  return 0;
-}
-
 int rankForDistributedWriteKey(uint64_t Key) {
-  const unsigned Ranks = distributedWritebackRankCount();
+  const unsigned Ranks = ompfile::env::writebackDistributeRankCount();
   if (Ranks <= 1)
     return -1;
   return static_cast<int>(Key % Ranks);
@@ -325,8 +299,6 @@ bool MPIIOBackend::hasUsablePlannedRead(
     return false;
   if (context.Plan.Status != 0)
     return false;
-  if (!mpp_open_enabled)
-    return false;
   return true;
 }
 
@@ -359,7 +331,6 @@ int MPIIOBackend::readAtWithContext(
     return -1;
   }
   pread_request_count.fetch_add(1, std::memory_order_relaxed);
-  recordForecastRead(context.Hint, size);
   io_trace("MPIIOBackend::readAtWithContext enter this=%p req_id=%llu file=%d "
            "offset=%ld size=%zu ctx_flags=0x%x has_plan=%d has_path_key=%d "
            "plan_status=%d aggregator=%d remote_handle=%d\n",
@@ -386,7 +357,7 @@ int MPIIOBackend::readAtWithContext(
   }
 
   if (hasUsablePlannedRead(context)) {
-    if (context.Plan.AggregatorRank >= 0 && mpp_remote_only &&
+    if (context.Plan.AggregatorRank >= 0 &&
         scalarPlannedReadRebalanceEnabledForStage()) {
       const char *rebalance_reason = "none";
       int rebalance_errno = 0;
@@ -467,10 +438,11 @@ int MPIIOBackend::readAtWithContext(
                   : offset;
           // Resolve the distributed-write rank count once, up front and
           // outside handle_mutex: it is constant for the whole scan and is
-          // otherwise re-parsed from env vars (up to 3 getenv/strtoul each)
-          // on every epoch entry, which turns the O(n) history walk under the
+          // otherwise re-parsed from env vars (a getenv/strtoul each) on
+          // every epoch entry, which turns the O(n) history walk under the
           // global lock into O(n) env parses.
-          const unsigned distribute_ranks = distributedWritebackRankCount();
+          const unsigned distribute_ranks =
+              ompfile::env::writebackDistributeRankCount();
           const auto lock = instrumentedHandleLock();
           auto write_it = file_write_epoch_history.find(file_id);
           if (distribute_ranks > 1 &&
@@ -536,160 +508,13 @@ int MPIIOBackend::readAtWithContext(
               oracle_errno = errno;
             }
             if (oracle_ok && oracle_state == 1) {
-              if (remoteDirtyOwnerPfsRebalanceEnabled()) {
-                int flushed_source_rank = -1;
-                uint64_t flushed_version = 0;
-                bool flush_ok = false;
-                int flush_errno = 0;
-                {
-                  const auto lock = instrumentedMppCallLock();
-                  errno = 0;
-                  flush_ok = ompfile::mpp::flushDirtyTile(
-                      FreshnessPathKey, flushed_source_rank, flushed_version);
-                  flush_errno = errno;
-                }
-                if (!flush_ok || flushed_source_rank != DirtySourceRank ||
-                    (DirtyExpectedVersion != 0 &&
-                     flushed_version != DirtyExpectedVersion)) {
-                  dirty_source_unknown = true;
-                  dirty_owner_forward_failure_count.fetch_add(
-                      1, std::memory_order_relaxed);
-                  errno = flush_errno != 0 ? flush_errno : ESTALE;
-                  io_log("Phase 1 remote dirty-owner pfs rebalance failed: "
-                         "request_id=%llu file=%d aggregator_rank=%d "
-                         "source_rank=%d flushed_source_rank=%d "
-                         "version=%llu flushed_version=%llu errno=%d; "
-                         "fail-closed.\n",
-                         static_cast<unsigned long long>(context.RequestId),
-                         file_id, context.Plan.AggregatorRank, DirtySourceRank,
-                         flushed_source_rank,
-                         static_cast<unsigned long long>(DirtyExpectedVersion),
-                         static_cast<unsigned long long>(flushed_version),
-                         errno);
-                  return -1;
-                }
-                size_t pfs_bytes_read = 0;
-                if (readAtRemoteRankNoStageWithBytes(
-                        file_id, context.Plan.AggregatorRank, offset, data,
-                        size, pfs_bytes_read)) {
-                  dirty_owner_forward_success_count.fetch_add(
-                      1, std::memory_order_relaxed);
-                  dirty_owner_forward_bytes_total.fetch_add(
-                      pfs_bytes_read, std::memory_order_relaxed);
-                  remote_pread_event_count.fetch_add(1,
-                                                     std::memory_order_relaxed);
-                  remote_pread_bytes_total.fetch_add(size,
-                                                     std::memory_order_relaxed);
-                  noteAppliedRebalancedReadForFile(file_id);
-                  io_log("Phase 1 remote dirty-owner pfs rebalanced: "
-                         "request_id=%llu file=%d aggregator_rank=%d "
-                         "source_rank=%d version=%llu bytes=%zu\n",
-                         static_cast<unsigned long long>(context.RequestId),
-                         file_id, context.Plan.AggregatorRank, DirtySourceRank,
-                         static_cast<unsigned long long>(flushed_version),
-                         pfs_bytes_read);
-                  return 0;
-                }
-                dirty_source_unknown = true;
-                dirty_owner_forward_failure_count.fetch_add(
-                    1, std::memory_order_relaxed);
-                errno = errno != 0 ? errno : EIO;
-                io_log("Phase 1 remote dirty-owner pfs read failed: "
-                       "request_id=%llu file=%d aggregator_rank=%d "
-                       "source_rank=%d offset=%lld size=%zu errno=%d; "
-                       "fail-closed.\n",
-                       static_cast<unsigned long long>(context.RequestId),
-                       file_id, context.Plan.AggregatorRank, DirtySourceRank,
-                       static_cast<long long>(offset), size, errno);
-                return -1;
-              }
-
               size_t dirty_source_bytes_read = 0;
-              bool dirty_source_read_ok = false;
               int dirty_source_read_errno = 0;
-              bool served_from_readahead = false;
-              {
-                const auto lock = instrumentedHandleLock();
-                for (const DirtyOwnerReadCacheEntry &CacheEntry :
-                     dirty_owner_read_cache) {
-                  if (CacheEntry.FileId != file_id ||
-                      CacheEntry.SourceRank != DirtySourceRank ||
-                      CacheEntry.Version != DirtyExpectedVersion ||
-                      offset < CacheEntry.Start ||
-                      offset + static_cast<long>(size) > CacheEntry.End)
-                    continue;
-                  const size_t CacheOffset =
-                      static_cast<size_t>(offset - CacheEntry.Start);
-                  std::memcpy(data, CacheEntry.Data.data() + CacheOffset, size);
-                  dirty_source_bytes_read = size;
-                  dirty_source_read_ok = true;
-                  served_from_readahead = true;
-                  break;
-                }
-              }
-              if (!dirty_source_read_ok) {
-                const uint64_t ReadAheadBytes = dirtyOwnerReadAheadBytes();
-                const uint64_t RequestedBytes =
-                    ReadAheadBytes > size ? ReadAheadBytes : size;
-                if (RequestedBytes > size) {
-                  std::vector<char> ReadAheadBuffer(
-                      static_cast<size_t>(RequestedBytes));
-                  size_t ReadAheadBytesRead = 0;
-                  bool ReadAheadOk = false;
-                  int ReadAheadErrno = 0;
-                  {
-                    const auto lock = instrumentedMppCallLock();
-                    errno = 0;
-                    ReadAheadOk = ompfile::mpp::dirtyOwnerPreadEx(
-                        remote_handle, DirtySourceRank, DirtyExpectedVersion,
-                        offset, ReadAheadBuffer.data(),
-                        static_cast<size_t>(RequestedBytes),
-                        ReadAheadBytesRead);
-                    ReadAheadErrno = errno;
-                  }
-                  if (ReadAheadOk && ReadAheadBytesRead >= size) {
-                    std::memcpy(data, ReadAheadBuffer.data(), size);
-                    dirty_source_bytes_read = size;
-                    dirty_source_read_ok = true;
-                    DirtyOwnerReadCacheEntry CacheEntry{};
-                    CacheEntry.FileId = file_id;
-                    CacheEntry.SourceRank = DirtySourceRank;
-                    CacheEntry.Version = DirtyExpectedVersion;
-                    CacheEntry.Start = offset;
-                    CacheEntry.End = offset + static_cast<long>(ReadAheadBytesRead);
-                    CacheEntry.Data.assign(ReadAheadBuffer.begin(),
-                                           ReadAheadBuffer.begin() +
-                                               static_cast<long>(
-                                                   ReadAheadBytesRead));
-                    {
-                      const auto lock = instrumentedHandleLock();
-                      dirty_owner_read_cache.push_back(std::move(CacheEntry));
-                      while (dirty_owner_read_cache.size() > 1024)
-                        dirty_owner_read_cache.pop_front();
-                    }
-                    io_log("Phase 1 dirty-worker staged read-ahead: "
-                           "request_id=%llu file=%d aggregator_rank=%d "
-                           "source_rank=%d version=%llu bytes=%zu "
-                           "cached_bytes=%zu\n",
-                           static_cast<unsigned long long>(context.RequestId),
-                           file_id, context.Plan.AggregatorRank,
-                           DirtySourceRank,
-                           static_cast<unsigned long long>(
-                               InitialFreshnessRoute.SelectedVersion),
-                           dirty_source_bytes_read, ReadAheadBytesRead);
-                  } else {
-                    dirty_source_read_errno =
-                        ReadAheadErrno != 0 ? ReadAheadErrno : EIO;
-                  }
-                }
-              }
-              if (!dirty_source_read_ok) {
-                dirty_source_read_ok = dirtyOwnerPreadMaybeBatch(
-                    file_id, remote_handle, DirtySourceRank,
-                    DirtyExpectedVersion, offset, data, size,
-                    dirty_source_bytes_read, dirty_source_read_errno,
-                    context.RequestId);
-              }
+              const bool dirty_source_read_ok = dirtyOwnerPreadMaybeBatch(
+                  file_id, remote_handle, DirtySourceRank,
+                  DirtyExpectedVersion, offset, data, size,
+                  dirty_source_bytes_read, dirty_source_read_errno,
+                  context.RequestId);
               if (dirty_source_read_ok) {
                 dirty_owner_forward_success_count.fetch_add(
                     1, std::memory_order_relaxed);
@@ -725,39 +550,16 @@ int MPIIOBackend::readAtWithContext(
               dirty_source_known_clean = true;
               dirty_owner_forward_failure_count.fetch_add(
                   1, std::memory_order_relaxed);
-              if (dirty_clean_pfs_allow_clean_pfs_enabled) {
-                size_t clean_bytes_read = 0;
-                if (readAtRemoteRankNoStageWithBytes(
-                        file_id, context.Plan.AggregatorRank, offset, data,
-                        size, clean_bytes_read)) {
-                  noteAppliedRebalancedReadForFile(file_id);
-                  io_log("Phase 1 dirty-clean pfs rebalanced: request_id=%llu "
-                         "file=%d aggregator_rank=%d source_rank=%d "
-                         "version=%llu bytes=%zu\n",
-                         static_cast<unsigned long long>(context.RequestId),
-                         file_id, context.Plan.AggregatorRank, DirtySourceRank,
-                         static_cast<unsigned long long>(
-                             InitialFreshnessRoute.SelectedVersion),
-                         clean_bytes_read);
-                  return 0;
-                }
-                io_log("Phase 1 dirty-clean pfs rebalanced failed: "
-                       "request_id=%llu file=%d aggregator_rank=%d errno=%d; "
-                       "falling back to owner-staged read.\n",
-                       static_cast<unsigned long long>(context.RequestId),
-                       file_id, context.Plan.AggregatorRank, errno);
-              } else {
-                io_log("Phase 1 dirty-clean pfs rebalanced disabled: "
-                       "request_id=%llu file=%d aggregator_rank=%d "
-                       "source_rank=%d offset=%lld size=%zu tile=%llu "
-                       "version=%llu; falling back for clean-oracle range.\n",
-                       static_cast<unsigned long long>(context.RequestId),
-                       file_id, context.Plan.AggregatorRank, DirtySourceRank,
-                       static_cast<long long>(offset), size,
-                       static_cast<unsigned long long>(context.Hint.TileId),
-                       static_cast<unsigned long long>(
-                           InitialFreshnessRoute.SelectedVersion));
-              }
+              io_log("Phase 1 dirty-clean pfs rebalanced disabled: "
+                     "request_id=%llu file=%d aggregator_rank=%d "
+                     "source_rank=%d offset=%lld size=%zu tile=%llu "
+                     "version=%llu; falling back for clean-oracle range.\n",
+                     static_cast<unsigned long long>(context.RequestId),
+                     file_id, context.Plan.AggregatorRank, DirtySourceRank,
+                     static_cast<long long>(offset), size,
+                     static_cast<unsigned long long>(context.Hint.TileId),
+                     static_cast<unsigned long long>(
+                         InitialFreshnessRoute.SelectedVersion));
             } else {
               dirty_source_unknown = true;
               dirty_owner_forward_failure_count.fetch_add(
@@ -781,11 +583,6 @@ int MPIIOBackend::readAtWithContext(
                    static_cast<unsigned long long>(context.RequestId), file_id,
                    context.Plan.AggregatorRank, DirtySourceRank);
           }
-        } else if (dirty_clean_pfs_rebalance_enabled) {
-          io_log("Phase 1 dirty-worker oracle skipped: request_id=%llu file=%d "
-                 "aggregator_rank=%d source_rank=%d reason=source-rank\n",
-                 static_cast<unsigned long long>(context.RequestId), file_id,
-                 context.Plan.AggregatorRank, DirtySourceRank);
         }
         if (distributedWritebackRoutingEnabled() &&
             DirtySourceRank == context.Plan.AggregatorRank) {
@@ -1213,20 +1010,11 @@ int MPIIOBackend::readAtWithContext(
            static_cast<unsigned long long>(context.RequestId), file_id, offset,
            size);
   size_t bytes_read = 0;
-  return readAtFallbackWithBytes(file_id, offset, data, size, bytes_read,
-                                 &context.Hint);
-}
-
-int MPIIOBackend::readAtFallback(int file_id, long offset, void *data,
-                                 size_t size) {
-  size_t bytes_read = 0;
   return readAtFallbackWithBytes(file_id, offset, data, size, bytes_read);
 }
 
 int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
-                                           size_t size, size_t &bytes_read,
-                                           const ompfile::OmpFileIOHint *hint,
-                                           bool force_no_stage) {
+                                          size_t size, size_t &bytes_read) {
   bytes_read = 0;
   if (offset < 0) {
     errno = EINVAL;
@@ -1237,86 +1025,34 @@ int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
     return -1;
   }
 
-  if (mpp_io_enabled) {
-    int remote_handle = -1;
-    {
-      const auto lock = instrumentedHandleLock();
-      auto it = remote_file_handle_map.find(file_id);
-      if (it != remote_file_handle_map.end())
-        remote_handle = it->second;
-    }
-    if (remote_handle < 0) {
-      io_log("Error: Missing remote handle for file %d\n", file_id);
-      traceHandleState("readAtFallback.mpp_io.missing_remote", file_id,
-                       remote_handle);
-      errno = EBADF;
-      return -1;
-    }
-    remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
-    remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
-    bool pread_ok = false;
-    {
-      const auto lock = instrumentedMppCallLock();
-      if (hint && shouldUseNoStageFallback(*hint, force_no_stage)) {
-        pread_ok = ompfile::mpp::preadNoStageEx(remote_handle, offset, data,
-                                                size, bytes_read);
-      } else {
-        pread_ok =
-            ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
-      }
-    }
-    if (!pread_ok) {
-      io_log("MPP pread failed for file %d\n", file_id);
-      traceHandleState("readAtFallback.mpp_io.pread_fail", file_id,
-                       remote_handle);
-      return -1;
-    }
-    if (bytes_read > size) {
-      errno = EPROTO;
-      return -1;
-    }
-    if (bytes_read < size && data) {
-      const size_t short_bytes = size - bytes_read;
-      short_read_count.fetch_add(1, std::memory_order_relaxed);
-      short_read_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
-      std::memset(static_cast<char *>(data) + bytes_read, 0, short_bytes);
-    }
-
-    io_log("MPP read at offset completed.\n");
-    return 0;
-  }
-
-  MPI_File file = MPI_FILE_NULL;
+  int remote_handle = -1;
   {
     const auto lock = instrumentedHandleLock();
-    auto it = file_handle_map.find(file_id);
-    if (it == file_handle_map.end()) {
-      io_log("Error: Invalid file handle %d\n", file_id);
-      errno = EBADF;
-      return -1;
-    }
-    file = it->second;
+    auto it = remote_file_handle_map.find(file_id);
+    if (it != remote_file_handle_map.end())
+      remote_handle = it->second;
   }
-
-  if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    errno = EOVERFLOW;
+  if (remote_handle < 0) {
+    io_log("Error: Missing remote handle for file %d\n", file_id);
+    traceHandleState("readAtFallback.mpp_io.missing_remote", file_id,
+                     remote_handle);
+    errno = EBADF;
     return -1;
   }
-
-  MPI_Status status{};
-  const int ret = MPI_File_read_at(file, offset, data, static_cast<int>(size),
-                                   MPI_BYTE, &status);
-  if (ret != MPI_SUCCESS) {
-    io_log("Error: Read at offset failed\n");
+  remote_pread_event_count.fetch_add(1, std::memory_order_relaxed);
+  remote_pread_bytes_total.fetch_add(size, std::memory_order_relaxed);
+  bool pread_ok = false;
+  {
+    const auto lock = instrumentedMppCallLock();
+    pread_ok =
+        ompfile::mpp::preadEx(remote_handle, offset, data, size, bytes_read);
+  }
+  if (!pread_ok) {
+    io_log("MPP pread failed for file %d\n", file_id);
+    traceHandleState("readAtFallback.mpp_io.pread_fail", file_id,
+                     remote_handle);
     return -1;
   }
-  int count = 0;
-  if (MPI_Get_count(&status, MPI_BYTE, &count) != MPI_SUCCESS || count < 0) {
-    errno = EIO;
-    return -1;
-  }
-
-  bytes_read = static_cast<size_t>(count);
   if (bytes_read > size) {
     errno = EPROTO;
     return -1;
@@ -1328,6 +1064,6 @@ int MPIIOBackend::readAtFallbackWithBytes(int file_id, long offset, void *data,
     std::memset(static_cast<char *>(data) + bytes_read, 0, short_bytes);
   }
 
-  io_log("Read at offset completed\n");
+  io_log("MPP read at offset completed.\n");
   return 0;
 }

@@ -104,10 +104,6 @@ bool MPIIOBackend::writeAtRemoteRankWithBytes(
     int file_id, int target_rank, long offset, const void *data, size_t size,
     size_t &bytes_written) {
   bytes_written = 0;
-  if (!mpp_remote_only) {
-    errno = ENOTSUP;
-    return false;
-  }
   if (target_rank < 0 || offset < 0 || (!data && size > 0)) {
     errno = EINVAL;
     return false;
@@ -142,10 +138,6 @@ bool MPIIOBackend::readAtRemoteRankNoStageWithBytes(
     int file_id, int target_rank, long offset, void *data, size_t size,
     size_t &bytes_read) {
   bytes_read = 0;
-  if (!mpp_remote_only) {
-    errno = ENOTSUP;
-    return false;
-  }
   if (target_rank < 0) {
     errno = EINVAL;
     return false;
@@ -201,10 +193,6 @@ bool MPIIOBackend::readAtRemoteRankWithBytes(int file_id, int target_rank,
                                              long offset, void *data,
                                              size_t size, size_t &bytes_read) {
   bytes_read = 0;
-  if (!mpp_remote_only) {
-    errno = ENOTSUP;
-    return false;
-  }
   if (target_rank < 0) {
     errno = EINVAL;
     return false;

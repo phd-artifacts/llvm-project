@@ -24,7 +24,6 @@ void MPIIOBackend::rememberFilePathKey(int file_id, const char *path) {
     const auto lock = instrumentedHandleLock();
     file_path_key_map[file_id] = path_key;
   }
-  invalidateTwoPhaseReadCacheKey(path_key);
 }
 
 void MPIIOBackend::rememberFilePath(int file_id, const char *path) {
@@ -33,17 +32,6 @@ void MPIIOBackend::rememberFilePath(int file_id, const char *path) {
   const auto lock = instrumentedHandleLock();
   file_path_map[file_id] = path;
   file_write_epoch_history.erase(file_id);
-}
-
-void MPIIOBackend::forgetFilePath(int file_id) {
-  const auto lock = instrumentedHandleLock();
-  file_path_map.erase(file_id);
-  file_write_epoch_history.erase(file_id);
-}
-
-void MPIIOBackend::forgetFilePathKey(int file_id) {
-  const auto lock = instrumentedHandleLock();
-  file_path_key_map.erase(file_id);
 }
 
 void MPIIOBackend::traceHandleStateLocked(const char *where, int file_id,
@@ -56,7 +44,6 @@ void MPIIOBackend::traceHandleStateLocked(const char *where, int file_id,
   const auto remote_it = remote_file_handle_map.find(file_id);
   const bool remote_present = remote_it != remote_file_handle_map.end();
   const int remote_mapped_handle = remote_present ? remote_it->second : -1;
-  const bool mpi_present = file_handle_map.find(file_id) != file_handle_map.end();
 
   std::ostringstream logical_ids;
   int logical_emitted = 0;
@@ -88,13 +75,12 @@ void MPIIOBackend::traceHandleStateLocked(const char *where, int file_id,
 
   io_trace("MPIIOBackend::%s this=%p file_id=%d remote_handle_arg=%d "
            "logical_present=%d remote_present=%d remote_mapped=%d "
-           "mpi_present=%d logical_count=%zu remote_count=%zu mpi_count=%zu "
+           "logical_count=%zu remote_count=%zu "
            "logical_ids=[%s] remote_ids=[%s]\n",
            where ? where : "(unknown)", static_cast<const void *>(this), file_id,
            remote_handle, static_cast<int>(logical_present),
            static_cast<int>(remote_present), remote_mapped_handle,
-           static_cast<int>(mpi_present), logical_handle_set.size(),
-           remote_file_handle_map.size(), file_handle_map.size(),
+           logical_handle_set.size(), remote_file_handle_map.size(),
            logical_ids.str().c_str(), remote_ids.str().c_str());
 }
 

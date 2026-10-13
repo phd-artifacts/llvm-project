@@ -4,13 +4,6 @@
 #include "ompfile_sched.h"
 #include <stddef.h>
 
-enum class IOBackendTy {
-  MPI, /* only one implemented, default*/
-  POSIX,
-  IO_URING,
-  HDF5,
-};
-
 class IOBackend {
 public:
   virtual ~IOBackend() {}

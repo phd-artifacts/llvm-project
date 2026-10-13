@@ -12,7 +12,6 @@
 #include <cassert>
 #include <cerrno>
 #include <cstdlib>
-#include <cstdarg>
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -84,21 +83,6 @@ void OmpFileHeadnodeManager::emitFreshnessTrace(
                static_cast<unsigned long long>(LatestVersion),
                Decision ? Decision : "na", Result ? Result : "na",
                Reason ? Reason : "na", TileId ? TileId : "na");
-}
-
-void OmpFileHeadnodeManager::freshnessTraceLogUnlocked(const char *Format,
-                                                       ...) const {
-  if (!isFreshnessTraceEnabled())
-    return;
-
-  char Buffer[512] = {0};
-  va_list Args;
-  va_start(Args, Format);
-  std::vsnprintf(Buffer, sizeof(Buffer), Format, Args);
-  va_end(Args);
-
-  emitFreshnessTrace("legacy", "na", -1, -1, -1, 0, 0, "na", "na",
-                     Buffer, "na");
 }
 
 bool OmpFileHeadnodeManager::segmentRangesOverlap(int64_t ReadOffset,
@@ -231,6 +215,11 @@ void OmpFileHeadnodeManager::initialize(int NewWorkerCount,
   SpreadSamePathOpens =
       parseUint64Env("LIBOMPFILE_MPP_OPEN_SPREAD", 0) != 0;
   FreshnessTraceEnabled = parseBoolEnv("LIBOMPFILE_FRESHNESS_TRACE", false);
+  {
+    // Same rule as every other LIBOMPFILE_DEBUG_TRACE reader: exactly "1".
+    const char *TraceEnv = std::getenv("LIBOMPFILE_DEBUG_TRACE");
+    SchedTraceEnabled = TraceEnv && TraceEnv[0] == '1' && TraceEnv[1] == '\0';
+  }
   ensureHandlersUnlocked();
   Initialized = true;
 }
@@ -246,12 +235,11 @@ void OmpFileHeadnodeManager::resetForTesting() {
   UsePlannedLoadForSkew = false;
   SpreadSamePathOpens = false;
   FreshnessTraceEnabled = false;
-  FlightplanTable.clear();
+  SchedTraceEnabled = false;
   GlobalFileTable.clear();
   PathAffinityTable.clear();
   PathWriteVersions.clear();
   TileFreshnessTable.clear();
-  PendingTileCopies.clear();
   Handlers.clear();
   Stats = {};
   NextGlobalFileId = 1;
@@ -266,24 +254,6 @@ bool OmpFileHeadnodeManager::commitTileFreshnessWrite(
   const std::lock_guard<std::mutex> Lock(Mutex);
   return commitTileFreshnessWriteUnlocked(PathKey, WriterRank, WriteThroughMode,
                                           CommittedVersionOut);
-}
-
-bool OmpFileHeadnodeManager::markTileFresh(uint64_t PathKey, int Rank,
-                                           uint64_t Version) {
-  const std::lock_guard<std::mutex> Lock(Mutex);
-  return markTileFreshUnlocked(PathKey, Rank, Version);
-}
-
-bool OmpFileHeadnodeManager::registerTileCopy(uint64_t PathKey, int SourceRank,
-                                              int DestRank, uint64_t Version) {
-  const std::lock_guard<std::mutex> Lock(Mutex);
-  return registerTileCopyUnlocked(PathKey, SourceRank, DestRank, Version);
-}
-
-bool OmpFileHeadnodeManager::markTileFreshFromCopy(uint64_t PathKey, int Rank,
-                                                   uint64_t Version) {
-  const std::lock_guard<std::mutex> Lock(Mutex);
-  return markTileFreshFromCopyUnlocked(PathKey, Rank, Version);
 }
 
 bool OmpFileHeadnodeManager::flushDirtyTile(uint64_t PathKey,
@@ -386,17 +356,6 @@ bool OmpFileHeadnodeManager::commitTileFreshnessWriteUnlocked(
     return false;
   }
   ++Entry.LatestVersion;
-  auto PendingIt = PendingTileCopies.find(PathKey);
-  if (PendingIt != PendingTileCopies.end()) {
-    auto &Pending = PendingIt->second;
-    Pending.erase(std::remove_if(Pending.begin(), Pending.end(),
-                                 [&](const PendingTileCopy &Copy) {
-                                   return Copy.Version < Entry.LatestVersion;
-                                 }),
-                  Pending.end());
-    if (Pending.empty())
-      PendingTileCopies.erase(PendingIt);
-  }
   Entry.FreshRanks.clear();
   Entry.FreshRanks.insert(WriterRank);
   if (WriteThroughMode) {
@@ -411,127 +370,6 @@ bool OmpFileHeadnodeManager::commitTileFreshnessWriteUnlocked(
                      "ok", WriteThroughMode ? "write-through" : "write-back",
                      "na");
   return true;
-}
-
-bool OmpFileHeadnodeManager::markTileFreshUnlocked(uint64_t PathKey, int Rank,
-                                                   uint64_t Version) {
-  const std::string PathKeyStr = std::to_string(PathKey);
-  if (PathKey == 0 || !isWorkerRankUnlocked(Rank) || Version == 0) {
-    emitFreshnessTrace("mark_fresh", PathKeyStr, Rank, Rank, Rank, Version, 0,
-                       "", "fail", "invalid-args", "na");
-    errno = EINVAL;
-    return false;
-  }
-  auto It = TileFreshnessTable.find(PathKey);
-  if (It == TileFreshnessTable.end()) {
-    emitFreshnessTrace("mark_fresh", PathKeyStr, Rank, Rank, Rank, Version, 0,
-                       "", "fail", "missing-entry", "na");
-    errno = ENOKEY;
-    return false;
-  }
-  if (It->second.LatestVersion != Version) {
-    emitFreshnessTrace("mark_fresh", PathKeyStr, Rank, Rank, Rank, Version,
-                       It->second.LatestVersion, "", "fail",
-                       "version-mismatch", "na");
-    errno = ESTALE;
-    return false;
-  }
-  It->second.FreshRanks.insert(Rank);
-  emitFreshnessTrace("mark_fresh", PathKeyStr, Rank, Rank, Rank, Version,
-                     It->second.LatestVersion, "", "ok", "fresh", "na");
-  return true;
-}
-
-bool OmpFileHeadnodeManager::registerTileCopyUnlocked(uint64_t PathKey,
-                                                      int SourceRank,
-                                                      int DestRank,
-                                                      uint64_t Version) {
-  const std::string PathKeyStr = std::to_string(PathKey);
-  if (PathKey == 0 || !isWorkerRankUnlocked(SourceRank) ||
-      !isWorkerRankUnlocked(DestRank) || Version == 0) {
-    emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
-                       DestRank, Version, 0, "copy", "fail",
-                       "invalid-args", "na");
-    errno = EINVAL;
-    return false;
-  }
-  auto It = TileFreshnessTable.find(PathKey);
-  if (It == TileFreshnessTable.end()) {
-    emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
-                       DestRank, Version, 0, "copy", "fail",
-                       "missing-entry", "na");
-    errno = ENOKEY;
-    return false;
-  }
-  const TileFreshnessEntry &Entry = It->second;
-  if (Entry.LatestVersion != Version) {
-    emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
-                       DestRank, Version, Entry.LatestVersion, "copy", "fail",
-                       "version-mismatch", "na");
-    errno = ESTALE;
-    return false;
-  }
-  if (Entry.FreshRanks.find(SourceRank) == Entry.FreshRanks.end()) {
-    emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
-                       DestRank, Version, Entry.LatestVersion, "copy", "fail",
-                       "source-not-fresh", "na");
-    errno = EHOSTUNREACH;
-    return false;
-  }
-
-  auto &Pending = PendingTileCopies[PathKey];
-  for (const PendingTileCopy &Copy : Pending) {
-    if (Copy.DestRank == DestRank && Copy.Version == Version)
-      return true;
-  }
-  Pending.push_back({SourceRank, DestRank, Version});
-  emitFreshnessTrace("register_copy", PathKeyStr, DestRank, SourceRank,
-                     DestRank, Version, Entry.LatestVersion, "copy", "ok",
-                     "pending-added", "na");
-  return true;
-}
-
-bool OmpFileHeadnodeManager::markTileFreshFromCopyUnlocked(uint64_t PathKey,
-                                                           int Rank,
-                                                           uint64_t Version) {
-  if (PathKey == 0 || !isWorkerRankUnlocked(Rank) || Version == 0) {
-    errno = EINVAL;
-    return false;
-  }
-  auto It = TileFreshnessTable.find(PathKey);
-  if (It == TileFreshnessTable.end()) {
-    errno = ENOKEY;
-    return false;
-  }
-  if (It->second.LatestVersion != Version) {
-    errno = ESTALE;
-    return false;
-  }
-
-  auto PendingIt = PendingTileCopies.find(PathKey);
-  if (PendingIt == PendingTileCopies.end()) {
-    errno = ENOKEY;
-    return false;
-  }
-
-  auto &Pending = PendingIt->second;
-  Pending.erase(std::remove_if(Pending.begin(), Pending.end(),
-                               [&](const PendingTileCopy &Copy) {
-                                 return Copy.Version < Version;
-                               }),
-                Pending.end());
-  for (auto VecIt = Pending.begin(); VecIt != Pending.end(); ++VecIt) {
-    if (VecIt->DestRank == Rank && VecIt->Version == Version) {
-      It->second.FreshRanks.insert(Rank);
-      Pending.erase(VecIt);
-      if (Pending.empty())
-        PendingTileCopies.erase(PendingIt);
-      return true;
-    }
-  }
-
-  errno = ENOKEY;
-  return false;
 }
 
 bool OmpFileHeadnodeManager::flushDirtyTileUnlocked(uint64_t PathKey,
@@ -746,17 +584,7 @@ void OmpFileHeadnodeManager::ensureHandlersUnlocked() {
     Handlers.push_back({Rank, 0});
 }
 
-uint64_t OmpFileHeadnodeManager::minInFlightUnlocked() const {
-  if (Handlers.empty())
-    return 0;
-
-  uint64_t MinLoad = std::numeric_limits<uint64_t>::max();
-  for (const HandlerInfo &H : Handlers)
-    MinLoad = std::min(MinLoad, H.InFlight);
-  return MinLoad;
-}
-
-uint64_t OmpFileHeadnodeManager::inFlightForRankUnlocked(int Rank) const {
+uint64_t OmpFileHeadnodeManager::loadForRankUnlocked(int Rank) const {
   for (const HandlerInfo &H : Handlers) {
     if (H.Rank == Rank)
       return effectiveLoadUnlocked(H);
@@ -764,25 +592,62 @@ uint64_t OmpFileHeadnodeManager::inFlightForRankUnlocked(int Rank) const {
   return std::numeric_limits<uint64_t>::max();
 }
 
-uint64_t OmpFileHeadnodeManager::effectiveLoadUnlocked(
-    const HandlerInfo &H) const {
-  return UsePlannedLoadForSkew ? H.PlannedTotal : H.InFlight;
+uint64_t
+OmpFileHeadnodeManager::effectiveLoadUnlocked(const HandlerInfo &H) const {
+  if (UsePlannedLoadForSkew)
+    return H.PlannedTotal;
+  return H.PlansIssued;
 }
 
-void OmpFileHeadnodeManager::bumpHandlerLoadUnlocked(int Rank) {
+void OmpFileHeadnodeManager::noteScalarPlanUnlocked(int Rank) {
   for (HandlerInfo &H : Handlers) {
     if (H.Rank == Rank) {
-      H.InFlight += 1;
+      H.PlansIssued += 1;
       H.PlannedTotal += 1;
       return;
     }
   }
 }
 
-void OmpFileHeadnodeManager::noteBatchPlanUnlocked(int Rank) {
+void OmpFileHeadnodeManager::notePlannedUnlocked(int Rank) {
   for (HandlerInfo &H : Handlers) {
     if (H.Rank == Rank) {
       H.PlannedTotal += 1;
+      return;
+    }
+  }
+}
+
+void OmpFileHeadnodeManager::addOpenHandleUnlocked(int Rank) {
+  assert(isWorkerRankUnlocked(Rank) &&
+         "planRequest counts open handles on worker ranks only");
+  for (HandlerInfo &H : Handlers) {
+    if (H.Rank == Rank) {
+      H.OpenHandles += 1;
+      if (SchedTraceEnabled)
+        fprintf(stderr,
+                "[ompfile-mpp][sched] open-handles op=open rank=%d "
+                "open_handles=%llu\n",
+                H.Rank, static_cast<unsigned long long>(H.OpenHandles));
+      return;
+    }
+  }
+}
+
+void OmpFileHeadnodeManager::releaseOpenHandleUnlocked(int Rank) {
+  if (!isWorkerRankUnlocked(Rank))
+    return;
+  for (HandlerInfo &H : Handlers) {
+    if (H.Rank == Rank) {
+      // Saturates at 0: a CLOSE naming a rank with nothing counted must not
+      // wrap the count.
+      if (H.OpenHandles > 0)
+        H.OpenHandles -= 1;
+      if (SchedTraceEnabled)
+        fprintf(stderr,
+                "[ompfile-mpp][sched] open-handles op=close rank=%d "
+                "open_handles=%llu\n",
+                H.Rank, static_cast<unsigned long long>(H.OpenHandles));
       return;
     }
   }
@@ -833,7 +698,8 @@ int OmpFileHeadnodeManager::pickRankForPathKeyUnlocked(uint64_t PathKey,
   if (!HasPathKey || PathKey == 0)
     return pickLeastLoadedRankUnlocked(ClientRank);
 
-  const int LeastLoadedRank = pickLeastLoadedRankUnlocked(/*ClientRank=*/-1);
+  const int LeastLoadedRank =
+      pickLeastLoadedRankUnlocked(/*ClientRank=*/-1);
   auto It = PathAffinityTable.find(PathKey);
   if (It == PathAffinityTable.end()) {
     registerPathAffinityUnlocked(PathKey, LeastLoadedRank);
@@ -847,8 +713,8 @@ int OmpFileHeadnodeManager::pickRankForPathKeyUnlocked(uint64_t PathKey,
     return LeastLoadedRank;
   }
 
-  const uint64_t PreferredLoad = inFlightForRankUnlocked(PreferredRank);
-  const uint64_t LeastLoad = inFlightForRankUnlocked(LeastLoadedRank);
+  const uint64_t PreferredLoad = loadForRankUnlocked(PreferredRank);
+  const uint64_t LeastLoad = loadForRankUnlocked(LeastLoadedRank);
   const bool CanMeasureLoads =
       PreferredLoad != std::numeric_limits<uint64_t>::max() &&
       LeastLoad != std::numeric_limits<uint64_t>::max();
@@ -892,6 +758,18 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
     return Plan;
   }
 
+  if (Request.Op == OmpFileIOOp::CLOSE && Request.FileHandle < 0) {
+    // Release-only: libompfile's open failed after a counted OPEN plan named
+    // Request.AggregatorRank, so no handle will ever close it. Give the live
+    // handle back and plan nothing: no PlansIssued or PlannedTotal count, no
+    // tie-breaker step. The reply is Status 0 with AggregatorRank -1.
+    releaseOpenHandleUnlocked(Request.AggregatorRank);
+    return Plan;
+  }
+
+  // For an OPEN the branch below replaces this pick, but the call still
+  // advances the tie-breaker, as it always has; every later pick depends on
+  // that sequence.
   int HandlerRank = pickLeastLoadedRankUnlocked(Request.ClientRank);
 
   if (Request.Op == OmpFileIOOp::OPEN) {
@@ -952,11 +830,6 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
       Plan.PlanFlags |= OMPFILE_BATCH_PLAN_REBALANCED;
 
     Plan.RemoteHandle = static_cast<int32_t>(Entry.GlobalFileId & 0x7fffffffU);
-
-    const std::string PathKeyStr = std::to_string(PathKey);
-    emitFreshnessTrace("compat_sched_open", PathKeyStr, Request.ClientRank,
-                       Request.ClientRank, HandlerRank, 0, 0, "route", "ok",
-                       "legacy_entrypoint", "na");
   } else if (Request.Op == OmpFileIOOp::PWRITE) {
     uint64_t PathKey = 0;
     bool HasPathKey = false;
@@ -971,10 +844,6 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
 
     if (HasPathKey) {
       recordWriteVersionUnlocked(PathKey, Request);
-      const std::string PathKeyStr = std::to_string(PathKey);
-      emitFreshnessTrace("compat_write_version", PathKeyStr, Request.ClientRank,
-                         Request.ClientRank, HandlerRank, 0, 0, "record",
-                         "ok", "legacy_entrypoint", "na");
       fprintf(stderr,
               "[ompfile-mpp][sched] write-version path_key=%llu offset=%lld "
               "size=%llu has_epoch=%d epoch=%llu has_tile=%d tile=%llu\n",
@@ -993,6 +862,11 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
               static_cast<unsigned long long>(Request.Size),
               static_cast<int>(Request.PathSize > 0 && Path));
     }
+  } else if (Request.Op == OmpFileIOOp::CLOSE) {
+    // The close of a handle whose OPEN plan named Request.AggregatorRank;
+    // -1 (nothing planned) changes nothing. The close itself is still planned
+    // and counted below, as before.
+    releaseOpenHandleUnlocked(Request.AggregatorRank);
   }
 
   if (!isWorkerRankUnlocked(HandlerRank)) {
@@ -1003,8 +877,15 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
 
   Plan.AggregatorRank = HandlerRank;
 
-  FlightplanTable[Plan.RequestId] = Plan;
-  bumpHandlerLoadUnlocked(HandlerRank);
+  // Every successful scalar plan counts in PlansIssued and PlannedTotal, one
+  // of which is the load every pick weighs (effectiveLoadUnlocked); only an
+  // OPEN that is not PLACEMENT_ONLY adds a live open handle, which the CLOSE
+  // naming this rank gives back. Open handles are accounting only and never
+  // steer a pick.
+  noteScalarPlanUnlocked(HandlerRank);
+  if (Request.Op == OmpFileIOOp::OPEN &&
+      (Request.Flags & OMPFILE_IO_REQUEST_PLACEMENT_ONLY) == 0)
+    addOpenHandleUnlocked(HandlerRank);
 
   return Plan;
 }
@@ -1095,7 +976,8 @@ bool OmpFileHeadnodeManager::planBatchRequest(
       }
     }
     const int HandlerRank = pickRankForPathKeyUnlocked(
-        Segment.PathKey, HasPathKey, Segment.ClientRank, AffinityHit, Rebalanced);
+        Segment.PathKey, HasPathKey, Segment.ClientRank, AffinityHit,
+        Rebalanced);
 
     const char *RebalanceReason = "none";
     int RebalanceErrno = 0;
@@ -1117,7 +999,7 @@ bool OmpFileHeadnodeManager::planBatchRequest(
     } else {
       Entry.AggregatorRank = HandlerRank;
       Entry.RemoteHandle = -1;
-      noteBatchPlanUnlocked(HandlerRank);
+      notePlannedUnlocked(HandlerRank);
       if (AffinityHit) {
         Entry.PlanFlags |= OMPFILE_BATCH_PLAN_FILE_AFFINITY;
         ++AffinityHits;
@@ -1190,22 +1072,4 @@ void OmpFileHeadnodeManager::maybeReportBatchStatsUnlocked() {
           static_cast<unsigned long long>(Stats.Segments),
           static_cast<unsigned long long>(Stats.AffinityHits),
           static_cast<unsigned long long>(Stats.Rebalances), Handlers.size());
-}
-
-void OmpFileHeadnodeManager::completeRequest(const OmpFileIOPlan &Plan) {
-  const std::lock_guard<std::mutex> Lock(Mutex);
-
-  auto It = FlightplanTable.find(Plan.RequestId);
-  if (It == FlightplanTable.end())
-    return;
-
-  const int HandlerRank = It->second.AggregatorRank;
-  for (HandlerInfo &H : Handlers) {
-    if (H.Rank == HandlerRank && H.InFlight > 0) {
-      H.InFlight -= 1;
-      break;
-    }
-  }
-
-  FlightplanTable.erase(It);
 }

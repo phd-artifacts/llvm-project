@@ -3,8 +3,6 @@
 #include "mpp_shim.h"
 
 #include <cerrno>
-#include <cstring>
-#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -18,14 +16,13 @@ int MPIIOBackend::openWithPlan(const char *filename,
   if (strict_mpp_init_failed)
     return failStrictMpp("open");
   int file_id = getNextFileHandle();
-  const bool remote_only = mpp_remote_only;
   const bool have_open_plan = plan && plan->Status == 0 &&
                               plan->AggregatorRank >= 0;
 
   io_log("Opening file %s with file_id %d\n", filename, file_id);
-  io_trace("MPIIOBackend::open enter this=%p file_id=%d remote_only=%d "
+  io_trace("MPIIOBackend::open enter this=%p file_id=%d "
            "filename=%s have_plan=%d aggregator=%d remote_handle=%d\n",
-           static_cast<void *>(this), file_id, static_cast<int>(remote_only),
+           static_cast<void *>(this), file_id,
            filename ? filename : "(null)", static_cast<int>(have_open_plan),
            have_open_plan ? plan->AggregatorRank : -1,
            have_open_plan ? plan->RemoteHandle : -1);
@@ -61,143 +58,40 @@ int MPIIOBackend::openWithPlan(const char *filename,
     return open_ok;
   };
 
-  if (remote_only) {
-    int remote_handle = -1;
-    int owner_rank = -1;
-    const bool open_ok = openRemoteHandle(remote_handle, owner_rank);
-    if (!open_ok) {
-      io_log("MPP open failed for %s\n", filename);
-      if (errno == 0)
-        errno = EIO;
-      return -1;
-    }
-    {
-      const auto lock = instrumentedHandleLock();
-      remote_file_handle_map[file_id] = remote_handle;
-      remote_file_owner_rank_map[file_id] = owner_rank;
-      remote_read_handle_cache[file_id].clear();
-      logical_handle_set.insert(file_id);
-      traceHandleStateLocked("open.remote_only.insert", file_id, remote_handle);
-    }
-    io_log("Remote-only open completed for file_id %d\n", file_id);
-    rememberFilePath(file_id, filename);
-    rememberFilePathKey(file_id, filename);
-    traceHandleState("open.remote_only.done", file_id, remote_handle);
-    return file_id;
-  }
-
-  MPI_File file_handle;
-  int ret = MPI_File_open(file_comm, filename, mpi_open_mode, MPI_INFO_NULL,
-                          &file_handle);
-  if (ret != MPI_SUCCESS) {
-    char err_str[MPI_MAX_ERROR_STRING];
-    int err_len = 0;
-    MPI_Error_string(ret, err_str, &err_len);
-    io_log("MPI_File_open failed for %s: %.*s (code %d)\n", filename,
-           err_len, err_str, ret);
-    errno = EIO;
+  int remote_handle = -1;
+  int owner_rank = -1;
+  const bool open_ok = openRemoteHandle(remote_handle, owner_rank);
+  if (!open_ok) {
+    io_log("MPP open failed for %s\n", filename);
+    if (errno == 0)
+      errno = EIO;
     return -1;
   }
   {
     const auto lock = instrumentedHandleLock();
-    file_handle_map[file_id] = file_handle;
+    remote_file_handle_map[file_id] = remote_handle;
+    remote_file_owner_rank_map[file_id] = owner_rank;
     remote_read_handle_cache[file_id].clear();
     logical_handle_set.insert(file_id);
-    traceHandleStateLocked("open.mpi.insert", file_id, -1);
+    traceHandleStateLocked("open.remote_only.insert", file_id, remote_handle);
   }
-
-  if (mpp_open_enabled) {
-    int remote_handle = -1;
-    int owner_rank = -1;
-    const bool open_ok = openRemoteHandle(remote_handle, owner_rank);
-    if (!open_ok) {
-      io_log("MPP open failed for %s\n", filename);
-      MPI_File_close(&file_handle);
-      {
-        const auto lock = instrumentedHandleLock();
-        file_handle_map.erase(file_id);
-        logical_handle_set.erase(file_id);
-        traceHandleStateLocked("open.mpp.fail.cleanup", file_id, -1);
-      }
-      errno = EIO;
-      return -1;
-    }
-    {
-      const auto lock = instrumentedHandleLock();
-      remote_file_handle_map[file_id] = remote_handle;
-      remote_file_owner_rank_map[file_id] = owner_rank;
-      traceHandleStateLocked("open.mpp.remote.insert", file_id, remote_handle);
-    }
-  }
+  io_log("Remote-only open completed for file_id %d\n", file_id);
   rememberFilePath(file_id, filename);
   rememberFilePathKey(file_id, filename);
-  traceHandleState("open.done", file_id, -1);
+  traceHandleState("open.remote_only.done", file_id, remote_handle);
   return file_id;
 }
 
 int MPIIOBackend::write(int file_id, const void *data, size_t size) {
   if (strict_mpp_init_failed)
     return failStrictMpp("write");
-  if (mpp_open_enabled && mpp_io_enabled) {
-    io_log("Error: write() without explicit offset is unsupported in "
-           "remote-only MPP mode.\n");
-    errno = ENOTSUP;
-    return -1;
-  }
-  if (!data && size > 0) {
-    errno = EINVAL;
-    return -1;
-  }
-  if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    errno = EOVERFLOW;
-    return -1;
-  }
-  invalidateTwoPhaseReadCacheForFile(file_id);
-
-  io_log("Writing %zu bytes to file %d\n", size, file_id);
-
-  MPI_File file = MPI_FILE_NULL;
-  {
-    const auto lock = instrumentedHandleLock();
-    auto it = file_handle_map.find(file_id);
-    if (it == file_handle_map.end()) {
-      io_log("Error: Invalid file handle %d\n", file_id);
-      errno = EBADF;
-      return -1;
-    }
-    file = it->second;
-  }
-
-  MPI_Status status{};
-  const int ret = MPI_File_write(file, data, static_cast<int>(size), MPI_BYTE,
-                                 &status);
-
-  if (ret != MPI_SUCCESS) {
-    io_log("Error: Write failed\n");
-    return -1;
-  }
-
-  int count = 0;
-  if (MPI_Get_count(&status, MPI_BYTE, &count) != MPI_SUCCESS || count < 0) {
-    errno = EIO;
-    return -1;
-  }
-  const size_t bytes_written = static_cast<size_t>(count);
-  if (bytes_written > size) {
-    errno = EPROTO;
-    return -1;
-  }
-  if (bytes_written < size) {
-    const size_t short_bytes = size - bytes_written;
-    short_write_count.fetch_add(1, std::memory_order_relaxed);
-    short_write_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
-    errno = EIO;
-    return -1;
-  }
-
-  io_log("Write completed\n");
-
-  return 0;
+  (void)file_id;
+  (void)data;
+  (void)size;
+  io_log("Error: write() without explicit offset is unsupported in "
+         "remote-only MPP mode.\n");
+  errno = ENOTSUP;
+  return -1;
 }
 
 int MPIIOBackend::commit(int file_id) {
@@ -244,12 +138,10 @@ int MPIIOBackend::close(int file_id) {
   io_log("Closing file %d\n", file_id);
   std::vector<int> rebalanced_handles;
   uint64_t close_path_key = 0;
-  const bool remote_only = mpp_remote_only;
   int remote_handle = -1;
   bool has_remote_handle = false;
-  MPI_File mpi_file = MPI_FILE_NULL;
-  io_trace("MPIIOBackend::close enter this=%p file_id=%d remote_only=%d\n",
-           static_cast<void *>(this), file_id, static_cast<int>(remote_only));
+  io_trace("MPIIOBackend::close enter this=%p file_id=%d\n",
+           static_cast<void *>(this), file_id);
 
   {
     const auto lock = instrumentedHandleLock();
@@ -275,29 +167,17 @@ int MPIIOBackend::close(int file_id) {
     file_path_key_map.erase(file_id);
     file_write_epoch_history.erase(file_id);
 
-    if (mpp_open_enabled) {
-      auto it = remote_file_handle_map.find(file_id);
-      if (it != remote_file_handle_map.end()) {
-        remote_handle = it->second;
-        has_remote_handle = true;
-      } else {
-        remote_file_owner_rank_map.erase(file_id);
-      }
-    }
-
-    if (!remote_only) {
-      auto it = file_handle_map.find(file_id);
-      if (it != file_handle_map.end()) {
-        mpi_file = it->second;
-        file_handle_map.erase(it);
-      }
+    auto it = remote_file_handle_map.find(file_id);
+    if (it != remote_file_handle_map.end()) {
+      remote_handle = it->second;
+      has_remote_handle = true;
+    } else {
+      remote_file_owner_rank_map.erase(file_id);
     }
 
     logical_handle_set.erase(file_id);
     traceHandleStateLocked("close.after_local_erase", file_id, remote_handle);
   }
-
-  invalidateTwoPhaseReadCacheForFile(file_id);
 
   int mpp_ret = 0;
   if (has_remote_handle) {
@@ -335,142 +215,37 @@ int MPIIOBackend::close(int file_id) {
     }
   }
 
-  if (remote_only) {
-    if (mpp_ret != 0)
-      return -1;
-    if (close_path_key != 0) {
-      int source_rank = -1;
-      uint64_t flushed_version = 0;
-      (void)ompfile::mpp::flushDirtyTile(close_path_key, source_rank,
-                                         flushed_version);
-    }
-    io_log("Remote-only close completed\n");
-    traceHandleState("close.remote_only.done", file_id, remote_handle);
-    return 0;
-  }
-
-  if (mpi_file == MPI_FILE_NULL) {
-    io_log("Error: Missing MPI file handle for file %d\n", file_id);
+  if (mpp_ret != 0)
     return -1;
-  }
-
-  int ret = MPI_File_close(&mpi_file);
-
-  if (ret != MPI_SUCCESS) {
-    io_log("Error: Close failed\n");
-    return -1;
-  }
-
   if (close_path_key != 0) {
     int source_rank = -1;
     uint64_t flushed_version = 0;
     (void)ompfile::mpp::flushDirtyTile(close_path_key, source_rank,
                                        flushed_version);
   }
-
-  if (mpp_ret != 0)
-    return -1;
-
-  io_log("Close completed\n");
-  traceHandleState("close.done", file_id, remote_handle);
-
+  io_log("Remote-only close completed\n");
+  traceHandleState("close.remote_only.done", file_id, remote_handle);
   return 0;
 }
 
 int MPIIOBackend::read(int file_id, void *data, size_t size) {
   if (strict_mpp_init_failed)
     return failStrictMpp("read");
-  if (mpp_open_enabled && mpp_io_enabled) {
-    io_log("Error: read() without explicit offset is unsupported in "
-           "remote-only MPP mode.\n");
-    errno = ENOTSUP;
-    return -1;
-  }
-  if (!data && size > 0) {
-    errno = EINVAL;
-    return -1;
-  }
-  if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    errno = EOVERFLOW;
-    return -1;
-  }
-
-  io_log("Reading %zu bytes from file %d\n", size, file_id);
-
-  MPI_File file = MPI_FILE_NULL;
-  {
-    const auto lock = instrumentedHandleLock();
-    auto it = file_handle_map.find(file_id);
-    if (it == file_handle_map.end()) {
-      io_log("Error: Invalid file handle %d\n", file_id);
-      errno = EBADF;
-      return -1;
-    }
-    file = it->second;
-  }
-
-  MPI_Status status{};
-  const int ret =
-      MPI_File_read(file, data, static_cast<int>(size), MPI_BYTE, &status);
-  if (ret != MPI_SUCCESS) {
-    io_log("Error: Read failed\n");
-    errno = EIO;
-    return -1;
-  }
-
-  int count = 0;
-  if (MPI_Get_count(&status, MPI_BYTE, &count) != MPI_SUCCESS || count < 0) {
-    errno = EIO;
-    return -1;
-  }
-  const size_t bytes_read = static_cast<size_t>(count);
-  if (bytes_read > size) {
-    errno = EPROTO;
-    return -1;
-  }
-  if (bytes_read < size && data) {
-    const size_t short_bytes = size - bytes_read;
-    short_read_count.fetch_add(1, std::memory_order_relaxed);
-    short_read_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
-    std::memset(static_cast<char *>(data) + bytes_read, 0, short_bytes);
-  }
-
-  io_log("Read completed\n");
-
-  return 0;
+  (void)file_id;
+  (void)data;
+  (void)size;
+  io_log("Error: read() without explicit offset is unsupported in "
+         "remote-only MPP mode.\n");
+  errno = ENOTSUP;
+  return -1;
 }
 
 int MPIIOBackend::seek(int file_id, long offset) {
   if (strict_mpp_init_failed)
     return failStrictMpp("seek");
-  if (mpp_open_enabled && mpp_io_enabled) {
-    io_log("Error: seek() is unsupported in remote-only MPP mode.\n");
-    errno = ENOTSUP;
-    return -1;
-  }
-
-  io_log("Setting file pointer to offset %ld\n", offset);
-
-  MPI_File file = MPI_FILE_NULL;
-  {
-    const auto lock = instrumentedHandleLock();
-    auto it = file_handle_map.find(file_id);
-    if (it == file_handle_map.end()) {
-      io_log("Error: Invalid file handle %d\n", file_id);
-      errno = EBADF;
-      return -1;
-    }
-    file = it->second;
-  }
-
-  int ret = MPI_File_seek(file, offset, MPI_SEEK_SET);
-
-  if (ret != MPI_SUCCESS) {
-    io_log("Error: Seek failed\n");
-    return -1;
-  }
-
-  io_log("Seek completed\n");
-
-  return 0;
+  (void)file_id;
+  (void)offset;
+  io_log("Error: seek() is unsupported in remote-only MPP mode.\n");
+  errno = ENOTSUP;
+  return -1;
 }

@@ -31,22 +31,29 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   both bridges define its prototypes); the scheduler wire structs are
   libompfile's `ompfile_sched.h`, aliased in `EventSystem.h`
 - Shared environment readers: `openmp/libompfile/include/ompfile_env.h`
-  (`normalizeStageWriteMode` and the `envBoolOrDefault` family forward to it)
+  (`normalizeStageWriteMode` and the `envBoolOrDefault` family forward to it).
+  A knob libompfile and the proxy both read has exactly one reader there —
+  `schedulerIsHeadnode()` for `LIBOMPFILE_SCHEDULER`,
+  `writebackDistributeActive()` for distributed write-back (the proxy's
+  derived-tile dirty-flush completion uses it) — never a local `getenv`.
 
 ## Event model
 
 - File events: `OMPFILE_OPEN`, `OMPFILE_CLOSE`, `OMPFILE_PREAD`,
   `OMPFILE_PREAD_NO_STAGE`, `OMPFILE_PWRITE`, `OMPFILE_PING`
-- Scheduler events: `OMPFILE_SCHED_REQUEST`, `OMPFILE_SCHED_PLAN`,
-  `OMPFILE_SCHED_REQUEST_BATCH`
-- Coherence events (write-back staging): `OMPFILE_STAGE_INVALIDATE`,
-  `OMPFILE_FRESHNESS_QUERY`, `OMPFILE_FRESHNESS_WRITE_COMMIT`,
-  `OMPFILE_FRESHNESS_MARK_FRESH`, `OMPFILE_PROXY_COPY_TILE`,
-  `OMPFILE_FLUSH_DIRTY_TILE`, `OMPFILE_DIRTY_OWNER_PREAD`,
-  `OMPFILE_DIRTY_OWNER_PREAD_BATCH`, `OMPFILE_DIRTY_OWNER_QUERY`
+- Scheduler events: `OMPFILE_SCHED_REQUEST`, `OMPFILE_SCHED_REQUEST_BATCH`
+  (wire value 33, the former `OMPFILE_SCHED_PLAN`, is reserved)
+- Coherence events (write-back staging): `OMPFILE_FRESHNESS_QUERY`,
+  `OMPFILE_FRESHNESS_WRITE_COMMIT`, `OMPFILE_FLUSH_DIRTY_TILE`,
+  `OMPFILE_DIRTY_OWNER_PREAD`, `OMPFILE_DIRTY_OWNER_PREAD_BATCH`,
+  `OMPFILE_DIRTY_OWNER_QUERY` (wire values 36, 39 and 40, the former
+  `OMPFILE_STAGE_INVALIDATE`, `OMPFILE_PROXY_COPY_TILE` and
+  `OMPFILE_FRESHNESS_MARK_FRESH`, are reserved)
 - The full enum with its pinned numeric values is `EventTypeTy` in
   `event_system/EventSystem.h`; the static_asserts there are the wire
-  contract
+  contract. A removed event leaves a "reserved" comment where its enumerator
+  and its static_assert were, and the next enumerator keeps an explicit value
+  (`SYNC = 34`); never renumber or reuse a reserved value
 - `ProxyDevice` creates rank-targeted events and waits for completion.
 
 ## Proxy queues and threads
@@ -58,12 +65,15 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   `EventSystem.h` is the contract; keep it current.
 - A new `OMPFILE_*` event type must be added to `isFileIoEvent()` or it
   silently lands on the data queue.
-- `OMPTARGET_NUM_IO_EVENT_HANDLERS` defaults to **4**, not 1, because an io
-  handler can block: the owner-forwarding paths (`openOnRank`,
-  `preadOnRank`, `pwriteOnRank`, `closeOnRank`) call `waitForEvent`, which
-  is `EventTy::wait()`. With one io thread, two proxies forwarding to each
-  other starve each other. Do not lower the default until those waits are
-  `co_await`s.
+- `OMPTARGET_NUM_IO_EVENT_HANDLERS` defaults to **4**, not 1, as margin for
+  the one place an io handler blocks: the headnode coherence round trips
+  (`freshnessQueryOnHeadnode`, `freshnessWriteCommitOnHeadnode`,
+  `completeDirtyFlushOnHeadnode`, also reached through
+  `completeDerivedTileFlushesOnHeadnode`) under write-back staging on a
+  non-headnode rank, via `waitForEvent`, which is `EventTy::wait()`. The
+  owner-forwarding helpers wait only on kernel threads (see "Which threads
+  can block on a peer" below). Do not lower the default until the coherence
+  waits are `co_await`s.
 - Each pool is at least one thread whatever its knob says.
 
 ## MPI call lock invariant (do not regress)
@@ -101,11 +111,43 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
 
 ## Scheduler behavior
 
-- `LIBOMPFILE_SCHEDULER=HEADNODE` triggers scheduler request on open.
+- HEADNODE is the scheduler default since Oct 2026: `LIBOMPFILE_SCHEDULER`
+  unset, empty, `HEADNODE` (any case) or an unknown value all mean HEADNODE,
+  and only `LOCAL` turns it off (`ompfile::env::schedulerIsHeadnode()`).
+  Under HEADNODE an open sends a scheduler request.
 - `OmpFileHeadnodeManager` keeps:
-  - handler table (rank + in-flight load)
+  - handler table, per worker rank: `PlansIssued` (one per scalar plan, OPEN
+    included, batch segments not; monotonic; the load of every pick),
+    `PlannedTotal` (every plan plus one per batch segment; monotonic; the load
+    of every pick under `LIBOMPFILE_SCHED_USE_PLANNED_LOAD_FOR_SKEW=1`) and
+    `OpenHandles` (live open handles, accounting only: an OPEN plan adds one on
+    the rank it names, the CLOSE carrying that rank in
+    `OmpFileIORequest::AggregatorRank` removes it, saturating at 0)
   - global file table (`path -> preferred aggregator rank`)
-  - flightplan table (request tracking)
+- Every pick, OPEN included (scalar OPEN/PREAD/PWRITE/CLOSE, batch segments),
+  weighs `PlansIssued` with the round-robin tie-breaker, exactly the rule from
+  before the Oct 2026 cleanup (`InFlight` was that count under another name).
+  `OpenHandles` never steers placement: an intermediate version that placed
+  OPENs by it put an origin's sequentially opened files on one proxy rank and
+  broke the Cholesky two-phase regression (`docs/known-issues.md`), and
+  `test-mpp-rebalance-fallback-regression` (`sequential-open-spread`) now
+  guards that. Making it a scheduler signal is a placement change, to be
+  validated as one. `planRequest` keeps its first
+  `pickLeastLoadedRankUnlocked` call for an OPEN whose result the OPEN branch
+  overwrites, because the call advances the tie-breaker. Keep it.
+- A CLOSE with `FileHandle < 0` is release-only: it gives back the live
+  handle of its `AggregatorRank` and plans nothing (no count, no tie-breaker
+  step). libompfile sends one when its backend open fails after a counted
+  OPEN plan.
+- Only libompfile's `HeadnodeScheduler` pairs a counted OPEN plan with its
+  CLOSE. The bridge's own pick (`selectAggregatorRankForOpen`, in `mppOpen`)
+  sets `OMPFILE_IO_REQUEST_PLACEMENT_ONLY` in `OmpFileIORequest::Flags`: the
+  headnode places and counts it like any OPEN but adds no live handle. Any new
+  OPEN-plan requester must do one or the other, or the live-handle counts only
+  grow.
+- `LIBOMPFILE_DEBUG_TRACE=1` on the headnode prints one
+  `[ompfile-mpp][sched] open-handles op=open|close rank=<r> open_handles=<n>`
+  line per live-handle change.
 - If the scheduler request fails, or the plan names a rank that is not a
   worker, the open falls back to the local rank and says so on stderr
   (`MPIProxyDevice --> OMPFile scheduler fallback ...`, at every build
@@ -113,9 +155,12 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
 
 ## Ownership and handles
 
-- `mppOpen` picks an aggregator rank, opens there, and stores
+- `mppOpen` picks an aggregator rank (under HEADNODE a placement-only
+  scheduler request), opens there, and stores
   local-handle -> {rank, remote_handle}.
-- `mppPread`/`mppPwrite` route via that stored rank.
+- `mppPreadEx`/`mppPwriteEx` route via that stored rank (the plain
+  `mppPread`/`mppPwrite` and their `ompfile_mpp_pread`/`_pwrite` bridges were
+  removed in Oct 2026).
 - `mppClose` closes on that stored rank and removes handle mapping.
 - Several `ompfile_mpp_*` exports exist twice: the origin definition in
   `src/rtl.cpp` and a proxy-side one in `src/ProxyDevice.cpp`, which is what a
@@ -129,28 +174,39 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
   `fdatasync` waits in `OmpFileUnsyncedWriteFds` for the next commit or the
   logical close; the commit handler drains it (`syncDeferredWritesForPathKey`).
   Anything new that promises durability must drain that set too.
-- Split-phase writes (`ompfile_mpp_pwrite_submit` / `ompfile_mpp_poll_ex`,
-  behind libompfile's `LIBOMPFILE_MPP_SPLIT_PHASE_WRITES`): a poll takes its
-  entry out of the token map while it resumes the event, so one event is never
-  resumed by two threads; the event's result slots live on the heap next to it.
-  Resuming an `OMPFILE_PWRITE` event runs its **blocking payload send on the
-  resuming thread**, so a split-phase write frees no thread until that send can
-  be suspended across (Sep 2026 trace). On a proxy, a file it owns completes at
-  submit — there is no event on that path.
-- The pwrite payload send can suspend (`LIBOMPFILE_MPP_ASYNC_PWRITE_SEND=1`,
-  `ompfilePwrite` in `EventSystem.cpp`): header first, then the payload's
-  `MPI_Isend` fragments awaited on their own, then the completion receives —
-  never the payload and the completion in one wait. It was made blocking in
-  May 2026 (a1461b1) against `internal_Testall` aborts; polling has used
-  `MPI_Testany` since 494c060. An `MPI_Isend` progresses only while a thread
-  is inside MPI, so a suspended payload is only as fast as whoever polls it —
-  that, not the seam, is what limits several writes in flight (Sep 2026).
+- An `OMPFILE_PWRITE` event sends its payload with a blocking send
+  (`sendInBatchsBlocking` in `ompfilePwrite`, `EventSystem.cpp`, outside
+  `ompfileWithMPICallLock`) on whichever thread resumes it, after the header
+  and before the completion receives. The Sep 2026 split-phase seam
+  (`ompfile_mpp_pwrite_submit` / `ompfile_mpp_poll_ex`) and the suspendable
+  payload send (`LIBOMPFILE_MPP_ASYNC_PWRITE_SEND`) were removed in Oct 2026:
+  a split-phase write freed no thread, because the resuming thread ran the
+  send, and an `MPI_Isend` progresses only while some thread is inside MPI,
+  so the polled send was slower than the blocking one. MPI progress, not a
+  seam, is the missing piece for several writes in flight.
+- `offload/src/exports` (the origin's version script) must list exactly the
+  `ompfile_mpp_*` entrypoints `rtl.cpp` defines: a listed name with no
+  definition, or a definition `dlsym` cannot reach, is the Sep 2026 export
+  mismatch again. The proxy-only rows (`handle_owner_rank`,
+  `pread_no_stage_ex` and the three `dirty_owner_*_ex`) have no origin
+  definition or export (`rtl.cpp` defines exactly the 15 exported rows), so
+  an origin caller takes the shim fallback documented in
+  `ompfile_mpp_abi.h`; giving one an origin definition and export is a
+  behavior change, not a cleanup. The gate checks the built
+  artifact (`nm -D libomptarget.so`) against its own copy of the list,
+  `MPP_LOCAL_EXPORTS` in `application/lib/mpp_local.sh`
+  (`mpp_local_check_exports`), so the exports file, the `rtl.cpp` definitions
+  and that array change together.
+- `ProxyDevice::isPluginCompatible` only asks each plugin
+  `is_plugin_compatible`; it must not move plugins out of, or reorder,
+  `PluginManager.Plugins` (port of OMPC `5b27d1e59`, Oct 2026).
 - Which threads can block on a peer: the owner-forwarding helpers
   (`openOnRank`, `preadOnRank`, `pwriteOnRank`, `closeOnRank`) run only on
   kernel threads via the `mpp*` bridges. An I/O-handler coroutine reaches
   `waitForEvent` only through the headnode coherence helpers
   (`freshnessQueryOnHeadnode`, `freshnessWriteCommitOnHeadnode`,
-  `completeDirtyFlushOnHeadnode`), i.e. under write-back staging on a
+  `completeDirtyFlushOnHeadnode`, also via
+  `completeDerivedTileFlushesOnHeadnode`), i.e. under write-back staging on a
   non-headnode rank. Keep it that way, or make the new wait a `co_await`.
 - The coherent read refresh (`refreshTrackedOmpFileFdForRead`: re-open +
   `dup2` over the shared `O_RDWR` fd before a read) closes the old open file
@@ -166,8 +222,8 @@ MPP event routing, scheduler selection, and proxy-side I/O dispatch.
 
 - If `ActiveMPIPlugin is null`, confirm which process loads this code path
   and whether plugin init is valid in that role.
-- If scheduling seems ignored, verify `LIBOMPFILE_SCHEDULER=HEADNODE` in
-  the process environment.
+- If scheduling seems ignored, check that `LIBOMPFILE_SCHEDULER` is not
+  `LOCAL` in the process environment (unset means HEADNODE since Oct 2026).
 - Use `LIBOMPFILE_OPT_STATS=1` to inspect open/close cache counters
   printed by proxy.
 - Readthrough stage entries are process-local; if multiple proxies can

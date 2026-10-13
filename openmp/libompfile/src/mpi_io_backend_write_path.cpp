@@ -2,7 +2,6 @@
 #include "ompfile_env.h"
 #include "mpi_io_backend.h"
 #include "mpp_shim.h"
-#include "ompfile_trace.h"
 
 #include <cassert>
 #include <cerrno>
@@ -11,7 +10,6 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -27,30 +25,11 @@ bool freshnessWriteThroughModeEnabled() {
   return true;
 }
 
-bool writebackDistributeWritesEnabled() {
-  return ompfile::env::flag("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES");
-}
-
-unsigned parsePositiveEnv(const char *name) {
-  return ompfile::env::positiveOr(name);
-}
-
-unsigned writebackDistributeRankCount() {
-  if (const unsigned explicit_count =
-          parsePositiveEnv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS"))
-    return explicit_count;
-  if (const unsigned worker_nodes = parsePositiveEnv("OMPFILE_CHOLESKY_WORKER_NODES"))
-    return worker_nodes;
-  if (const unsigned target_regions = parsePositiveEnv("OMPFILE_CHOLESKY_TARGET_REGIONS"))
-    return target_regions;
-  return 0;
-}
-
 int chooseDistributedWriteRank(const ompfile::OmpFileWriteRequestContext &context,
                                size_t size) {
-  if (!writebackDistributeWritesEnabled())
+  if (!ompfile::env::writebackDistributeActive())
     return -1;
-  const unsigned ranks = writebackDistributeRankCount();
+  const unsigned ranks = ompfile::env::writebackDistributeRankCount();
   if (ranks <= 1)
     return -1;
   uint64_t key = 0;
@@ -78,39 +57,7 @@ uint64_t tileFreshnessKey(uint64_t path_key,
 } // namespace
 
 bool MPIIOBackend::isWriteBatchActive() const {
-  return write_batch_enabled && mpp_remote_only;
-}
-
-// One remote write through the submit/poll seam. mpp_call_mutex is taken
-// for the submit and for each poll, never across the wait, and the wait
-// yields, then backs off, instead of spinning in EventTy::wait(). One NVTX
-// range per write (never per poll).
-bool MPIIOBackend::splitPhasePwrite(int remote_handle, long offset,
-                                    const void *data, size_t size,
-                                    size_t &bytes_written) {
-  bytes_written = 0;
-  const uint64_t token = ompfile::mpp::nextSplitPhaseToken();
-  {
-    const auto lock = instrumentedMppCallLock();
-    if (!ompfile::mpp::pwriteSubmit(remote_handle, offset, data, size, token))
-      return false;
-  }
-  ompfile::trace::Scope trace(ompfile::trace::Domain::LibOmpFile,
-                              "split-phase-wait", ompfile::trace::Color::Wait);
-  for (unsigned polls = 0;; ++polls) {
-    bool done = false;
-    bool ok = false;
-    {
-      const auto lock = instrumentedMppCallLock();
-      ok = ompfile::mpp::pollEx(token, done, bytes_written);
-    }
-    if (done || !ok)
-      return ok && done;
-    if (polls < 64)
-      std::this_thread::yield();
-    else
-      std::this_thread::sleep_for(std::chrono::microseconds(20));
-  }
+  return write_batch_enabled;
 }
 
 int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
@@ -130,10 +77,7 @@ int MPIIOBackend::writeAtRemoteHandle(int remote_handle, long offset,
 
     bool pwrite_ok = false;
     size_t call_bytes_written = 0;
-    if (mpp_split_phase_writes && ompfile::mpp::splitPhaseWriteAvailable()) {
-      pwrite_ok = splitPhasePwrite(remote_handle, current_offset, cursor,
-                                   remaining, call_bytes_written);
-    } else {
+    {
       const auto lock = instrumentedMppCallLock();
       pwrite_ok = ompfile::mpp::pwriteEx(remote_handle, current_offset, cursor,
                                          remaining, call_bytes_written);
@@ -203,7 +147,6 @@ int MPIIOBackend::writeAtWithContext(
 
   if (strict_mpp_init_failed)
     return failStrictMpp("pwrite");
-  const bool remote_only = mpp_remote_only;
   pwrite_request_count.fetch_add(1, std::memory_order_relaxed);
   if (offset < 0) {
     errno = EINVAL;
@@ -213,8 +156,6 @@ int MPIIOBackend::writeAtWithContext(
     errno = EINVAL;
     return -1;
   }
-  recordForecastWrite(context.Hint, size);
-  invalidateTwoPhaseReadCacheForFile(file_id);
 
   const auto report_freshness_write_commit = [&](int writer_rank_override) {
     if ((context.Hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) == 0)
@@ -277,7 +218,6 @@ int MPIIOBackend::writeAtWithContext(
         writeAtBatched(file_id, offset, data, size, group_key);
     if (batched_rc == 0) {
       recordWriteEpochForContext(file_id, offset, size, context.Hint);
-      triggerStageInvalidationAfterSuccessfulRemoteWrite(file_id);
       if (!report_freshness_write_commit(/*writer_rank_override=*/-1)) {
         if (errno == 0)
           errno = EIO;
@@ -287,148 +227,61 @@ int MPIIOBackend::writeAtWithContext(
     return batched_rc;
   }
 
-  if (remote_only) {
-    const int distributed_write_rank = chooseDistributedWriteRank(context, size);
-    if (distributed_write_rank >= 0) {
-      size_t distributed_bytes_written = 0;
-      if (writeAtRemoteRankWithBytes(file_id, distributed_write_rank, offset,
-                                     data, size,
-                                     distributed_bytes_written)) {
-        assert(distributed_bytes_written == size &&
-               "Distributed remote pwrite must complete full request");
-        recordWriteEpochForContext(file_id, offset, size, context.Hint);
-        triggerStageInvalidationAfterSuccessfulRemoteWrite(file_id);
-        if (!report_freshness_write_commit(distributed_write_rank)) {
-          if (errno == 0)
-            errno = EIO;
-          return -1;
-        }
-        io_log("MPP distributed write at offset completed: file=%d rank=%d "
-               "bytes=%zu.\n",
-               file_id, distributed_write_rank, distributed_bytes_written);
-        return 0;
+  const int distributed_write_rank = chooseDistributedWriteRank(context, size);
+  if (distributed_write_rank >= 0) {
+    size_t distributed_bytes_written = 0;
+    if (writeAtRemoteRankWithBytes(file_id, distributed_write_rank, offset,
+                                   data, size,
+                                   distributed_bytes_written)) {
+      assert(distributed_bytes_written == size &&
+             "Distributed remote pwrite must complete full request");
+      recordWriteEpochForContext(file_id, offset, size, context.Hint);
+      if (!report_freshness_write_commit(distributed_write_rank)) {
+        if (errno == 0)
+          errno = EIO;
+        return -1;
       }
-      io_log("MPP distributed pwrite failed for file %d rank=%d offset=%lld "
-             "size=%zu errno=%d; falling back to owner handle.\n",
-             file_id, distributed_write_rank, static_cast<long long>(offset),
-             size, errno);
+      io_log("MPP distributed write at offset completed: file=%d rank=%d "
+             "bytes=%zu.\n",
+             file_id, distributed_write_rank, distributed_bytes_written);
+      return 0;
     }
-
-    int remote_handle = -1;
-    {
-      const auto lock = instrumentedHandleLock();
-      auto it = remote_file_handle_map.find(file_id);
-      if (it != remote_file_handle_map.end())
-        remote_handle = it->second;
-    }
-    if (remote_handle < 0) {
-      io_log("Error: Missing remote handle for file %d\n", file_id);
-      errno = EBADF;
-      return -1;
-    }
-    size_t bytes_written = 0;
-    if (writeAtRemoteHandle(remote_handle, offset, data, size, bytes_written) !=
-        0) {
-      io_log("MPP pwrite failed for file %d (remote_handle=%d offset=%lld "
-             "size=%zu errno=%d)\n",
-             file_id, remote_handle, static_cast<long long>(offset), size,
-             errno);
-      return -1;
-    }
-    assert(bytes_written == size && "Remote pwrite must complete full request");
-
-    recordWriteEpochForContext(file_id, offset, size, context.Hint);
-    triggerStageInvalidationAfterSuccessfulRemoteWrite(file_id);
-    if (!report_freshness_write_commit(/*writer_rank_override=*/-1)) {
-      if (errno == 0)
-        errno = EIO;
-      return -1;
-    }
-    io_log("MPP write at offset completed.\n");
-    return 0;
+    io_log("MPP distributed pwrite failed for file %d rank=%d offset=%lld "
+           "size=%zu errno=%d; falling back to owner handle.\n",
+           file_id, distributed_write_rank, static_cast<long long>(offset),
+           size, errno);
   }
 
-  // Check if the file handle is valid
-  if (mpp_io_enabled) {
-    int remote_handle = -1;
-    {
-      const auto lock = instrumentedHandleLock();
-      auto it = remote_file_handle_map.find(file_id);
-      if (it != remote_file_handle_map.end())
-        remote_handle = it->second;
-    }
-    if (remote_handle < 0) {
-      io_log("Error: Missing remote handle for file %d\n", file_id);
-      errno = EBADF;
-      return -1;
-    }
-    size_t bytes_written = 0;
-    if (writeAtRemoteHandle(remote_handle, offset, data, size, bytes_written) !=
-        0) {
-      io_log("MPP pwrite failed for file %d (remote_handle=%d offset=%lld "
-             "size=%zu errno=%d)\n",
-             file_id, remote_handle, static_cast<long long>(offset), size,
-             errno);
-      return -1;
-    }
-    assert(bytes_written == size && "Remote pwrite must complete full request");
-
-    recordWriteEpochForContext(file_id, offset, size, context.Hint);
-    if (!report_freshness_write_commit(/*writer_rank_override=*/-1)) {
-      if (errno == 0)
-        errno = EIO;
-      return -1;
-    }
-    io_log("MPP write at offset completed.\n");
-    return 0;
-  }
-
-  MPI_File file = MPI_FILE_NULL;
+  int remote_handle = -1;
   {
     const auto lock = instrumentedHandleLock();
-    auto it = file_handle_map.find(file_id);
-    if (it == file_handle_map.end()) {
-      io_log("Error: Invalid file handle %d\n", file_id);
-      errno = EBADF;
-      return -1;
-    }
-    file = it->second;
+    auto it = remote_file_handle_map.find(file_id);
+    if (it != remote_file_handle_map.end())
+      remote_handle = it->second;
   }
-
-  if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    errno = EOVERFLOW;
+  if (remote_handle < 0) {
+    io_log("Error: Missing remote handle for file %d\n", file_id);
+    errno = EBADF;
     return -1;
   }
-
-  // Perform the actual write at the specified offset
-  MPI_Status status{};
-  const int ret = MPI_File_write_at(file, offset, data, static_cast<int>(size),
-                                    MPI_BYTE, &status);
-  if (ret != MPI_SUCCESS) {
-    io_log("Error: Write at offset failed\n");
+  size_t bytes_written = 0;
+  if (writeAtRemoteHandle(remote_handle, offset, data, size, bytes_written) !=
+      0) {
+    io_log("MPP pwrite failed for file %d (remote_handle=%d offset=%lld "
+           "size=%zu errno=%d)\n",
+           file_id, remote_handle, static_cast<long long>(offset), size,
+           errno);
     return -1;
   }
-
-  int count = 0;
-  if (MPI_Get_count(&status, MPI_BYTE, &count) != MPI_SUCCESS || count < 0) {
-    errno = EIO;
-    return -1;
-  }
-  const size_t bytes_written = static_cast<size_t>(count);
-  if (bytes_written > size) {
-    errno = EPROTO;
-    return -1;
-  }
-  if (bytes_written < size) {
-    const size_t short_bytes = size - bytes_written;
-    short_write_count.fetch_add(1, std::memory_order_relaxed);
-    short_write_bytes_total.fetch_add(short_bytes, std::memory_order_relaxed);
-    errno = EIO;
-    return -1;
-  }
+  assert(bytes_written == size && "Remote pwrite must complete full request");
 
   recordWriteEpochForContext(file_id, offset, size, context.Hint);
-  io_log("Write at offset completed\n");
+  if (!report_freshness_write_commit(/*writer_rank_override=*/-1)) {
+    if (errno == 0)
+      errno = EIO;
+    return -1;
+  }
+  io_log("MPP write at offset completed.\n");
   return 0;
 }
 

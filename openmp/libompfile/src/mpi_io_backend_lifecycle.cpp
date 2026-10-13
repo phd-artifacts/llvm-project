@@ -1,6 +1,7 @@
 #include "mpi_io_backend.h"
 #include "debug_log.h"
 #include "mpp_shim.h"
+#include "ompfile_env.h"
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -8,13 +9,13 @@
 #include <fcntl.h>
 #include <mpi.h>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace {
 
 struct OpenModeConfig {
   int PosixFlags = O_RDWR;
-  int MpiMode = MPI_MODE_RDWR;
 };
 
 OpenModeConfig parseOpenModeConfig() {
@@ -23,7 +24,7 @@ OpenModeConfig parseOpenModeConfig() {
     return {};
   if (std::strcmp(mode, "readonly") == 0 ||
       std::strcmp(mode, "read-only") == 0 || std::strcmp(mode, "read") == 0)
-    return {O_RDONLY, MPI_MODE_RDONLY};
+    return {O_RDONLY};
 
   io_log("Invalid LIBOMPFILE_OPEN_MODE='%s'; using readwrite mode.\n", mode);
   return {};
@@ -32,19 +33,33 @@ OpenModeConfig parseOpenModeConfig() {
 } // namespace
 
 MPIIOBackend::MPIIOBackend() {
-  int provided = 0;
-  int initialized = 0;
+  // Remote-only MPP is libompfile's only mode (Oct 2026). A removed mode
+  // requested through LIBOMPFILE_BACKEND / LIBOMPFILE_MPP_OPEN /
+  // LIBOMPFILE_MPP_IO takes the MPP-init-failure path below, and every
+  // removed knob still set is named once (both lists live in ompfile_env.h).
+  const std::string rejected_mode_knobs = ompfile::env::rejectedModeKnobs();
+  const bool mode_knobs_valid = rejected_mode_knobs.empty();
+  if (!mode_knobs_valid)
+    io_report("libompfile init failed: %s requests a removed mode; "
+              "remote-only MPP is the only mode (leave LIBOMPFILE_BACKEND, "
+              "LIBOMPFILE_MPP_OPEN and LIBOMPFILE_MPP_IO unset, or set them "
+              "to MPI, 1 and 1); all I/O calls will fail.\n",
+              rejected_mode_knobs.c_str());
+  const std::string removed_knobs = ompfile::env::removedKnobsSet();
+  if (!removed_knobs.empty())
+    io_report("removed knob ignored: %s\n", removed_knobs.c_str());
 
-  // Check if MPI is already initialized
+  int provided = -1;
+  int initialized = 0;
   MPI_Initialized(&initialized);
-  if (!initialized) {
-    // Initialize MPI with thread support
-    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
-    io_log("MPI_Init_thread called, provided = %d\n", provided);
-    externally_initialized = 0;
-  } else {
-    io_log("MPI already initialized by user program.\n");
-    externally_initialized = 1;
+  if (!initialized && mode_knobs_valid) {
+    // The runtime owns MPI end to end: libompfile never calls MPI_Init.
+    // Bringing the MPP bridge up initializes the MPI plugin, which
+    // initializes MPI at MPI_THREAD_MULTIPLE.
+    (void)ompfile::mpp::init();
+    MPI_Initialized(&initialized);
+  }
+  if (initialized) {
     // MPI was initialized elsewhere (offload runtime / launcher), so we did
     // not choose the thread level. Query the level actually granted, since
     // it decides whether mpp_call_mutex is load-bearing for correctness: if
@@ -52,6 +67,8 @@ MPIIOBackend::MPIIOBackend() {
     // outbound MPP/MPI calls from multiple client threads MUST stay
     // serialized and mpp_call_mutex cannot be removed or per-rank sharded.
     MPI_Query_thread(&provided);
+  } else {
+    io_log("MPI is not initialized; libompfile does not initialize it.\n");
   }
   mpi_provided_thread_level = provided;
   lock_stats_enabled = parseBoolEnv("LIBOMPFILE_OPT_STATS", false);
@@ -62,105 +79,60 @@ MPIIOBackend::MPIIOBackend() {
   mpp_call_lock_bypass =
       parseBoolEnv("LIBOMPFILE_OPT_MPP_CALL_LOCK_FREE", false) &&
       provided == MPI_THREAD_MULTIPLE;
-  // Same fail-safe: releasing mpp_call_mutex between polls lets another client
-  // thread issue MPI while this write is in flight.
-  mpp_split_phase_writes =
-      parseBoolEnv("LIBOMPFILE_MPP_SPLIT_PHASE_WRITES", false) &&
-      provided == MPI_THREAD_MULTIPLE;
-  io_log("libompfile mpp_split_phase_writes=%d\n",
-         static_cast<int>(mpp_split_phase_writes));
   io_log("libompfile mpp_call_lock_bypass=%d (requested=%d thread_level=%d "
          "multiple=%d)\n",
          static_cast<int>(mpp_call_lock_bypass),
          static_cast<int>(parseBoolEnv("LIBOMPFILE_OPT_MPP_CALL_LOCK_FREE", false)),
          provided, MPI_THREAD_MULTIPLE);
   io_log("libompfile MPI thread level: provided=%d (SINGLE=%d FUNNELED=%d "
-         "SERIALIZED=%d MULTIPLE=%d) externally_initialized=%d "
+         "SERIALIZED=%d MULTIPLE=%d) "
          "lock_stats_enabled=%d\n",
          provided, MPI_THREAD_SINGLE, MPI_THREAD_FUNNELED,
          MPI_THREAD_SERIALIZED, MPI_THREAD_MULTIPLE,
-         static_cast<int>(externally_initialized),
          static_cast<int>(lock_stats_enabled));
 
-  if (parseBoolEnv("LIBOMPFILE_MPP_OPEN", false)) {
-    mpp_open_enabled = true;
-    io_log("LIBOMPFILE_MPP_OPEN=1: enabling MPP open/close path.\n");
-  }
-
-  if (parseBoolEnv("LIBOMPFILE_MPP_IO", false)) {
-    if (mpp_open_enabled) {
-      mpp_io_enabled = true;
-      io_log("LIBOMPFILE_MPP_IO=1: enabling MPP I/O path.\n");
-    } else {
-      io_log("LIBOMPFILE_MPP_IO set without MPP open enabled.\n");
-    }
-  }
-
-  mpp_requested = mpp_open_enabled || mpp_io_enabled;
-  mpp_remote_only = mpp_open_enabled && mpp_io_enabled;
   const OpenModeConfig open_mode = parseOpenModeConfig();
   open_flags = open_mode.PosixFlags;
-  mpi_open_mode = open_mode.MpiMode;
   if (open_flags == O_RDONLY)
     io_log("LIBOMPFILE_OPEN_MODE=readonly: opening files read-only.\n");
   writable_read_rebalance_enabled =
       parseBoolEnv("LIBOMPFILE_OPT_WRITABLE_READ_REBALANCE", false);
   dirty_owner_forwarding_enabled =
       parseBoolEnv("LIBOMPFILE_OPT_DIRTY_OWNER_FORWARDING", false);
-  dirty_clean_pfs_rebalance_enabled =
-      parseBoolEnv("LIBOMPFILE_OPT_DIRTY_CLEAN_PFS_REBALANCE", false);
-  dirty_clean_pfs_allow_clean_pfs_enabled = parseBoolEnv(
-      "LIBOMPFILE_OPT_DIRTY_CLEAN_PFS_REBALANCE_ALLOW_CLEAN_PFS", false);
-  stage_global_invalidation_enabled =
-      parseBoolEnv("LIBOMPFILE_OPT_STAGE_GLOBAL_INVALIDATION", false);
-  allow_fallback = parseBoolEnv("LIBOMPFILE_ALLOWFALLBACK", false);
-  strict_mpp_required = mpp_requested && !allow_fallback;
-
-  if (!mpp_remote_only) {
-    MPI_Comm source_comm = MPI_COMM_WORLD;
-    const char *comm_self_env = std::getenv("LIBOMPFILE_MPI_COMM_SELF");
-    if (comm_self_env && comm_self_env[0] == '1' && comm_self_env[1] == '\0') {
-      source_comm = MPI_COMM_SELF;
-      io_log("LIBOMPFILE_MPI_COMM_SELF=1: using MPI_COMM_SELF for file I/O.\n");
+  {
+    bool distribute_misconfigured = false;
+    (void)ompfile::env::writebackDistributeActive(&distribute_misconfigured);
+    if (distribute_misconfigured) {
+      const char *ranks_env =
+          std::getenv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS");
+      io_report("Error: LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES=1 requires "
+                "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS > 1 (got '%s'); "
+                "distributed write-back routing stays off.\n",
+                ranks_env ? ranks_env : "unset");
     }
+  }
 
-    // Duplicate the chosen communicator for file I/O.
-    MPI_Comm_dup(source_comm, &file_comm);
-    io_log("MPI_Comm_dup completed for file I/O.\n");
+  if (!mode_knobs_valid) {
+    strict_mpp_init_failed = true;
+  } else if (ompfile::mpp::init()) {
+    mpp_init_succeeded = true;
+    const char *env = std::getenv("LIBOMPFILE_MPP_PING");
+    if (env && env[0] == '1' && env[1] == '\0') {
+      if (!ompfile::mpp::ping())
+        io_log("MPP shim ping failed.\n");
+    }
   } else {
-    io_log("Remote-only MPP mode: skipping MPI communicator duplication.\n");
+    strict_mpp_init_failed = true;
+    io_log("MPP init failed; all I/O calls will fail.\n");
   }
 
-  if (mpp_requested) {
-    if (ompfile::mpp::init()) {
-      mpp_init_succeeded = true;
-      const char *env = std::getenv("LIBOMPFILE_MPP_PING");
-      if (env && env[0] == '1' && env[1] == '\0') {
-        if (!ompfile::mpp::ping())
-          io_log("MPP shim ping failed.\n");
-      }
-    } else {
-      strict_mpp_init_failed = strict_mpp_required;
-      if (strict_mpp_required) {
-        io_log("MPP mode requested but MPP init failed and "
-               "LIBOMPFILE_ALLOWFALLBACK is disabled; all I/O calls will "
-               "fail.\n");
-      } else {
-        io_log("MPP mode requested but MPP init failed; MPP operations may "
-               "fallback or fail.\n");
-      }
-    }
-  }
-
-  const char *scheduler_env = std::getenv("LIBOMPFILE_SCHEDULER");
-  const bool scheduler_headnode =
-      scheduler_env && std::strcmp(scheduler_env, "HEADNODE") == 0;
+  const bool scheduler_headnode = ompfile::env::schedulerIsHeadnode();
 
   two_phase_policy = parseTwoPhasePolicy(std::getenv("LIBOMPFILE_OPT_TWO_PHASE"));
   if (two_phase_policy == TwoPhasePolicy::Enabled) {
     two_phase_enabled = true;
   } else if (two_phase_policy == TwoPhasePolicy::Auto) {
-    two_phase_enabled = mpp_remote_only && scheduler_headnode;
+    two_phase_enabled = scheduler_headnode;
   } else {
     two_phase_enabled = false;
   }
@@ -178,7 +150,7 @@ MPIIOBackend::MPIIOBackend() {
   if (write_batch_policy == TwoPhasePolicy::Enabled) {
     write_batch_enabled = true;
   } else if (write_batch_policy == TwoPhasePolicy::Auto) {
-    write_batch_enabled = mpp_remote_only;
+    write_batch_enabled = true;
   } else {
     write_batch_enabled = false;
   }
@@ -204,17 +176,12 @@ MPIIOBackend::MPIIOBackend() {
   write_batch_max_batch_bytes =
       parseUint64Env("LIBOMPFILE_OPT_WRITE_BATCH_MAX_BATCH_BYTES",
                      write_batch_enabled ? kDefaultWriteBatchMaxBatchBytes : 0);
-  forecast_mode = parseForecastMode(std::getenv("LIBOMPFILE_IO_FORECAST"));
-  stage_affinity_mode = parseStageAffinityMode(
-      std::getenv("LIBOMPFILE_IO_STAGE_AFFINITY"));
 
   io_log("Two-phase guard config: policy=%s enabled=%d window_us=%llu "
          "max_batch_bytes=%llu sieve_bytes=%llu write_batch_policy=%s "
          "write_batch_enabled=%d write_batch_window_us=%llu "
-         "write_batch_max_batch_bytes=%llu scheduler=%s remote_only=%d "
-         "writable_read_rebalance=%d dirty_owner_forwarding=%d "
-         "dirty_clean_pfs_rebalance=%d dirty_clean_pfs_allow_clean_pfs=%d "
-         "stage_global_invalidation=%d forecast_mode=%s stage_affinity_mode=%s\n",
+         "write_batch_max_batch_bytes=%llu scheduler=%s "
+         "writable_read_rebalance=%d dirty_owner_forwarding=%d\n",
          twoPhasePolicyToString(two_phase_policy),
          static_cast<int>(two_phase_enabled),
          static_cast<unsigned long long>(two_phase_window_us),
@@ -224,24 +191,15 @@ MPIIOBackend::MPIIOBackend() {
          static_cast<int>(write_batch_enabled),
          static_cast<unsigned long long>(write_batch_window_us),
          static_cast<unsigned long long>(write_batch_max_batch_bytes),
-         scheduler_env ? scheduler_env : "(unset)",
-         static_cast<int>(mpp_remote_only),
+         scheduler_headnode ? "HEADNODE" : "LOCAL",
          static_cast<int>(writable_read_rebalance_enabled),
-         static_cast<int>(dirty_owner_forwarding_enabled),
-         static_cast<int>(dirty_clean_pfs_rebalance_enabled),
-         static_cast<int>(dirty_clean_pfs_allow_clean_pfs_enabled),
-         static_cast<int>(stage_global_invalidation_enabled),
-         forecastModeToString(forecast_mode),
-         stageAffinityModeToString(stage_affinity_mode));
+         static_cast<int>(dirty_owner_forwarding_enabled));
 
   if (isTwoPhaseActive()) {
     io_log("Two-phase batching active (leader/follower mode).\n");
-  } else if (two_phase_enabled) {
-    io_log("Two-phase requested but inactive (requires remote-only MPP mode).\n");
   } else if (two_phase_policy == TwoPhasePolicy::Auto) {
     io_log("Two-phase auto policy resolved to disabled for this run: "
-           "remote_only=%d scheduler_headnode=%d.\n",
-           static_cast<int>(mpp_remote_only),
+           "scheduler_headnode=%d.\n",
            static_cast<int>(scheduler_headnode));
   }
 
@@ -250,18 +208,14 @@ MPIIOBackend::MPIIOBackend() {
   MPI_Initialized(&mpi_initialized_for_rank);
   if (mpi_initialized_for_rank)
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  io_trace("MPIIOBackend ctor this=%p rank=%d external_mpi=%d mpp_open=%d "
-           "mpp_io=%d mpp_requested=%d mpp_remote_only=%d mpp_init_ok=%d "
-           "allow_fallback=%d strict_mpp_required=%d strict_init_failed=%d "
+  io_trace("MPIIOBackend ctor this=%p rank=%d mode_knobs_valid=%d "
+           "mpp_init_ok=%d strict_init_failed=%d "
            "two_phase_policy=%s two_phase_enabled=%d "
            "two_phase_window_us=%llu "
            "two_phase_max_batch_bytes=%llu two_phase_sieve_bytes=%llu\n",
-           static_cast<void *>(this), rank, externally_initialized,
-           static_cast<int>(mpp_open_enabled), static_cast<int>(mpp_io_enabled),
-           static_cast<int>(mpp_requested), static_cast<int>(mpp_remote_only),
+           static_cast<void *>(this), rank,
+           static_cast<int>(mode_knobs_valid),
            static_cast<int>(mpp_init_succeeded),
-           static_cast<int>(allow_fallback),
-           static_cast<int>(strict_mpp_required),
            static_cast<int>(strict_mpp_init_failed),
            twoPhasePolicyToString(two_phase_policy),
            static_cast<int>(two_phase_enabled),
@@ -342,16 +296,6 @@ MPIIOBackend::~MPIIOBackend() {
     }
   }
   ompfile::mpp::finalize();
-  if (file_comm != MPI_COMM_NULL) {
-    int finalized = 0;
-    MPI_Finalized(&finalized);
-    if (!finalized)
-      MPI_Comm_free(&file_comm);
-  }
-  // if(!externally_initialized) {
-  //   // Free the duplicated communicator
-  //   io_log("MPI_Comm_free completed.\n");
-  // }
 }
 
 

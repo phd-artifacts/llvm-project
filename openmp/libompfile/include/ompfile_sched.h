@@ -52,13 +52,28 @@ enum class OmpFileIOOp : uint32_t {
   PREFETCH = 4,
 };
 
+// OmpFileIORequest::Flags bits.
+enum OmpFileIORequestFlags : int32_t {
+  // OPEN only: a placement query whose open nobody reports back with a CLOSE
+  // (the proxy bridge's own pick in mppOpen). The flag keeps it out of the
+  // headnode's live-handle accounting (no open handle is added for it);
+  // placement is unaffected: it is placed, and counted as a plan, like any
+  // OPEN.
+  OMPFILE_IO_REQUEST_PLACEMENT_ONLY = 1 << 0,
+};
+
 struct OmpFileIORequest {
   uint64_t RequestId = 0;
   OmpFileIOOp Op = OmpFileIOOp::OPEN;
   int32_t FileHandle = -1;
-  int32_t Flags = 0;
+  int32_t Flags = 0; // OmpFileIORequestFlags bits.
   int32_t Mode = 0;
   int32_t ClientRank = -1;
+  // CLOSE only: the AggregatorRank of the OPEN plan whose live-handle count
+  // this close releases on the headnode; -1 releases nothing. A CLOSE with
+  // FileHandle < 0 only releases (the headnode plans nothing for it). Ignored
+  // by every other op. Occupies what was padding, so sizeof stays 80.
+  int32_t AggregatorRank = -1;
   int64_t Offset = 0;
   uint64_t Size = 0;
   uint32_t PathSize = 0;

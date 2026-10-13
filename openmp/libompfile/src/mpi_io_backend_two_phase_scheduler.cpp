@@ -16,21 +16,16 @@ int MPIIOBackend::readAtTwoPhase(
     const ompfile::OmpFileReadRequestContext &context, void *data,
     size_t size) {
   // Keep zero-length reads on the validated fallback path so invalid handles
-  // still fail consistently with the non-cached pread flow.
-  if (size == 0)
-    return readAtFallback(context.FileHandle, static_cast<long>(context.Offset),
-                          data, size);
+  // still fail consistently with the scalar pread flow.
+  if (size == 0) {
+    size_t bytes_read = 0;
+    return readAtFallbackWithBytes(context.FileHandle,
+                                   static_cast<long>(context.Offset), data,
+                                   size, bytes_read);
+  }
 
   const uint64_t request_key = resolveTwoPhaseKey(context);
   const long request_offset = static_cast<long>(context.Offset);
-  if (!mpp_remote_only &&
-      tryServeTwoPhaseReadCache(request_key, request_offset, data, size)) {
-    io_trace("MPIIOBackend::readAtTwoPhase cache-hit file=%d offset=%ld "
-             "size=%zu key=%llu\n",
-             context.FileHandle, request_offset, size,
-             static_cast<unsigned long long>(request_key));
-    return 0;
-  }
 
   TwoPhaseReadRequest request{};
   request.DebugRequestId =
@@ -41,7 +36,6 @@ int MPIIOBackend::readAtTwoPhase(
   request.Size = size;
   request.Buffer = data;
   request.PathKey = request_key;
-  request.HasPathKey = true;
   request.Hint = context.Hint;
 
   // Counts the threads inside the two-phase read path, so an adaptive leader
@@ -312,13 +306,10 @@ void MPIIOBackend::processTwoPhaseGroup(
     segment.FileHandle = item.Requests.front()->FileHandle;
     segment.ClientRank = item.Requests.front()->ClientRank;
     segment.Offset = item.Start;
-    segment.Size = static_cast<uint64_t>(computeForecastTargetReadSize(
-        item.Requests.front()->Hint, item.Start, item.End,
-        item.Requests.size(), mpp_remote_only, two_phase_sieve_bytes,
-        two_phase_max_batch_bytes));
-    segment.PathKey = item.Requests.front()->HasPathKey
-                          ? item.Requests.front()->PathKey
-                          : static_cast<uint64_t>(0);
+    segment.Size = static_cast<uint64_t>(computeTwoPhaseTargetReadSize(
+        item.Start, item.End, item.Requests.size(), /*remote_only=*/true,
+        two_phase_sieve_bytes, two_phase_max_batch_bytes));
+    segment.PathKey = item.Requests.front()->PathKey;
     segment.SegmentFlags = item.Requests.front()->Hint.HintFlags;
     segment.EpochId = item.Requests.front()->Hint.EpochId;
     segment.StreamId = item.Requests.front()->Hint.StreamId;
@@ -420,10 +411,9 @@ void MPIIOBackend::processTwoPhaseGroup(
       continue;
     }
 
-    const size_t read_size = computeForecastTargetReadSize(
-        item.Requests.front()->Hint, item.Start, item.End,
-        item.Requests.size(), mpp_remote_only, two_phase_sieve_bytes,
-        two_phase_max_batch_bytes);
+    const size_t read_size = computeTwoPhaseTargetReadSize(
+        item.Start, item.End, item.Requests.size(), /*remote_only=*/true,
+        two_phase_sieve_bytes, two_phase_max_batch_bytes);
     two_phase_coalesced_bytes_total.fetch_add(read_size,
                                               std::memory_order_relaxed);
     std::vector<char> buffer(read_size);
@@ -433,46 +423,7 @@ void MPIIOBackend::processTwoPhaseGroup(
     bool remote_rebalanced_ok = false;
     int read_errno = 0;
     const int file_id = item.Requests.front()->FileHandle;
-    int source_affinity_rank = -1;
-    bool force_no_stage_fallback = false;
-    const bool source_affinity_candidate = isSourceStageAffinityEligible(
-        item.Requests.front()->Hint, item.Requests.front()->HasPathKey,
-        mpp_remote_only);
-    if (source_affinity_candidate) {
-      stage_affinity_source_candidate_count.fetch_add(
-          1, std::memory_order_relaxed);
-      stage_affinity_source_candidate_bytes.fetch_add(
-          read_size, std::memory_order_relaxed);
-    }
-    const bool source_affinity_safe = canAttemptSourceStageAffinityRead(
-        item.Requests.front()->Hint, file_id, item.Start, read_size,
-        item.Requests.front()->HasPathKey, mpp_remote_only,
-        item.PlannerForceFallback);
-    if (source_affinity_safe) {
-      if (sourceStageAffinityPreReadInvalidateForFile(file_id)) {
-        bool ok = readAtSourceStageAffinityRankWithBytes(
-            file_id, item.Requests.front()->PathKey,
-            item.Requests.front()->Hint, item.Start, buffer.data(), read_size,
-            bytes_read, source_affinity_rank);
-        if (ok) {
-          rc = 0;
-          stage_affinity_source_applied_count.fetch_add(
-              1, std::memory_order_relaxed);
-          stage_affinity_source_applied_bytes.fetch_add(
-              read_size, std::memory_order_relaxed);
-        }
-      } else {
-        force_no_stage_fallback = true;
-      }
-    }
-    if (source_affinity_candidate && rc != 0) {
-      stage_affinity_source_fallback_count.fetch_add(
-          1, std::memory_order_relaxed);
-    }
-
-    if (shouldAttemptPlannerRebalancedRead(
-            rc, force_no_stage_fallback, item.PlannerRebalanced,
-            item.PlannedAggregatorRank)) {
+    if (item.PlannerRebalanced && item.PlannedAggregatorRank >= 0) {
       const char *fallback_reason = "none";
       int fallback_errno = 0;
       bool eligible_for_rebalance = false;
@@ -527,8 +478,7 @@ void MPIIOBackend::processTwoPhaseGroup(
 
     if (rc != 0) {
       rc = readAtFallbackWithBytes(file_id, item.Start, buffer.data(), read_size,
-                                   bytes_read, &item.Requests.front()->Hint,
-                                   force_no_stage_fallback);
+                                   bytes_read);
     }
     if (rc != 0) {
       const int errnum = errno;
@@ -538,11 +488,6 @@ void MPIIOBackend::processTwoPhaseGroup(
       for (TwoPhaseReadRequest *request : item.Requests)
         completeTwoPhaseRequest(*request, rc, errnum);
       continue;
-    }
-
-    if (!mpp_remote_only) {
-      const uint64_t cache_key = getTwoPhaseGroupKey(*item.Requests.front());
-      updateTwoPhaseReadCache(cache_key, item.Start, buffer);
     }
 
     for (TwoPhaseReadRequest *request : item.Requests) {
@@ -576,9 +521,7 @@ void MPIIOBackend::processTwoPhaseGroup(
 
 uint64_t MPIIOBackend::getTwoPhaseGroupKey(
     const TwoPhaseReadRequest &request) const {
-  if (request.HasPathKey)
-    return request.PathKey;
-  return static_cast<uint64_t>(static_cast<uint32_t>(request.FileHandle));
+  return request.PathKey;
 }
 
 void MPIIOBackend::completeTwoPhaseRequest(TwoPhaseReadRequest &request,
@@ -595,5 +538,5 @@ void MPIIOBackend::completeTwoPhaseRequest(TwoPhaseReadRequest &request,
 }
 
 bool MPIIOBackend::isTwoPhaseActive() const {
-  return two_phase_enabled && mpp_open_enabled && mpp_io_enabled;
+  return two_phase_enabled;
 }

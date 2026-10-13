@@ -9,7 +9,6 @@
 #include <cstdarg>
 #include <fstream>
 #include <cstdio>
-#include <optional>
 #include <cstdlib>
 #include <cstring>
 #include <fnmatch.h>
@@ -856,8 +855,8 @@ struct ProxyDevice {
       : NumExecEventHandlers("OMPTARGET_NUM_EXEC_EVENT_HANDLERS", 1),
         NumDataEventHandlers("OMPTARGET_NUM_DATA_EVENT_HANDLERS", 1),
         // More than one on purpose: an io handler can block in waitForEvent
-        // while forwarding to another rank (see the queue policy comment on
-        // EventSystemTy::IoEventQueue).
+        // on a headnode coherence round trip under write-back staging (see the
+        // queue policy comment on EventSystemTy::IoEventQueue).
         NumIoEventHandlers("OMPTARGET_NUM_IO_EVENT_HANDLERS", 4),
         EventPollingRate("OMPTARGET_EVENT_POLLING_RATE", 0),
         OmpFileOpenCacheEnable("LIBOMPFILE_OPT_OPEN_CACHE", false),
@@ -886,9 +885,7 @@ struct ProxyDevice {
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_STRIPE_MIN_BYTES", 16u << 20)),
         OmpFileLocalDisjointReadStreams(envUint64OrDefault(
             "LIBOMPFILE_OPT_LOCAL_DISJOINT_READ_STREAMS", 1)),
-        OmpFileHeadnodeScheduler(
-            envStringOrDefault("LIBOMPFILE_SCHEDULER", "LOCAL") ==
-            "HEADNODE"),
+        OmpFileHeadnodeScheduler(ompfile::env::schedulerIsHeadnode()),
         OmpFileStageMode(envStringOrDefault("LIBOMPFILE_STAGE_MODE", "off")),
         OmpFileStageWriteMode(normalizeStageWriteMode(
             envStringOrDefault("LIBOMPFILE_STAGE_WRITE_MODE", "write-through"))),
@@ -1144,22 +1141,12 @@ struct ProxyDevice {
 
     Image.ImageEnd = (void *)((ptrdiff_t)(Image.ImageStart) + Size);
 
-    llvm::SmallVector<std::unique_ptr<GenericPluginTy>> UsedPlugins;
-
     for (auto &Plugin : PluginManager.Plugins) {
       QueryResult = Plugin->is_plugin_compatible(&Image);
-      if (QueryResult) {
-        UsedPlugins.emplace_back(std::move(Plugin));
+      if (QueryResult)
         break;
-      }
     }
 
-    for (auto &Plugin : PluginManager.Plugins) {
-      if (Plugin)
-        UsedPlugins.emplace_back(std::move(Plugin));
-    }
-
-    PluginManager.Plugins = std::move(UsedPlugins);
     mapDevicesPerRemote();
 
     memFreeHost(Image.ImageStart);
@@ -2086,16 +2073,6 @@ struct ProxyDevice {
     return false;
   }
 
-  // Effective window every stage decision should consult. Centralizing this
-  // here keeps the adaptive-scale policy in one place as later tasks switch
-  // populate/eviction paths from OmpFileStageWindowBytes to the effective
-  // value.
-  uint64_t effectiveStageWindowBytes() const {
-    return OmpFileStageEffectiveWindowBytes > 0
-               ? OmpFileStageEffectiveWindowBytes
-               : OmpFileStageWindowBytes;
-  }
-
   bool shouldSyncStagePopulate() const {
     return OmpFileStageSyncPolicy == "always";
   }
@@ -2138,12 +2115,10 @@ struct ProxyDevice {
 
   // --- Write-back dirty-region helpers ---
   // All mark/clear helpers require the caller to hold Entry->Mutex; the
-  // "Locked" suffix mirrors invalidateStageEntryLocked. markDirtyRangeLocked
-  // is not yet called from the write path (that wiring lands with the
-  // write-back capture task). flushDirtyRangesToSource is the real
-  // stage->source flush and is wired into closeWithOptionalCache; it is a
-  // no-op unless DirtyExtents is nonempty, so the write-through default and
-  // the no-capture-yet state are behavior-neutral.
+  // "Locked" suffix mirrors invalidateStageEntryLocked.
+  // flushDirtyRangesToSource is the real stage->source flush and is wired
+  // into closeWithOptionalCache; it is a no-op unless DirtyExtents is
+  // nonempty, so the write-through default is behavior-neutral.
 
   // Record [Begin, End) as dirty in Entry, merging into DirtyExtents and
   // advancing DirtyBytes. Returns the new total dirty byte count.
@@ -2185,23 +2160,6 @@ struct ProxyDevice {
     if (Entry.DirtyExtents.empty())
       Entry.DirtyEpoch = 0;
     return Removed;
-  }
-
-  // Drop all dirty extents. Used when a full stage invalidation discards
-  // unflushed writes (only safe when the source copy is known current).
-  void clearDirtyRangesLocked(OmpFileStageEntry &Entry) {
-    if (Entry.DirtyBytes > 0) {
-      OmpFileStatsStageDirtyBytes.fetch_sub(Entry.DirtyBytes,
-                                            std::memory_order_relaxed);
-    }
-    Entry.DirtyExtents.clear();
-    Entry.DirtyBytes = 0;
-    Entry.DirtyEpoch = 0;
-  }
-
-  // Total dirty bytes currently held in Entry. Caller must hold Mutex.
-  uint64_t dirtyBytesLocked(const OmpFileStageEntry &Entry) const {
-    return Entry.DirtyBytes;
   }
 
   // File-scoped counterpart to flushLocalDirtyTileToSource below: push every
@@ -2574,11 +2532,10 @@ struct ProxyDevice {
 
       bool CompletedViaDerivedTileKeys = false;
       if (Epoch > 0 && !SourcePath.empty()) {
-        const char *DistributeWritesEnv =
-            std::getenv("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES");
+        // The same distributed write-back predicate libompfile routes by:
+        // DISTRIBUTE_WRITES=1 and DISTRIBUTE_RANKS > 1.
         const uint64_t TileBytes = configuredStageTileBytes();
-        if (DistributeWritesEnv && std::strcmp(DistributeWritesEnv, "1") == 0 &&
-            TileBytes > 0) {
+        if (ompfile::env::writebackDistributeActive() && TileBytes > 0) {
           if (DeferCloseMetadataCompletion) {
             // The close path already copied dirty bytes to the shared source and
             // fdatasync'd them above. Avoid one metadata-completion operation per
@@ -2909,17 +2866,6 @@ struct ProxyDevice {
     return true;
   }
 
-  bool isLastTrackedFdForPath(int Fd, std::string *PathOut = nullptr) const {
-    const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
-    auto It = OmpFileTrackedFds.find(Fd);
-    if (It == OmpFileTrackedFds.end())
-      return true;
-    if (PathOut)
-      *PathOut = It->second.Path;
-    auto CountIt = OmpFileTrackedFdPathRefCounts.find(It->second.Path);
-    return CountIt == OmpFileTrackedFdPathRefCounts.end() || CountIt->second <= 1;
-  }
-
   void eraseTrackedOmpFileFd(int Fd) {
     const std::lock_guard<std::mutex> Lock(OmpFileTrackedFdMutex);
     auto It = OmpFileTrackedFds.find(Fd);
@@ -3058,47 +3004,6 @@ struct ProxyDevice {
       return;
     const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
     invalidateStageEntryLocked(SourcePath, /*CountInvalidation=*/true);
-  }
-
-  OmpFileStageInvalidateReply invalidateStageForRequest(
-      const OmpFileStageInvalidateRequest &Request, const std::string &Path) {
-    OmpFileStageInvalidateReply Reply{};
-    Reply.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
-    if (Request.AbiVersion != OMPFILE_STAGE_INVALIDATE_ABI_VERSION) {
-      Reply.Status = -1;
-      Reply.Errno = EPROTO;
-      return Reply;
-    }
-    if (Path.empty() || Request.PathKey == 0) {
-      Reply.Status = -1;
-      Reply.Errno = ENOKEY;
-      return Reply;
-    }
-
-    const std::lock_guard<std::mutex> Lock(OmpFileStageMutex);
-    auto It = OmpFileStageEntries.find(Path);
-    if (It == OmpFileStageEntries.end()) {
-      OmpFileStatsStageGlobalInvalidationCompletions.fetch_add(
-          1, std::memory_order_relaxed);
-      return Reply;
-    }
-
-    uint64_t InvalidatedBytes = 0;
-    {
-      const std::shared_ptr<OmpFileStageEntry> Entry = It->second;
-      std::lock_guard<std::mutex> EntryLock(Entry->Mutex);
-      for (const OmpFileStageExtent &Extent : Entry->CoveredExtents) {
-        if (Extent.End > Extent.Begin)
-          InvalidatedBytes += (Extent.End - Extent.Begin);
-      }
-    }
-    invalidateStageEntryLocked(Path, /*CountInvalidation=*/true,
-                               InvalidatedBytes, /*FullInvalidation=*/true);
-    Reply.InvalidatedEntries = 1;
-    Reply.InvalidatedBytes = InvalidatedBytes;
-    OmpFileStatsStageGlobalInvalidationCompletions.fetch_add(
-        1, std::memory_order_relaxed);
-    return Reply;
   }
 
   void invalidateStageRangeForPath(const std::string &SourcePath,
@@ -4384,15 +4289,6 @@ struct ProxyDevice {
         OmpFileStatsStageLockWaitUs.load(std::memory_order_relaxed);
     uint64_t StageLockHoldUs =
         OmpFileStatsStageLockHoldUs.load(std::memory_order_relaxed);
-    uint64_t StageGlobalInvalidationRequests =
-        OmpFileStatsStageGlobalInvalidationRequests.load(
-            std::memory_order_relaxed);
-    uint64_t StageGlobalInvalidationCompletions =
-        OmpFileStatsStageGlobalInvalidationCompletions.load(
-            std::memory_order_relaxed);
-    uint64_t StageGlobalInvalidationFailures =
-        OmpFileStatsStageGlobalInvalidationFailures.load(
-            std::memory_order_relaxed);
     uint64_t SourcePreadBytes =
         OmpFileStatsSourcePreadBytes.load(std::memory_order_relaxed);
     uint64_t SourcePreadUs =
@@ -4532,9 +4428,7 @@ struct ProxyDevice {
             "stage_copy_us_total=%llu stage_fsync_us_total=%llu "
             "stage_reopen_us_total=%llu stage_lock_wait_us_total=%llu "
             "stage_lock_hold_us_total=%llu "
-            "stage_global_invalidations_requested=%llu "
-            "stage_global_invalidations_completed=%llu "
-            "stage_global_invalidations_failed=%llu source_pread_bytes=%llu "
+            "source_pread_bytes=%llu "
             "source_pread_us_total=%llu staged_pread_us_total=%llu "
             "source_pwrite_bytes=%llu source_pwrite_ops=%llu "
             "source_pwrite_us_total=%llu "
@@ -4617,9 +4511,6 @@ struct ProxyDevice {
             static_cast<unsigned long long>(StageReopenUs),
             static_cast<unsigned long long>(StageLockWaitUs),
             static_cast<unsigned long long>(StageLockHoldUs),
-            static_cast<unsigned long long>(StageGlobalInvalidationRequests),
-            static_cast<unsigned long long>(StageGlobalInvalidationCompletions),
-            static_cast<unsigned long long>(StageGlobalInvalidationFailures),
             static_cast<unsigned long long>(SourcePreadBytes),
             static_cast<unsigned long long>(SourcePreadUs),
             static_cast<unsigned long long>(StagedPreadUs),
@@ -5050,56 +4941,6 @@ struct ProxyDevice {
     co_return (co_await RequestManager);
   }
 
-  EventTy ompfileStageInvalidate(MPIRequestManagerTy RequestManager) {
-    OmpFileStageInvalidateRequest Request{};
-    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
-    if (auto Error = co_await RequestManager; Error)
-      co_return Error;
-
-    OmpFileStatsStageGlobalInvalidationRequests.fetch_add(
-        1, std::memory_order_relaxed);
-
-    OmpFileStageInvalidateReply Reply{};
-    Reply.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
-    constexpr uint32_t MaxStageInvalidatePathSize =
-        static_cast<uint32_t>(PATH_MAX) + 1;
-    if (Request.PathSize > static_cast<uint32_t>(INT_MAX) ||
-        Request.PathSize > MaxStageInvalidatePathSize) {
-      Reply.Status = -1;
-      Reply.Errno = EOVERFLOW;
-      OmpFileStatsStageGlobalInvalidationFailures.fetch_add(
-          1, std::memory_order_relaxed);
-      RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
-      RequestManager.send(nullptr, 0, MPI_BYTE);
-      co_return (co_await RequestManager);
-    }
-
-    std::vector<char> PathBytes;
-    if (Request.PathSize > 0) {
-      PathBytes.resize(Request.PathSize);
-      RequestManager.receive(PathBytes.data(), static_cast<int>(Request.PathSize),
-                             MPI_CHAR);
-      if (auto Error = co_await RequestManager; Error)
-        co_return Error;
-    }
-
-    std::string Path;
-    if (!PathBytes.empty()) {
-      const char *Begin = PathBytes.data();
-      const size_t Len = PathBytes.back() == '\0' ? PathBytes.size() - 1
-                                                  : PathBytes.size();
-      Path.assign(Begin, Begin + Len);
-    }
-
-    Reply = invalidateStageForRequest(Request, Path);
-    if (Reply.Status != 0)
-      OmpFileStatsStageGlobalInvalidationFailures.fetch_add(
-          1, std::memory_order_relaxed);
-    RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
-    RequestManager.send(nullptr, 0, MPI_BYTE);
-    co_return (co_await RequestManager);
-  }
-
   EventTy ompfileFreshnessQuery(MPIRequestManagerTy RequestManager) {
     OmpFileFreshnessQueryRequest Request{};
     RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
@@ -5109,86 +4950,6 @@ struct ProxyDevice {
     OmpFileFreshnessQueryReply Reply{};
     OmpFileHeadnodeManager::instance().handleFreshnessQueryRequest(Request,
                                                                     Reply);
-
-    RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
-    RequestManager.send(nullptr, 0, MPI_BYTE);
-    co_return (co_await RequestManager);
-  }
-
-  EventTy ompfileProxyCopyTile(MPIRequestManagerTy RequestManager) {
-    OmpFileProxyCopyTileRequest Request{};
-    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
-    if (auto Error = co_await RequestManager; Error)
-      co_return Error;
-
-    OmpFileProxyCopyTileReply Reply{};
-    Reply.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
-    const std::string PathKeyStr = std::to_string(Request.PathKey);
-    const std::string TileIdStr = std::to_string(Request.TileId);
-    OmpFileHeadnodeManager::instance().emitFreshnessTrace(
-        "copy_req", PathKeyStr, Request.DestRank, Request.SourceRank,
-        Request.DestRank, Request.Version, Request.Version, "copy", "start", "",
-        TileIdStr.c_str());
-    if (Request.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
-      Reply.Status = -1;
-      Reply.Errno = EPROTO;
-      OmpFileHeadnodeManager::instance().emitFreshnessTrace(
-          "copy_done", PathKeyStr, Request.DestRank, Request.SourceRank,
-          Request.DestRank, Request.Version, Request.Version, "copy", "fail",
-          "abi_mismatch", TileIdStr.c_str());
-    } else if (!isWorkerRank(Request.SourceRank) ||
-               !isWorkerRank(Request.DestRank) || Request.PathKey == 0 ||
-               Request.Version == 0) {
-      Reply.Status = -1;
-      Reply.Errno = EINVAL;
-      OmpFileHeadnodeManager::instance().emitFreshnessTrace(
-          "copy_done", PathKeyStr, Request.DestRank, Request.SourceRank,
-          Request.DestRank, Request.Version, Request.Version, "copy", "fail",
-          "invalid_request", TileIdStr.c_str());
-    } else {
-      if (EventSystem.LocalRank == getHeadnodeRank()) {
-        if (!OmpFileHeadnodeManager::instance().registerTileCopy(
-                Request.PathKey, Request.SourceRank, Request.DestRank,
-                Request.Version)) {
-          Reply.Status = -1;
-          Reply.Errno = errno != 0 ? errno : EIO;
-          OmpFileHeadnodeManager::instance().emitFreshnessTrace(
-              "copy_done", PathKeyStr, Request.DestRank, Request.SourceRank,
-              Request.DestRank, Request.Version, Request.Version, "copy", "fail",
-              "register_copy_failed", TileIdStr.c_str());
-        }
-      }
-      if (Reply.Status == 0) {
-        Reply.Errno = 0;
-        Reply.BytesCopied = 0;
-        OmpFileHeadnodeManager::instance().emitFreshnessTrace(
-            "copy_done", PathKeyStr, Request.DestRank, Request.SourceRank,
-            Request.DestRank, Request.Version, Request.Version, "copy", "ok", "",
-            TileIdStr.c_str());
-      }
-    }
-
-    RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
-    RequestManager.send(nullptr, 0, MPI_BYTE);
-    co_return (co_await RequestManager);
-  }
-
-  EventTy ompfileFreshnessMarkFresh(MPIRequestManagerTy RequestManager) {
-    OmpFileFreshnessMarkFreshRequest Request{};
-    RequestManager.receive(&Request, sizeof(Request), MPI_BYTE);
-    if (auto Error = co_await RequestManager; Error)
-      co_return Error;
-
-    OmpFileFreshnessMarkFreshReply Reply{};
-    Reply.AbiVersion = OMPFILE_FRESHNESS_QUERY_ABI_VERSION;
-    if (Request.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
-      Reply.Status = -1;
-      Reply.Errno = EPROTO;
-    } else if (!OmpFileHeadnodeManager::instance().markTileFreshFromCopy(
-                   Request.PathKey, Request.Rank, Request.Version)) {
-      Reply.Status = -1;
-      Reply.Errno = errno != 0 ? errno : EIO;
-    }
 
     RequestManager.send(&Reply, sizeof(Reply), MPI_BYTE);
     RequestManager.send(nullptr, 0, MPI_BYTE);
@@ -5706,25 +5467,6 @@ struct ProxyDevice {
     return true;
   }
 
-  bool stageInvalidateOnRank(int Rank,
-                             const OmpFileStageInvalidateRequest &Request,
-                             const char *Path,
-                             OmpFileStageInvalidateReply &Reply) {
-    Reply = {};
-    Reply.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
-
-    if (Rank == EventSystem.LocalRank) {
-      Reply = invalidateStageForRequest(Request, Path ? Path : "");
-      return true;
-    }
-
-    EventTy Event = createRankEvent(
-        OriginEvents::ompfileStageInvalidate,
-        EventTypeTy::OMPFILE_STAGE_INVALIDATE, Rank, /*TargetDeviceId=*/0,
-        &Request, Path, &Reply);
-    return waitForEvent(Event, "stage_invalidate");
-  }
-
   bool freshnessQueryOnHeadnode(const OmpFileFreshnessQueryRequest &Request,
                                 OmpFileFreshnessQueryReply &Reply) {
     Reply = {};
@@ -5895,102 +5637,21 @@ struct ProxyDevice {
     return true;
   }
 
-  bool freshnessMarkFreshOnHeadnode(uint64_t PathKey, int Rank,
-                                    uint64_t Version) {
-    if (PathKey == 0 || Rank < 0 || Version == 0) {
-      errno = EINVAL;
-      return false;
-    }
-
-    if (EventSystem.LocalRank == getHeadnodeRank()) {
-      return OmpFileHeadnodeManager::instance().markTileFreshFromCopy(
-          PathKey, Rank, Version);
-    }
-
-    OmpFileFreshnessMarkFreshRequest Request{};
-    Request.PathKey = PathKey;
-    Request.Rank = Rank;
-    Request.Version = Version;
-    OmpFileFreshnessMarkFreshReply Reply{};
-    EventTy Event = createRankEvent(OriginEvents::ompfileFreshnessMarkFresh,
-                                    EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH,
-                                    getHeadnodeRank(), /*TargetDeviceId=*/0,
-                                    &Request, &Reply);
-    if (!waitForEvent(Event, "freshness_mark_fresh"))
-      return false;
-    if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
-      errno = EPROTO;
-      return false;
-    }
-    if (Reply.Status != 0) {
-      errno = Reply.Errno != 0 ? Reply.Errno : EIO;
-      return false;
-    }
-    return true;
-  }
-
-  bool proxyCopyTileEvent(uint64_t PathKey, uint64_t TileId, int SourceRank,
-                          int DestRank, uint64_t Version) {
-    if (PathKey == 0 || Version == 0 || !isWorkerRank(SourceRank) ||
-        !isWorkerRank(DestRank)) {
-      errno = EINVAL;
-      return false;
-    }
-    OmpFileProxyCopyTileRequest Request{};
-    Request.PathKey = PathKey;
-    Request.TileId = TileId;
-    Request.SourceRank = SourceRank;
-    Request.DestRank = DestRank;
-    Request.Version = Version;
-
-    OmpFileProxyCopyTileReply HeadnodeReply{};
-    EventTy HeadnodeEvent = createRankEvent(
-        OriginEvents::ompfileProxyCopyTile,
-        EventTypeTy::OMPFILE_PROXY_COPY_TILE,
-        getHeadnodeRank(), /*TargetDeviceId=*/0, &Request, &HeadnodeReply);
-    if (!waitForEvent(HeadnodeEvent, "proxy_copy_tile_register"))
-      return false;
-    if (HeadnodeReply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
-      errno = EPROTO;
-      return false;
-    }
-    if (HeadnodeReply.Status != 0) {
-      errno = HeadnodeReply.Errno != 0 ? HeadnodeReply.Errno : EIO;
-      return false;
-    }
-
-    if (SourceRank == DestRank)
-      return true;
-
-    OmpFileProxyCopyTileReply Reply{};
-    EventTy Event = createRankEvent(OriginEvents::ompfileProxyCopyTile,
-                                    EventTypeTy::OMPFILE_PROXY_COPY_TILE,
-                                    DestRank, /*TargetDeviceId=*/0, &Request,
-                                    &Reply);
-    if (!waitForEvent(Event, "proxy_copy_tile"))
-      return false;
-    if (Reply.AbiVersion != OMPFILE_FRESHNESS_QUERY_ABI_VERSION) {
-      errno = EPROTO;
-      return false;
-    }
-    if (Reply.Status != 0) {
-      errno = Reply.Errno != 0 ? Reply.Errno : EIO;
-      return false;
-    }
-    return true;
-  }
-
-  int selectAggregatorRankForOpen(const char *Path, int Flags, int Mode) {
+  int selectAggregatorRankForOpen(const char *Path, int Mode) {
     int Rank = isWorkerRank(EventSystem.LocalRank) ? EventSystem.LocalRank : 0;
-    const char *SchedulerEnv = std::getenv("LIBOMPFILE_SCHEDULER");
-    if (!SchedulerEnv || std::strcmp(SchedulerEnv, "HEADNODE") != 0)
+    if (!ompfile::env::schedulerIsHeadnode())
       return Rank;
 
     OmpFileIORequest Request{};
     Request.RequestId =
         NextSchedRequestId.fetch_add(1, std::memory_order_relaxed);
     Request.Op = OmpFileIOOp::OPEN;
-    Request.Flags = Flags;
+    // A placement query only. The headnode counts an OPEN plan as a live
+    // handle until a CLOSE names its rank, and nothing sends that CLOSE for
+    // this pick: a libompfile client that reached ompfile_mpp_open already
+    // holds the counted plan for this logical open (or holds none) and its
+    // CLOSE settles that one.
+    Request.Flags = OMPFILE_IO_REQUEST_PLACEMENT_ONLY;
     Request.Mode = Mode;
     Request.ClientRank = EventSystem.LocalRank;
     Request.PathSize = Path ? static_cast<uint32_t>(std::strlen(Path) + 1) : 0;
@@ -6081,117 +5742,13 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
-  // Split-phase counterpart of mppPwriteEx. Only a write to a peer owner has
-  // anything to overlap; the owner-bypass and local-owner paths complete here
-  // and the first poll reports them. Same result semantics as pwriteOnRank.
-  int mppPwriteSubmit(int Handle, int64_t Offset, const void *Buffer,
-                      uint64_t Size, uint64_t Token) {
-    if (!Buffer && Size > 0) {
-      errno = EINVAL;
-      return OFFLOAD_FAIL;
-    }
-    {
-      const std::lock_guard<std::mutex> Lock(MppEventMutex);
-      if (MppPendingWrites.count(Token)) {
-        errno = EEXIST;
-        return OFFLOAD_FAIL;
-      }
-    }
-    OmpFileHandleEntry Entry{};
-    if (!findRemoteHandle(Handle, Entry))
-      return OFFLOAD_FAIL;
-
-    auto Pending = std::make_unique<MppPendingWrite>();
-    Pending->Size = Size;
-    bool HardFail = false;
-    if (tryLocalDisjointPwrite(Entry, Offset, Buffer, Size, &Pending->Bytes,
-                               &HardFail)) {
-      Pending->Ok = true;
-    } else if (HardFail) {
-      return OFFLOAD_FAIL;
-    } else if (Entry.Rank == EventSystem.LocalRank) {
-      Pending->Ok = pwriteOnRank(Entry.Rank, Entry.RemoteHandle, Offset,
-                                 Buffer, Size, &Pending->Bytes);
-      Pending->Errno = Pending->Ok ? 0 : errno;
-    } else {
-      Pending->Event.emplace(createRankEvent(
-          OriginEvents::ompfilePwrite, EventTypeTy::OMPFILE_PWRITE,
-          Entry.Rank, /*TargetDeviceId=*/0, Entry.RemoteHandle, Offset, Buffer,
-          Size, &Pending->IoRet, &Pending->RemoteErrno, &Pending->Bytes));
-      if (Pending->Event->empty()) {
-        errno = EIO;
-        return OFFLOAD_FAIL;
-      }
-    }
-    const std::lock_guard<std::mutex> Lock(MppEventMutex);
-    MppPendingWrites.emplace(Token, std::move(Pending));
-    return OFFLOAD_SUCCESS;
-  }
-
-  int mppPollEx(uint64_t Token, int *Done, uint64_t *BytesOut) {
-    if (!Done || !BytesOut)
-      return OFFLOAD_FAIL;
-    *Done = 0;
-    *BytesOut = 0;
-    std::unique_ptr<MppPendingWrite> Pending;
-    {
-      const std::lock_guard<std::mutex> Lock(MppEventMutex);
-      auto It = MppPendingWrites.find(Token);
-      if (It == MppPendingWrites.end()) {
-        errno = ENOENT;
-        return OFFLOAD_FAIL;
-      }
-      Pending = std::move(It->second);
-      MppPendingWrites.erase(It);
-    }
-
-    if (!Pending->Event) {
-      *Done = 1;
-      *BytesOut = Pending->Bytes;
-      if (!Pending->Ok) {
-        errno = Pending->Errno;
-        return OFFLOAD_FAIL;
-      }
-      return OFFLOAD_SUCCESS;
-    }
-
-    Pending->Event->resume();
-    if (!Pending->Event->done()) {
-      const std::lock_guard<std::mutex> Lock(MppEventMutex);
-      MppPendingWrites.emplace(Token, std::move(Pending));
-      return OFFLOAD_SUCCESS;
-    }
-
-    *Done = 1;
-    if (auto Error = Pending->Event->getError()) {
-      REPORT("OMPFile split-phase pwrite event failed: %s\n",
-             toString(std::move(Error)).c_str());
-      errno = EIO;
-      return OFFLOAD_FAIL;
-    }
-    if (Pending->IoRet != 0) {
-      errno = Pending->RemoteErrno;
-      return OFFLOAD_FAIL;
-    }
-    if (Pending->Bytes > Pending->Size) {
-      errno = EPROTO;
-      return OFFLOAD_FAIL;
-    }
-    *BytesOut = Pending->Bytes;
-    if (Pending->Bytes < Pending->Size) {
-      errno = EIO;
-      return OFFLOAD_FAIL;
-    }
-    return OFFLOAD_SUCCESS;
-  }
-
   int mppOpen(const char *Path, int Flags, int Mode, int *Handle) {
     if (!Path || !Handle)
       return OFFLOAD_FAIL;
 
     traceOmpFile("mppOpen enter path=%s flags=0x%x mode=%o\n", Path, Flags,
                  Mode);
-    const int Rank = selectAggregatorRankForOpen(Path, Flags, Mode);
+    const int Rank = selectAggregatorRankForOpen(Path, Mode);
     int RemoteHandle = -1;
     if (!openOnRank(Rank, Path, Flags, Mode, RemoteHandle))
       return OFFLOAD_FAIL;
@@ -6257,29 +5814,6 @@ struct ProxyDevice {
     if (!findRemoteHandle(Handle, Entry))
       return errno != 0 ? errno : EIO;
     *RankOut = Entry.Rank;
-    return OFFLOAD_SUCCESS;
-  }
-
-  int mppPread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
-    traceOmpFile("mppPread enter local=%d offset=%lld size=%llu\n", Handle,
-                 static_cast<long long>(Offset),
-                 static_cast<unsigned long long>(Size));
-    OmpFileHandleEntry Entry{};
-    if (!findRemoteHandle(Handle, Entry))
-      return OFFLOAD_FAIL;
-    uint64_t BytesRead = 0;
-    if (tryLocalDisjointPread(Entry, Offset, Buffer, Size, &BytesRead)) {
-      traceOmpFile("mppPread exit local=%d (disjoint-read bypass) bytes=%llu\n",
-                   Handle, static_cast<unsigned long long>(BytesRead));
-      return OFFLOAD_SUCCESS;
-    }
-    if (!preadOnRank(Entry.Rank, Entry.RemoteHandle, Offset, Buffer, Size,
-                     &BytesRead)) {
-      return OFFLOAD_FAIL;
-    }
-    traceOmpFile("mppPread exit local=%d rank=%d remote=%d bytes=%llu\n",
-                 Handle, Entry.Rank, Entry.RemoteHandle,
-                 static_cast<unsigned long long>(BytesRead));
     return OFFLOAD_SUCCESS;
   }
 
@@ -7051,54 +6585,6 @@ struct ProxyDevice {
     return OFFLOAD_SUCCESS;
   }
 
-  int mppPwrite(int Handle, int64_t Offset, const void *Buffer, uint64_t Size) {
-    uint64_t BytesWritten = 0;
-    if (mppPwriteEx(Handle, Offset, Buffer, Size, &BytesWritten) !=
-        OFFLOAD_SUCCESS)
-      return OFFLOAD_FAIL;
-    if (BytesWritten != Size) {
-      errno = EIO;
-      return OFFLOAD_FAIL;
-    }
-    return OFFLOAD_SUCCESS;
-  }
-
-  int mppStageInvalidatePathKey(uint64_t PathKey, uint64_t Generation,
-                                const char *Path) {
-    if (PathKey == 0 || !Path || Path[0] == '\0')
-      return ENOKEY;
-
-    const size_t PathSize = std::strlen(Path) + 1;
-    if (PathSize > static_cast<size_t>(INT_MAX) ||
-        PathSize > static_cast<size_t>(PATH_MAX) + 1)
-      return EOVERFLOW;
-
-    OmpFileStageInvalidateRequest Request{};
-    Request.AbiVersion = OMPFILE_STAGE_INVALIDATE_ABI_VERSION;
-    Request.PathSize = static_cast<uint32_t>(PathSize);
-    Request.PathKey = PathKey;
-    Request.Generation = Generation;
-
-    int FirstErrno = 0;
-    for (int Rank = 0; Rank < EventSystem.numWorkerRanks(); ++Rank) {
-      OmpFileStageInvalidateReply Reply{};
-      if (!stageInvalidateOnRank(Rank, Request, Path, Reply)) {
-        if (FirstErrno == 0)
-          FirstErrno = errno != 0 ? errno : EIO;
-        continue;
-      }
-      if (Reply.AbiVersion != OMPFILE_STAGE_INVALIDATE_ABI_VERSION) {
-        if (FirstErrno == 0)
-          FirstErrno = EPROTO;
-        continue;
-      }
-      if (Reply.Status != 0 && FirstErrno == 0)
-        FirstErrno = Reply.Errno != 0 ? Reply.Errno : EIO;
-    }
-
-    return FirstErrno;
-  }
-
   int mppSchedRequest(const OmpFileIORequest *Request, const char *Path,
                       OmpFileIOPlan *Plan) {
     if (!Request || !Plan)
@@ -7143,27 +6629,6 @@ struct ProxyDevice {
     if (PathKey != 0 && Committed != 0 && WriterRank == EventSystem.LocalRank)
       rememberWritebackFreshnessCommit(PathKey, Committed);
     *CommittedVersion = Committed;
-    return OFFLOAD_SUCCESS;
-  }
-
-  int mppProxyCopyTile(uint64_t PathKey, uint64_t TileId, int SourceRank,
-                       int DestRank, uint64_t Version) {
-    if (!proxyCopyTileEvent(PathKey, TileId, SourceRank, DestRank, Version))
-      return errno != 0 ? errno : EIO;
-    return OFFLOAD_SUCCESS;
-  }
-
-  int mppFreshnessMarkFresh(uint64_t PathKey, int Rank, uint64_t Version) {
-    if (!freshnessMarkFreshOnHeadnode(PathKey, Rank, Version))
-      return errno != 0 ? errno : EIO;
-    if (PathKey != 0 && Version != 0 && Rank == EventSystem.LocalRank) {
-      std::lock_guard<std::mutex> Lock(OmpFileWritebackCommitMutex);
-      auto It = OmpFileLocalFreshnessVersionByPath.find(PathKey);
-      if (It == OmpFileLocalFreshnessVersionByPath.end() ||
-          Version > It->second) {
-        OmpFileLocalFreshnessVersionByPath[PathKey] = Version;
-      }
-    }
     return OFFLOAD_SUCCESS;
   }
 
@@ -7315,26 +6780,6 @@ struct ProxyDevice {
     if (PlanPayloadBytes > 0)
       RequestManager.sendInBatchs(PlanPayload.data(), PlanPayloadBytes);
 
-    RequestManager.send(nullptr, 0, MPI_BYTE);
-    co_return (co_await RequestManager);
-  }
-
-  EventTy ompfileSchedPlan(MPIRequestManagerTy RequestManager) {
-    OmpFileIOPlan Plan{};
-    RequestManager.receive(&Plan, sizeof(Plan), MPI_BYTE);
-
-    if (auto Error = co_await RequestManager; Error)
-      co_return Error;
-
-    OmpFileIOCompletion Completion{};
-    Completion.RequestId = Plan.RequestId;
-    Completion.Status = 0;
-    Completion.Errno = 0;
-    Completion.Bytes = 0;
-
-    OmpFileHeadnodeManager::instance().completeRequest(Plan);
-
-    RequestManager.send(&Completion, sizeof(Completion), MPI_BYTE);
     RequestManager.send(nullptr, 0, MPI_BYTE);
     co_return (co_await RequestManager);
   }
@@ -7738,17 +7183,8 @@ struct ProxyDevice {
       case OMPFILE_PWRITE:
         NewEvent = ompfilePwrite(std::move(RequestManager));
         break;
-      case OMPFILE_STAGE_INVALIDATE:
-        NewEvent = ompfileStageInvalidate(std::move(RequestManager));
-        break;
       case OMPFILE_FRESHNESS_QUERY:
         NewEvent = ompfileFreshnessQuery(std::move(RequestManager));
-        break;
-      case OMPFILE_PROXY_COPY_TILE:
-        NewEvent = ompfileProxyCopyTile(std::move(RequestManager));
-        break;
-      case OMPFILE_FRESHNESS_MARK_FRESH:
-        NewEvent = ompfileFreshnessMarkFresh(std::move(RequestManager));
         break;
       case OMPFILE_FRESHNESS_WRITE_COMMIT:
         NewEvent = ompfileFreshnessWriteCommit(std::move(RequestManager));
@@ -7761,9 +7197,6 @@ struct ProxyDevice {
         break;
       case OMPFILE_SCHED_REQUEST_BATCH:
         NewEvent = ompfileSchedBatchRequest(std::move(RequestManager));
-        break;
-      case OMPFILE_SCHED_PLAN:
-        NewEvent = ompfileSchedPlan(std::move(RequestManager));
         break;
       case INIT_ASYNC_INFO:
         NewEvent = initAsyncInfo(std::move(RequestManager));
@@ -8020,9 +7453,6 @@ private:
   std::atomic<uint64_t> OmpFileStatsStageReopenUs{0};
   std::atomic<uint64_t> OmpFileStatsStageLockWaitUs{0};
   std::atomic<uint64_t> OmpFileStatsStageLockHoldUs{0};
-  std::atomic<uint64_t> OmpFileStatsStageGlobalInvalidationRequests{0};
-  std::atomic<uint64_t> OmpFileStatsStageGlobalInvalidationCompletions{0};
-  std::atomic<uint64_t> OmpFileStatsStageGlobalInvalidationFailures{0};
   std::atomic<uint64_t> OmpFileStatsSourcePreadBytes{0};
   std::atomic<uint64_t> OmpFileStatsSourcePreadUs{0};
   std::atomic<uint64_t> OmpFileStatsStagedPreadUs{0};
@@ -8071,20 +7501,6 @@ private:
   std::mutex MppEventMutex;
   std::unordered_map<uint64_t, EventTy> MppEvents;
   std::unordered_set<uint64_t> CompletedMppTokens;
-  // Split-phase writes (mppPwriteSubmit / mppPollEx), guarded by
-  // MppEventMutex. A poll owns its entry (taken out of the map) while it
-  // resumes the event.
-  struct MppPendingWrite {
-    std::optional<EventTy> Event; // empty: completed at submit
-    int IoRet = -1;
-    int RemoteErrno = 0;
-    uint64_t Bytes = 0;
-    uint64_t Size = 0;
-    bool Ok = false; // result of a write completed at submit
-    int Errno = 0;
-  };
-  std::unordered_map<uint64_t, std::unique_ptr<MppPendingWrite>>
-      MppPendingWrites;
 };
 
 static ProxyDevice *getActiveProxyDevice() {
@@ -8156,13 +7572,6 @@ int ompfile_mpp_handle_owner_rank(int Handle, int *RankOut) {
   return PD->mppHandleOwnerRank(Handle, RankOut);
 }
 
-int ompfile_mpp_pread(int Handle, int64_t Offset, void *Buffer, uint64_t Size) {
-  ProxyDevice *PD = getActiveProxyDevice();
-  if (!PD)
-    return OFFLOAD_FAIL;
-  return PD->mppPread(Handle, Offset, Buffer, Size);
-}
-
 int ompfile_mpp_pread_ex(int Handle, int64_t Offset, void *Buffer,
                           uint64_t Size, uint64_t *BytesRead) {
   ProxyDevice *PD = getActiveProxyDevice();
@@ -8178,15 +7587,6 @@ int ompfile_mpp_pread_no_stage_ex(int Handle, int64_t Offset, void *Buffer,
     return OFFLOAD_FAIL;
   return PD->mppPreadNoStageEx(Handle, Offset, Buffer, Size, BytesRead);
 }
-
-int ompfile_mpp_pwrite(int Handle, int64_t Offset, const void *Buffer,
-                       uint64_t Size) {
-  ProxyDevice *PD = getActiveProxyDevice();
-  if (!PD)
-    return OFFLOAD_FAIL;
-  return PD->mppPwrite(Handle, Offset, Buffer, Size);
-}
-
 
 int ompfile_mpp_dirty_owner_pread_ex(int Handle, int SourceRank,
                                      uint64_t ExpectedVersion, int64_t Offset,
@@ -8229,15 +7629,6 @@ int ompfile_mpp_pwrite_ex(int Handle, int64_t Offset, const void *Buffer,
   return PD->mppPwriteEx(Handle, Offset, Buffer, Size, BytesWritten);
 }
 
-int ompfile_mpp_stage_invalidate_path_key(uint64_t PathKey,
-                                          uint64_t Generation,
-                                          const char *Path) {
-  ProxyDevice *PD = getActiveProxyDevice();
-  if (!PD)
-    return EHOSTDOWN;
-  return PD->mppStageInvalidatePathKey(PathKey, Generation, Path);
-}
-
 int ompfile_mpp_freshness_query(const OmpFileFreshnessQueryRequest *Request,
                                 OmpFileFreshnessQueryReply *Reply) {
   ProxyDevice *PD = getActiveProxyDevice();
@@ -8254,23 +7645,6 @@ int ompfile_mpp_freshness_write_commit(uint64_t PathKey, int WriterRank,
     return EHOSTDOWN;
   return PD->mppFreshnessWriteCommit(PathKey, WriterRank, TileId,
                                      WriteThroughMode, CommittedVersion);
-}
-
-int ompfile_mpp_proxy_copy_tile(uint64_t PathKey, uint64_t TileId,
-                                int SourceRank, int DestRank,
-                                uint64_t Version) {
-  ProxyDevice *PD = getActiveProxyDevice();
-  if (!PD)
-    return EHOSTDOWN;
-  return PD->mppProxyCopyTile(PathKey, TileId, SourceRank, DestRank, Version);
-}
-
-int ompfile_mpp_freshness_mark_fresh(uint64_t PathKey, int Rank,
-                                     uint64_t Version) {
-  ProxyDevice *PD = getActiveProxyDevice();
-  if (!PD)
-    return EHOSTDOWN;
-  return PD->mppFreshnessMarkFresh(PathKey, Rank, Version);
 }
 
 int ompfile_mpp_flush_dirty_tile(uint64_t PathKey, int *SourceRank,
@@ -8305,21 +7679,6 @@ int ompfile_mpp_poll(uint64_t Token, int *Done) {
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppPoll(Token, Done);
-}
-
-int ompfile_mpp_pwrite_submit(int Handle, int64_t Offset, const void *Buffer,
-                              uint64_t Size, uint64_t Token) {
-  ProxyDevice *PD = getActiveProxyDevice();
-  if (!PD)
-    return OFFLOAD_FAIL;
-  return PD->mppPwriteSubmit(Handle, Offset, Buffer, Size, Token);
-}
-
-int ompfile_mpp_poll_ex(uint64_t Token, int *Done, uint64_t *Bytes) {
-  ProxyDevice *PD = getActiveProxyDevice();
-  if (!PD)
-    return OFFLOAD_FAIL;
-  return PD->mppPollEx(Token, Done, Bytes);
 }
 
 int ompfile_mpp_finalize() {

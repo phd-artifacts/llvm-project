@@ -87,27 +87,13 @@ void MPIIOBackend::reportPhase0Stats() const {
       dirty_owner_forward_failure_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_forward_bytes =
       dirty_owner_forward_bytes_total.load(std::memory_order_relaxed);
-  const uint64_t stage_invalidations_requested =
-      stage_global_invalidations_requested.load(std::memory_order_relaxed);
-  const uint64_t stage_invalidations_completed =
-      stage_global_invalidations_completed.load(std::memory_order_relaxed);
-  const uint64_t stage_invalidations_failed =
-      stage_global_invalidations_failed.load(std::memory_order_relaxed);
   const uint64_t writable_read_blocked_pending_invalidation =
       writable_read_rebalance_blocked_pending_invalidation.load(
-          std::memory_order_relaxed);
-  const uint64_t writable_read_after_invalidation_eligible =
-      writable_read_rebalance_after_invalidation_eligible.load(
-          std::memory_order_relaxed);
-  const uint64_t writable_read_after_invalidation_applied =
-      writable_read_rebalance_after_invalidation_applied.load(
           std::memory_order_relaxed);
   const uint64_t planner_scalar_fallbacks =
       two_phase_planner_scalar_fallback_count.load(std::memory_order_relaxed);
   const uint64_t planner_errors =
       two_phase_planner_error_count.load(std::memory_order_relaxed);
-  const uint64_t cache_hits =
-      two_phase_cache_hit_count.load(std::memory_order_relaxed);
   const uint64_t write_batches =
       write_batch_count.load(std::memory_order_relaxed);
   const uint64_t coalesced_writes =
@@ -146,36 +132,6 @@ void MPIIOBackend::reportPhase0Stats() const {
       write_batch_exec_us_total.load(std::memory_order_relaxed);
   const uint64_t write_request_wait_us =
       write_request_wait_us_total.load(std::memory_order_relaxed);
-  const uint64_t forecast_hint_reads =
-      forecast_hint_read_count.load(std::memory_order_relaxed);
-  const uint64_t forecast_hint_writes =
-      forecast_hint_write_count.load(std::memory_order_relaxed);
-  const uint64_t forecast_hint_read_bytes =
-      forecast_hint_read_bytes_total.load(std::memory_order_relaxed);
-  const uint64_t forecast_hint_write_bytes =
-      forecast_hint_write_bytes_total.load(std::memory_order_relaxed);
-  const uint64_t forecast_source_read_stageable =
-      forecast_source_read_stageable_count.load(std::memory_order_relaxed);
-  const uint64_t forecast_source_read_stageable_bytes =
-      forecast_source_read_stageable_bytes_total.load(std::memory_order_relaxed);
-  const uint64_t forecast_target_read_bypasses =
-      forecast_target_read_bypass_count.load(std::memory_order_relaxed);
-  const uint64_t forecast_target_read_bypass_bytes =
-      forecast_target_read_bypass_bytes_total.load(std::memory_order_relaxed);
-  const uint64_t forecast_role_unknown =
-      forecast_role_unknown_count.load(std::memory_order_relaxed);
-  const uint64_t forecast_role_unknown_bytes =
-      forecast_role_unknown_bytes_total.load(std::memory_order_relaxed);
-  const uint64_t stage_affinity_candidates =
-      stage_affinity_source_candidate_count.load(std::memory_order_relaxed);
-  const uint64_t stage_affinity_candidate_bytes =
-      stage_affinity_source_candidate_bytes.load(std::memory_order_relaxed);
-  const uint64_t stage_affinity_applied =
-      stage_affinity_source_applied_count.load(std::memory_order_relaxed);
-  const uint64_t stage_affinity_applied_bytes =
-      stage_affinity_source_applied_bytes.load(std::memory_order_relaxed);
-  const uint64_t stage_affinity_fallbacks =
-      stage_affinity_source_fallback_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_candidates =
       dirty_owner_batch_candidate_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batches =
@@ -247,14 +203,9 @@ void MPIIOBackend::reportPhase0Stats() const {
          "dirty_owner_forward_successes=%llu "
          "dirty_owner_forward_failures=%llu "
          "dirty_owner_forward_bytes=%llu "
-         "stage_global_invalidations_requested=%llu "
-         "stage_global_invalidations_completed=%llu "
-         "stage_global_invalidations_failed=%llu "
          "writable_read_rebalance_blocked_pending_invalidation=%llu "
-         "writable_read_rebalance_after_invalidation_eligible=%llu "
-         "writable_read_rebalance_after_invalidation_applied=%llu "
          "planner_scalar_fallbacks=%llu planner_errors=%llu "
-         "cache_hits=%llu fallbacks=%llu "
+         "fallbacks=%llu "
          "write_batch_count=%llu coalesced_writes=%llu "
          "coalesced_write_bytes=%llu coalesced_write_avg_bytes=%.2f "
          "write_batch_saved_events=%llu write_batch_failures=%llu "
@@ -266,20 +217,6 @@ void MPIIOBackend::reportPhase0Stats() const {
          "write_follower_waits=%llu write_follower_wait_us=%llu "
          "write_window_wait_us=%llu write_batch_exec_us=%llu "
          "write_request_wait_us=%llu "
-         "forecast_mode=%s forecast_hint_reads=%llu "
-         "forecast_hint_writes=%llu forecast_hint_read_bytes=%llu "
-         "forecast_hint_write_bytes=%llu "
-         "forecast_source_read_stageable=%llu "
-         "forecast_source_read_stageable_bytes=%llu "
-         "forecast_target_read_bypasses=%llu "
-          "forecast_target_read_bypass_bytes=%llu "
-          "forecast_role_unknown=%llu forecast_role_unknown_bytes=%llu "
-          "stage_affinity_mode=%s "
-          "stage_affinity_source_candidates=%llu "
-          "stage_affinity_source_candidate_bytes=%llu "
-          "stage_affinity_source_applied=%llu "
-          "stage_affinity_source_applied_bytes=%llu "
-          "stage_affinity_source_fallbacks=%llu "
           "dirty_owner_batch_candidates=%llu "
           "dirty_owner_batch_count=%llu "
           "dirty_owner_single_reads=%llu "
@@ -339,18 +276,10 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(dirty_owner_forward_successes),
          static_cast<unsigned long long>(dirty_owner_forward_failures),
          static_cast<unsigned long long>(dirty_owner_forward_bytes),
-         static_cast<unsigned long long>(stage_invalidations_requested),
-         static_cast<unsigned long long>(stage_invalidations_completed),
-         static_cast<unsigned long long>(stage_invalidations_failed),
          static_cast<unsigned long long>(
              writable_read_blocked_pending_invalidation),
-         static_cast<unsigned long long>(
-             writable_read_after_invalidation_eligible),
-         static_cast<unsigned long long>(
-             writable_read_after_invalidation_applied),
          static_cast<unsigned long long>(planner_scalar_fallbacks),
          static_cast<unsigned long long>(planner_errors),
-         static_cast<unsigned long long>(cache_hits),
          static_cast<unsigned long long>(fallback_count),
          static_cast<unsigned long long>(write_batches),
          static_cast<unsigned long long>(coalesced_writes),
@@ -372,23 +301,6 @@ void MPIIOBackend::reportPhase0Stats() const {
          static_cast<unsigned long long>(write_window_wait_us),
          static_cast<unsigned long long>(write_batch_exec_us),
          static_cast<unsigned long long>(write_request_wait_us),
-         forecastModeToString(forecast_mode),
-         static_cast<unsigned long long>(forecast_hint_reads),
-         static_cast<unsigned long long>(forecast_hint_writes),
-         static_cast<unsigned long long>(forecast_hint_read_bytes),
-         static_cast<unsigned long long>(forecast_hint_write_bytes),
-         static_cast<unsigned long long>(forecast_source_read_stageable),
-         static_cast<unsigned long long>(forecast_source_read_stageable_bytes),
-         static_cast<unsigned long long>(forecast_target_read_bypasses),
-          static_cast<unsigned long long>(forecast_target_read_bypass_bytes),
-          static_cast<unsigned long long>(forecast_role_unknown),
-          static_cast<unsigned long long>(forecast_role_unknown_bytes),
-          stageAffinityModeToString(stage_affinity_mode),
-          static_cast<unsigned long long>(stage_affinity_candidates),
-          static_cast<unsigned long long>(stage_affinity_candidate_bytes),
-          static_cast<unsigned long long>(stage_affinity_applied),
-          static_cast<unsigned long long>(stage_affinity_applied_bytes),
-          static_cast<unsigned long long>(stage_affinity_fallbacks),
           static_cast<unsigned long long>(dirty_owner_batch_candidates),
           static_cast<unsigned long long>(dirty_owner_batches),
           static_cast<unsigned long long>(dirty_owner_single_reads),

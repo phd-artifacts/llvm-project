@@ -16,7 +16,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdarg>
@@ -87,17 +86,10 @@ const char *eventTypeName(EventTypeTy eventType) {
     case EventTypeTy::OMPFILE_SCHED_REQUEST: return "OMPFILE_SCHED_REQUEST";
     case EventTypeTy::OMPFILE_SCHED_REQUEST_BATCH:
       return "OMPFILE_SCHED_REQUEST_BATCH";
-    case EventTypeTy::OMPFILE_SCHED_PLAN: return "OMPFILE_SCHED_PLAN";
     case EventTypeTy::SYNC: return "SYNC";
-    case EventTypeTy::OMPFILE_STAGE_INVALIDATE:
-      return "OMPFILE_STAGE_INVALIDATE";
     case EventTypeTy::OMPFILE_PREAD_NO_STAGE: return "OMPFILE_PREAD_NO_STAGE";
     case EventTypeTy::OMPFILE_FRESHNESS_QUERY:
       return "OMPFILE_FRESHNESS_QUERY";
-    case EventTypeTy::OMPFILE_PROXY_COPY_TILE:
-      return "OMPFILE_PROXY_COPY_TILE";
-    case EventTypeTy::OMPFILE_FRESHNESS_MARK_FRESH:
-      return "OMPFILE_FRESHNESS_MARK_FRESH";
     case EventTypeTy::OMPFILE_FRESHNESS_WRITE_COMMIT:
       return "OMPFILE_FRESHNESS_WRITE_COMMIT";
     case EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE:
@@ -149,20 +141,6 @@ RetrievePhaseStats &retrievePhaseStats() {
 bool ompfileTraceEnabled() {
   static const bool Enabled = []() {
     const char *Env = std::getenv("LIBOMPFILE_DEBUG_TRACE");
-    return Env && Env[0] == '1' && Env[1] == '\0';
-  }();
-  return Enabled;
-}
-
-// LIBOMPFILE_MPP_ASYNC_PWRITE_SEND=1: the pwrite payload leaves as
-// non-blocking fragments the event awaits, instead of a blocking MPI_Send on
-// whichever thread resumes the event. Default off. The blocking send dates
-// from May 2026 (a1461b1), a workaround for internal_Testall aborts from the
-// era of MPI_Testall polling; request polling has used MPI_Testany since
-// 494c060, which is what this knob exists to re-prove.
-bool ompfileAsyncPwriteSendEnabled() {
-  static const bool Enabled = []() {
-    const char *Env = std::getenv("LIBOMPFILE_MPP_ASYNC_PWRITE_SEND");
     return Env && Env[0] == '1' && Env[1] == '\0';
   }();
   return Enabled;
@@ -1180,20 +1158,8 @@ EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
     co_return Error;
 
   if (Size > 0) {
-    if (ompfileAsyncPwriteSendEnabled()) {
-      // Non-blocking fragments on this event's tag, awaited on their own
-      // before the completion receives are posted (never mix the payload and
-      // the completion in one wait). The event suspends here instead of
-      // holding the resuming thread for the rendezvous. The caller's buffer
-      // outlives the event: a synchronous pwrite waits for it, and the async
-      // engine owns its copy until the write completes.
-      RequestManager.sendInBatchs(const_cast<void *>(Buffer),
-                                  static_cast<int64_t>(Size));
-      if (auto Error = co_await RequestManager; Error)
-        co_return Error;
-    } else if (auto Error = RequestManager.sendInBatchsBlocking(Buffer, Size)) {
+    if (auto Error = RequestManager.sendInBatchsBlocking(Buffer, Size))
       co_return Error;
-    }
   }
 
   RequestManager.receive(IoRet, 1, MPI_INT);
@@ -1204,35 +1170,6 @@ EventTy ompfilePwrite(MPIRequestManagerTy RequestManager, int RemoteHandle,
     co_return Error;
 
   // Event completion notification
-  RequestManager.receive(nullptr, 0, MPI_BYTE);
-  co_return (co_await RequestManager);
-}
-
-EventTy ompfileStageInvalidate(MPIRequestManagerTy RequestManager,
-                               const OmpFileStageInvalidateRequest *Request,
-                               const char *Path,
-                               OmpFileStageInvalidateReply *Reply) {
-  if (!Request || !Reply)
-    co_return createError("OMPFile stage invalidate missing buffers.");
-  if (Request->PathSize > 0 && !Path)
-    co_return createError("OMPFile stage invalidate missing path.");
-  if (Request->PathSize > static_cast<uint32_t>(INT_MAX))
-    co_return createError("OMPFile stage invalidate path too large.");
-  if (Request->PathSize > static_cast<uint32_t>(PATH_MAX) + 1)
-    co_return createError("OMPFile stage invalidate path too large.");
-
-  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
-  if (Request->PathSize > 0)
-    RequestManager.send(Path, static_cast<int>(Request->PathSize), MPI_CHAR);
-
-  if (auto Error = co_await RequestManager; Error)
-    co_return Error;
-
-  RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
-
-  if (auto Error = co_await RequestManager; Error)
-    co_return Error;
-
   RequestManager.receive(nullptr, 0, MPI_BYTE);
   co_return (co_await RequestManager);
 }
@@ -1261,43 +1198,6 @@ EventTy ompfileFreshnessWriteCommit(
     OmpFileFreshnessWriteCommitReply *Reply) {
   if (!Request || !Reply)
     co_return createError("OMPFile freshness write commit missing buffers.");
-
-  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
-  if (auto Error = co_await RequestManager; Error)
-    co_return Error;
-
-  RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
-  if (auto Error = co_await RequestManager; Error)
-    co_return Error;
-
-  RequestManager.receive(nullptr, 0, MPI_BYTE);
-  co_return (co_await RequestManager);
-}
-
-EventTy ompfileProxyCopyTile(MPIRequestManagerTy RequestManager,
-                             const OmpFileProxyCopyTileRequest *Request,
-                             OmpFileProxyCopyTileReply *Reply) {
-  if (!Request || !Reply)
-    co_return createError("OMPFile proxy copy tile missing buffers.");
-
-  RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
-  if (auto Error = co_await RequestManager; Error)
-    co_return Error;
-
-  RequestManager.receive(Reply, sizeof(*Reply), MPI_BYTE);
-  if (auto Error = co_await RequestManager; Error)
-    co_return Error;
-
-  RequestManager.receive(nullptr, 0, MPI_BYTE);
-  co_return (co_await RequestManager);
-}
-
-EventTy ompfileFreshnessMarkFresh(
-    MPIRequestManagerTy RequestManager,
-    const OmpFileFreshnessMarkFreshRequest *Request,
-    OmpFileFreshnessMarkFreshReply *Reply) {
-  if (!Request || !Reply)
-    co_return createError("OMPFile freshness mark-fresh missing buffers.");
 
   RequestManager.send(Request, sizeof(*Request), MPI_BYTE);
   if (auto Error = co_await RequestManager; Error)
@@ -1401,24 +1301,6 @@ EventTy ompfileSchedBatchRequest(MPIRequestManagerTy RequestManager,
   RequestManager.receive(nullptr, 0, MPI_BYTE);
   co_return (co_await RequestManager);
 }
-
-EventTy ompfileSchedPlan(MPIRequestManagerTy RequestManager,
-                         const OmpFileIOPlan *Plan,
-                         OmpFileIOCompletion *Completion) {
-  if (!Plan || !Completion)
-    co_return createError("OMPFile sched plan missing buffers.");
-
-  RequestManager.send(Plan, sizeof(*Plan), MPI_BYTE);
-  RequestManager.receive(Completion, sizeof(*Completion), MPI_BYTE);
-
-  if (auto Error = co_await RequestManager; Error)
-    co_return Error;
-
-  // Event completion notification
-  RequestManager.receive(nullptr, 0, MPI_BYTE);
-  co_return (co_await RequestManager);
-}
-
 
 EventTy sync(EventTy Event) {
   while (!Event.done())

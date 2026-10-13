@@ -18,10 +18,6 @@ namespace {
 extern "C" int ompfile_mpp_freshness_write_commit(uint64_t, int, uint64_t, int,
                                                      uint64_t *)
     __attribute__((weak));
-extern "C" int ompfile_mpp_proxy_copy_tile(uint64_t, uint64_t, int, int,
-                                             uint64_t) __attribute__((weak));
-extern "C" int ompfile_mpp_freshness_mark_fresh(uint64_t, int, uint64_t)
-    __attribute__((weak));
 extern "C" int ompfile_mpp_flush_dirty_tile(uint64_t, int *, uint64_t *)
     __attribute__((weak));
 extern "C" int ompfile_mpp_commit_stage_path_key(uint64_t) __attribute__((weak));
@@ -78,14 +74,6 @@ MppApi getMppApiReloadIfMissing(Fn MppApi::*member) {
   return api;
 }
 
-MppApi getMppApiReloadIfPwriteMissing() {
-  const std::lock_guard<std::mutex> lock(mppApiMutex());
-  MppApi &api = mppApiStorage();
-  if (!api.pwrite && !api.pwrite_ex)
-    api = loadMppApi();
-  return api;
-}
-
 uint64_t nextShimCallId() {
   static std::atomic<uint64_t> call_id{1};
   return call_id.fetch_add(1, std::memory_order_relaxed);
@@ -117,8 +105,6 @@ bool init() {
                         reinterpret_cast<void *>(api.open_on_rank));
   io_trace_symbol_owner("ompfile_mpp_close",
                         reinterpret_cast<void *>(api.close));
-  io_trace_symbol_owner("ompfile_mpp_pread",
-                        reinterpret_cast<void *>(api.pread));
   io_trace_symbol_owner("ompfile_mpp_pread_ex",
                         reinterpret_cast<void *>(api.pread_ex));
   io_trace_symbol_owner("ompfile_mpp_dirty_owner_pread_ex",
@@ -126,13 +112,8 @@ bool init() {
   io_trace_symbol_owner(
       "ompfile_mpp_dirty_owner_pread_batch_ex",
       reinterpret_cast<void *>(api.dirty_owner_pread_batch_ex));
-  io_trace_symbol_owner("ompfile_mpp_pwrite",
-                        reinterpret_cast<void *>(api.pwrite));
   io_trace_symbol_owner("ompfile_mpp_pwrite_ex",
                         reinterpret_cast<void *>(api.pwrite_ex));
-  io_trace_symbol_owner(
-      "ompfile_mpp_stage_invalidate_path_key",
-      reinterpret_cast<void *>(api.stage_invalidate_path_key));
   io_trace_symbol_owner("ompfile_mpp_sched_request",
                         reinterpret_cast<void *>(api.sched_request));
   io_trace_symbol_owner("ompfile_mpp_sched_request_batch",
@@ -175,46 +156,6 @@ bool poll(uint64_t token, bool &done) {
     return false;
   done = raw_done != 0;
   return true;
-}
-
-bool splitPhaseWriteAvailable() {
-  if (!init())
-    return false;
-  const MppApi api = getMppApiReloadIfMissing(&MppApi::pwrite_submit);
-  return api.pwrite_submit && api.poll_ex;
-}
-
-uint64_t nextSplitPhaseToken() {
-  static std::atomic<uint64_t> token{1};
-  return token.fetch_add(1, std::memory_order_relaxed);
-}
-
-bool pwriteSubmit(int handle, int64_t offset, const void *buffer, size_t size,
-                  uint64_t token) {
-  if (!buffer && size > 0)
-    return false;
-  if (!init())
-    return false;
-  const MppApi api = getMppApiReloadIfMissing(&MppApi::pwrite_submit);
-  if (!api.pwrite_submit)
-    return false;
-  return api.pwrite_submit(handle, offset, buffer, size, token) == 0;
-}
-
-bool pollEx(uint64_t token, bool &done, size_t &bytes) {
-  done = false;
-  bytes = 0;
-  const MppApi api = getMppApiReloadIfMissing(&MppApi::poll_ex);
-  if (!api.poll_ex)
-    return false;
-  int raw_done = 0;
-  uint64_t raw_bytes = 0;
-  const int rc = api.poll_ex(token, &raw_done, &raw_bytes);
-  done = raw_done != 0;
-  if (raw_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
-    return false;
-  bytes = static_cast<size_t>(raw_bytes);
-  return rc == 0;
 }
 
 void finalize() {
@@ -328,11 +269,6 @@ bool close(int handle) {
   return rc == 0;
 }
 
-bool pread(int handle, int64_t offset, void *buffer, size_t size) {
-  size_t bytes_read = 0;
-  return preadEx(handle, offset, buffer, size, bytes_read);
-}
-
 bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
              size_t &bytes_read) {
   const uint64_t call_id = nextShimCallId();
@@ -346,36 +282,26 @@ bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
   if (!init())
     return false;
 
-  MppApi api = getMppApiReloadIfMissing(&MppApi::pread);
+  MppApi api = getMppApiReloadIfMissing(&MppApi::pread_ex);
 
-  if (!api.pread) {
-    io_log("MPP shim not available (ompfile_mpp_pread missing).\n");
+  if (!api.pread_ex) {
+    io_log("MPP shim not available (ompfile_mpp_pread_ex missing).\n");
     io_trace("mpp_shim::pread missing symbol call=%llu\n",
              static_cast<unsigned long long>(call_id));
     return false;
   }
 
-  if (api.pread_ex) {
-    uint64_t remote_bytes_read = 0;
-    const int rc = api.pread_ex(handle, offset, buffer, size, &remote_bytes_read);
-    io_trace("mpp_shim::pread_ex exit call=%llu rc=%d bytes=%llu\n",
-             static_cast<unsigned long long>(call_id), rc,
-             static_cast<unsigned long long>(remote_bytes_read));
-    if (rc != 0)
-      return false;
-    if (remote_bytes_read >
-        static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
-      return false;
-    bytes_read = static_cast<size_t>(remote_bytes_read);
-    return true;
-  }
-
-  const int rc = api.pread(handle, offset, buffer, size);
-  io_trace("mpp_shim::pread legacy exit call=%llu rc=%d\n",
-           static_cast<unsigned long long>(call_id), rc);
+  uint64_t remote_bytes_read = 0;
+  const int rc = api.pread_ex(handle, offset, buffer, size, &remote_bytes_read);
+  io_trace("mpp_shim::pread_ex exit call=%llu rc=%d bytes=%llu\n",
+           static_cast<unsigned long long>(call_id), rc,
+           static_cast<unsigned long long>(remote_bytes_read));
   if (rc != 0)
     return false;
-  bytes_read = size;
+  if (remote_bytes_read >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+    return false;
+  bytes_read = static_cast<size_t>(remote_bytes_read);
   return true;
 }
 
@@ -536,75 +462,28 @@ bool pwriteEx(int handle, int64_t offset, const void *buffer, size_t size,
   if (!init())
     return false;
 
-  MppApi api = getMppApiReloadIfPwriteMissing();
+  MppApi api = getMppApiReloadIfMissing(&MppApi::pwrite_ex);
 
-  if (!api.pwrite && !api.pwrite_ex) {
-    io_log("MPP shim not available (ompfile_mpp_pwrite{,_ex} missing).\n");
+  if (!api.pwrite_ex) {
+    io_log("MPP shim not available (ompfile_mpp_pwrite_ex missing).\n");
     io_trace("mpp_shim::pwrite missing symbol call=%llu\n",
              static_cast<unsigned long long>(call_id));
     return false;
   }
 
-  if (api.pwrite_ex) {
-    uint64_t remote_bytes_written = 0;
-    const int rc =
-        api.pwrite_ex(handle, offset, buffer, size, &remote_bytes_written);
-    io_trace("mpp_shim::pwrite_ex exit call=%llu rc=%d bytes=%llu\n",
-             static_cast<unsigned long long>(call_id), rc,
-             static_cast<unsigned long long>(remote_bytes_written));
-    if (rc != 0)
-      return false;
-    if (remote_bytes_written >
-        static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
-      return false;
-    bytes_written = static_cast<size_t>(remote_bytes_written);
-    return true;
-  }
-
-  const int rc = api.pwrite(handle, offset, buffer, size);
-  io_trace("mpp_shim::pwrite legacy exit call=%llu rc=%d\n",
-           static_cast<unsigned long long>(call_id), rc);
+  uint64_t remote_bytes_written = 0;
+  const int rc =
+      api.pwrite_ex(handle, offset, buffer, size, &remote_bytes_written);
+  io_trace("mpp_shim::pwrite_ex exit call=%llu rc=%d bytes=%llu\n",
+           static_cast<unsigned long long>(call_id), rc,
+           static_cast<unsigned long long>(remote_bytes_written));
   if (rc != 0)
     return false;
-  bytes_written = size;
+  if (remote_bytes_written >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+    return false;
+  bytes_written = static_cast<size_t>(remote_bytes_written);
   return true;
-}
-
-bool pwrite(int handle, int64_t offset, const void *buffer, size_t size) {
-  size_t bytes_written = 0;
-  if (!pwriteEx(handle, offset, buffer, size, bytes_written))
-    return false;
-  if (bytes_written != size) {
-    errno = EIO;
-    return false;
-  }
-  return true;
-}
-
-bool stageInvalidatePathKey(uint64_t path_key, uint64_t generation,
-                            const char *path) {
-  const uint64_t call_id = nextShimCallId();
-  MppApi api = getMppApiReloadIfMissing(&MppApi::stage_invalidate_path_key);
-
-  if (!api.stage_invalidate_path_key) {
-    io_log("MPP shim not available "
-           "(ompfile_mpp_stage_invalidate_path_key missing).\n");
-    errno = ENOSYS;
-    return false;
-  }
-
-  if (!init())
-    return false;
-
-  const int rc = api.stage_invalidate_path_key(path_key, generation, path);
-  io_trace("mpp_shim::stageInvalidatePathKey call=%llu path_key=%llu "
-           "generation=%llu rc=%d\n",
-           static_cast<unsigned long long>(call_id),
-           static_cast<unsigned long long>(path_key),
-           static_cast<unsigned long long>(generation), rc);
-  if (rc != 0)
-    errno = rc < 0 ? EIO : rc;
-  return rc == 0;
 }
 
 bool freshnessQuery(uint64_t path_key, uint64_t local_version,
@@ -694,73 +573,6 @@ bool freshnessWriteCommit(uint64_t path_key, int writer_rank, uint64_t tile_id,
   if (rc != 0) {
     errno = rc < 0 ? EIO : rc;
     committed_version_out = 0;
-    return false;
-  }
-  return true;
-}
-
-bool proxyCopyTile(uint64_t path_key, uint64_t tile_id, int source_rank,
-                   int dest_rank, uint64_t version) {
-  if (path_key == 0 || source_rank < 0 || dest_rank < 0 || version == 0) {
-    errno = EINVAL;
-    return false;
-  }
-
-  if (ompfile_mpp_proxy_copy_tile) {
-    const int rc = ompfile_mpp_proxy_copy_tile(path_key, tile_id, source_rank,
-                                               dest_rank, version);
-    if (rc != 0) {
-      errno = rc < 0 ? EIO : rc;
-      return false;
-    }
-    return true;
-  }
-
-  if (!init())
-    return false;
-
-  MppApi api = getMppApiReloadIfMissing(&MppApi::proxy_copy_tile);
-  if (!api.proxy_copy_tile) {
-    errno = ENOSYS;
-    return false;
-  }
-
-  const int rc =
-      api.proxy_copy_tile(path_key, tile_id, source_rank, dest_rank, version);
-  if (rc != 0) {
-    errno = rc < 0 ? EIO : rc;
-    return false;
-  }
-  return true;
-}
-
-bool freshnessMarkFresh(uint64_t path_key, int rank, uint64_t version) {
-  if (path_key == 0 || rank < 0 || version == 0) {
-    errno = EINVAL;
-    return false;
-  }
-
-  if (ompfile_mpp_freshness_mark_fresh) {
-    const int rc = ompfile_mpp_freshness_mark_fresh(path_key, rank, version);
-    if (rc != 0) {
-      errno = rc < 0 ? EIO : rc;
-      return false;
-    }
-    return true;
-  }
-
-  if (!init())
-    return false;
-
-  MppApi api = getMppApiReloadIfMissing(&MppApi::freshness_mark_fresh);
-  if (!api.freshness_mark_fresh) {
-    errno = ENOSYS;
-    return false;
-  }
-
-  const int rc = api.freshness_mark_fresh(path_key, rank, version);
-  if (rc != 0) {
-    errno = rc < 0 ? EIO : rc;
     return false;
   }
   return true;

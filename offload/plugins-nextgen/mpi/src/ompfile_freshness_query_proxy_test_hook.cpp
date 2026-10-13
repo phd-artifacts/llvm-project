@@ -42,28 +42,6 @@ extern "C" int ompfile_mpp_freshness_write_commit(uint64_t PathKey,
   return 0;
 }
 
-extern "C" int ompfile_mpp_proxy_copy_tile(uint64_t PathKey, uint64_t TileId,
-                                             int SourceRank, int DestRank,
-                                             uint64_t Version) {
-  (void)TileId;
-  if (PathKey == 0 || SourceRank < 0 || DestRank < 0 || Version == 0)
-    return EINVAL;
-  if (!OmpFileHeadnodeManager::instance().registerTileCopy(
-          PathKey, SourceRank, DestRank, Version)) {
-    return errno != 0 ? errno : EIO;
-  }
-  return 0;
-}
-
-extern "C" int ompfile_mpp_freshness_mark_fresh(uint64_t PathKey, int Rank,
-                                                  uint64_t Version) {
-  if (!OmpFileHeadnodeManager::instance().markTileFreshFromCopy(PathKey, Rank,
-                                                                 Version)) {
-    return errno != 0 ? errno : EIO;
-  }
-  return 0;
-}
-
 extern "C" int ompfile_mpp_flush_dirty_tile(uint64_t PathKey, int *SourceRank,
                                              uint64_t *FlushedVersion) {
   if (!SourceRank || !FlushedVersion)

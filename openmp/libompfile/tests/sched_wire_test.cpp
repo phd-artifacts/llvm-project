@@ -7,6 +7,7 @@
 #include "ompfile_sched.h"
 #include "ompfile_test.h"
 
+#include <cstddef>
 #include <cstring>
 #include <type_traits>
 #include <vector>
@@ -26,6 +27,10 @@ static_assert(std::is_trivially_copyable_v<OmpFileFreshnessQueryReply>);
 OMPFILE_TEST(wire_sizes_are_the_abi) {
   OMPFILE_CHECK_EQ(sizeof(OmpFileIOHint), 40u);
   OMPFILE_CHECK_EQ(sizeof(OmpFileIORequest), 80u);
+  OMPFILE_CHECK_EQ(offsetof(OmpFileIORequest, ClientRank), 24u);
+  OMPFILE_CHECK_EQ(offsetof(OmpFileIORequest, AggregatorRank), 28u);
+  OMPFILE_CHECK_EQ(offsetof(OmpFileIORequest, Offset), 32u);
+  OMPFILE_CHECK_EQ(OMPFILE_IO_REQUEST_PLACEMENT_ONLY, 1);
   OMPFILE_CHECK_EQ(sizeof(OmpFileIOPlan), 48u);
   OMPFILE_CHECK_EQ(sizeof(OmpFileIOBatchSegment), 72u);
   OMPFILE_CHECK_EQ(sizeof(OmpFileIOBatchRequest), 32u);

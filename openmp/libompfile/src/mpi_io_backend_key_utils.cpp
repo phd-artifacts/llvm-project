@@ -71,15 +71,14 @@ uint64_t MPIIOBackend::resolveTwoPhaseKey(
 int MPIIOBackend::failStrictMpp(const char *op_name) const {
   errno = EIO;
   if (!strict_failure_logged.exchange(true, std::memory_order_relaxed)) {
-    io_log("Error: '%s' failed because MPP init did not complete and fallback "
-           "is disabled. Set LIBOMPFILE_ALLOWFALLBACK=1 to allow fallback "
-           "behavior.\n",
+    io_log("Error: '%s' failed because libompfile initialization did not "
+           "complete (MPP init failed or a removed mode was requested); "
+           "remote-only MPP is the only mode.\n",
            op_name ? op_name : "(unknown)");
   }
-  io_trace("MPIIOBackend::failStrictMpp this=%p op=%s mpp_requested=%d "
-           "allow_fallback=%d strict_mpp_init_failed=%d\n",
+  io_trace("MPIIOBackend::failStrictMpp this=%p op=%s "
+           "strict_mpp_init_failed=%d\n",
            static_cast<const void *>(this), op_name ? op_name : "(unknown)",
-           static_cast<int>(mpp_requested), static_cast<int>(allow_fallback),
            static_cast<int>(strict_mpp_init_failed));
   return -1;
 }
