@@ -1,4 +1,4 @@
-uif USE_DEBUGGER
+#if USE_DEBUGGER
 /*
  * kmp_omp.h -- OpenMP definition for kmp_omp_struct_info_t.
  *              This is for information about runtime library structures.

@@ -65,16 +65,6 @@ if(LIBOMP_PROFILING_SUPPORT)
   )
 endif()
 
-# Looking for MPI...
-find_package(MPI REQUIRED)
-
-# Check for C++20 support
-
-if(NOT MPI_CXX_FOUND)
-  message(STATUS "Not building KMP. MPI is mandatory for this fork.")
-  return()
-endif()
-
 # Getting correct source files to build library
 set(LIBOMP_CXXFILES)
 set(LIBOMP_ASMFILES)
@@ -82,7 +72,6 @@ set(LIBOMP_GNUASMFILES)
 if(STUBS_LIBRARY)
   set(LIBOMP_CXXFILES kmp_stub.cpp)
 else()
-  message(STATUS "Building KMP on the OMP-IO fork.")
   # Get C++ files
   set(LIBOMP_CXXFILES
     kmp_alloc.cpp
@@ -185,7 +174,7 @@ if(OPENMP_STANDALONE_BUILD OR (NOT OPENMP_ENABLE_LIBOMP_PROFILING))
   add_library(omp ${LIBOMP_LIBRARY_KIND} ${LIBOMP_SOURCE_FILES})
   set_property(TARGET omp PROPERTY FOLDER "OpenMP/Libraries")
   # Linking command will include libraries in LIBOMP_CONFIGURED_LIBFLAGS
-  target_link_libraries(omp PRIVATE ${LIBOMP_CONFIGURED_LIBFLAGS} ${LIBOMP_DL_LIBS})
+  target_link_libraries(omp ${LIBOMP_CONFIGURED_LIBFLAGS} ${LIBOMP_DL_LIBS})
 else()
   add_llvm_library(omp ${LIBOMP_LIBRARY_KIND} ${LIBOMP_SOURCE_FILES} PARTIAL_SOURCES_INTENDED
     LINK_LIBS ${LIBOMP_CONFIGURED_LIBFLAGS} ${LIBOMP_DL_LIBS}
