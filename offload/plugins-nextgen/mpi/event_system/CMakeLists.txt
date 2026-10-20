@@ -1,6 +1,7 @@
 # Build EventSystem
 add_library(EventSystem OBJECT
     EventSystem.cpp
+    EventSystemOmpFile.cpp
 )
 
 # libompfile's headers carry the scheduler wire types and the bridge ABI

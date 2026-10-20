@@ -1,5 +1,5 @@
 #include "debug_log.h"
-#include "mpi_io_backend.h"
+#include "mpp_backend.h"
 #include "mpp_shim.h"
 
 #include <cerrno>
@@ -7,13 +7,13 @@
 #include <string>
 #include <vector>
 
-int MPIIOBackend::open(const char *filename) {
+int MppBackend::open(const char *filename) {
   return openWithPlan(filename, nullptr);
 }
 
-int MPIIOBackend::openWithPlan(const char *filename,
-                               const ompfile::OmpFileIOPlan *plan) {
-  if (strict_mpp_init_failed)
+int MppBackend::openWithPlan(const char *filename,
+                             const ompfile::OmpFileIOPlan *plan) {
+  if (settings.strict_mpp_init_failed)
     return failStrictMpp("open");
   int file_id = getNextFileHandle();
   const bool have_open_plan = plan && plan->Status == 0 &&
@@ -32,7 +32,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
     owner_rank_out = -1;
     const auto lock = instrumentedMppCallLock();
     if (have_open_plan) {
-      open_ok = ompfile::mpp::openOnRank(filename, open_flags, 0666,
+      open_ok = ompfile::mpp::openOnRank(filename, settings.open_flags, 0666,
                                          plan->AggregatorRank,
                                          remote_handle_out);
       if (open_ok)
@@ -44,7 +44,7 @@ int MPIIOBackend::openWithPlan(const char *filename,
       }
     }
     if (!open_ok) {
-      open_ok = ompfile::mpp::open(filename, open_flags, 0666,
+      open_ok = ompfile::mpp::open(filename, settings.open_flags, 0666,
                                    remote_handle_out);
       if (open_ok &&
           !ompfile::mpp::handleOwnerRank(remote_handle_out, owner_rank_out)) {
@@ -69,10 +69,10 @@ int MPIIOBackend::openWithPlan(const char *filename,
   }
   {
     const auto lock = instrumentedHandleLock();
-    remote_file_handle_map[file_id] = remote_handle;
-    remote_file_owner_rank_map[file_id] = owner_rank;
-    remote_read_handle_cache[file_id].clear();
-    logical_handle_set.insert(file_id);
+    remote.remote_file_handle_map[file_id] = remote_handle;
+    remote.remote_file_owner_rank_map[file_id] = owner_rank;
+    remote.remote_read_handle_cache[file_id].clear();
+    handles.logical_handle_set.insert(file_id);
     traceHandleStateLocked("open.remote_only.insert", file_id, remote_handle);
   }
   io_log("Remote-only open completed for file_id %d\n", file_id);
@@ -82,8 +82,8 @@ int MPIIOBackend::openWithPlan(const char *filename,
   return file_id;
 }
 
-int MPIIOBackend::write(int file_id, const void *data, size_t size) {
-  if (strict_mpp_init_failed)
+int MppBackend::write(int file_id, const void *data, size_t size) {
+  if (settings.strict_mpp_init_failed)
     return failStrictMpp("write");
   (void)file_id;
   (void)data;
@@ -94,17 +94,18 @@ int MPIIOBackend::write(int file_id, const void *data, size_t size) {
   return -1;
 }
 
-int MPIIOBackend::commit(int file_id) {
+int MppBackend::commit(int file_id) {
   uint64_t commit_path_key = 0;
   {
     const auto lock = instrumentedHandleLock();
-    if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
+    if (handles.logical_handle_set.find(file_id) ==
+        handles.logical_handle_set.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
       errno = EBADF;
       return -1;
     }
-    auto path_key_it = file_path_key_map.find(file_id);
-    if (path_key_it != file_path_key_map.end())
+    auto path_key_it = handles.file_path_key_map.find(file_id);
+    if (path_key_it != handles.file_path_key_map.end())
       commit_path_key = path_key_it->second;
   }
 
@@ -132,8 +133,8 @@ int MPIIOBackend::commit(int file_id) {
   return 0;
 }
 
-int MPIIOBackend::close(int file_id) {
-  if (strict_mpp_init_failed)
+int MppBackend::close(int file_id) {
+  if (settings.strict_mpp_init_failed)
     return failStrictMpp("close");
   io_log("Closing file %d\n", file_id);
   std::vector<int> rebalanced_handles;
@@ -145,37 +146,38 @@ int MPIIOBackend::close(int file_id) {
 
   {
     const auto lock = instrumentedHandleLock();
-    if (logical_handle_set.find(file_id) == logical_handle_set.end()) {
+    if (handles.logical_handle_set.find(file_id) ==
+        handles.logical_handle_set.end()) {
       io_log("Error: Invalid file handle %d\n", file_id);
       traceHandleStateLocked("close.invalid_handle", file_id, -1);
       errno = EBADF;
       return -1;
     }
 
-    auto path_key_it = file_path_key_map.find(file_id);
-    if (path_key_it != file_path_key_map.end())
+    auto path_key_it = handles.file_path_key_map.find(file_id);
+    if (path_key_it != handles.file_path_key_map.end())
       close_path_key = path_key_it->second;
 
-    auto read_cache_it = remote_read_handle_cache.find(file_id);
-    if (read_cache_it != remote_read_handle_cache.end()) {
+    auto read_cache_it = remote.remote_read_handle_cache.find(file_id);
+    if (read_cache_it != remote.remote_read_handle_cache.end()) {
       for (const auto &entry : read_cache_it->second)
         rebalanced_handles.push_back(entry.second);
-      remote_read_handle_cache.erase(read_cache_it);
+      remote.remote_read_handle_cache.erase(read_cache_it);
     }
 
-    file_path_map.erase(file_id);
-    file_path_key_map.erase(file_id);
-    file_write_epoch_history.erase(file_id);
+    handles.file_path_map.erase(file_id);
+    handles.file_path_key_map.erase(file_id);
+    write_epochs.file_write_epoch_history.erase(file_id);
 
-    auto it = remote_file_handle_map.find(file_id);
-    if (it != remote_file_handle_map.end()) {
+    auto it = remote.remote_file_handle_map.find(file_id);
+    if (it != remote.remote_file_handle_map.end()) {
       remote_handle = it->second;
       has_remote_handle = true;
     } else {
-      remote_file_owner_rank_map.erase(file_id);
+      remote.remote_file_owner_rank_map.erase(file_id);
     }
 
-    logical_handle_set.erase(file_id);
+    handles.logical_handle_set.erase(file_id);
     traceHandleStateLocked("close.after_local_erase", file_id, remote_handle);
   }
 
@@ -191,10 +193,11 @@ int MPIIOBackend::close(int file_id) {
       mpp_ret = -1;
     } else {
       const auto lock = instrumentedHandleLock();
-      auto it = remote_file_handle_map.find(file_id);
-      if (it != remote_file_handle_map.end() && it->second == remote_handle)
-        remote_file_handle_map.erase(it);
-      remote_file_owner_rank_map.erase(file_id);
+      auto it = remote.remote_file_handle_map.find(file_id);
+      if (it != remote.remote_file_handle_map.end() &&
+          it->second == remote_handle)
+        remote.remote_file_handle_map.erase(it);
+      remote.remote_file_owner_rank_map.erase(file_id);
     }
   }
 
@@ -228,8 +231,8 @@ int MPIIOBackend::close(int file_id) {
   return 0;
 }
 
-int MPIIOBackend::read(int file_id, void *data, size_t size) {
-  if (strict_mpp_init_failed)
+int MppBackend::read(int file_id, void *data, size_t size) {
+  if (settings.strict_mpp_init_failed)
     return failStrictMpp("read");
   (void)file_id;
   (void)data;
@@ -240,8 +243,8 @@ int MPIIOBackend::read(int file_id, void *data, size_t size) {
   return -1;
 }
 
-int MPIIOBackend::seek(int file_id, long offset) {
-  if (strict_mpp_init_failed)
+int MppBackend::seek(int file_id, long offset) {
+  if (settings.strict_mpp_init_failed)
     return failStrictMpp("seek");
   (void)file_id;
   (void)offset;

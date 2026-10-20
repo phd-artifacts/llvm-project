@@ -1,4 +1,4 @@
-#include "mpi_io_backend.h"
+#include "mpp_backend.h"
 #include "debug_log.h"
 #include "mpp_shim.h"
 
@@ -12,7 +12,53 @@
 #include <unordered_map>
 #include <vector>
 
-int MPIIOBackend::readAtTwoPhase(
+// The two-phase read on ompfile::batch::Batcher (LeaderPerBatch): Fixed or
+// Adaptive window from LIBOMPFILE_OPT_TWO_PHASE_WINDOW_US / _ADAPTIVE, drain
+// of the whole queue, execute = processTwoPhaseBatch. The trace hooks print
+// the lines readAtTwoPhase always printed.
+struct MppBackend::TwoPhaseBatchSite
+    : ompfile::batch::SiteDefaults<MppBackend::TwoPhaseReadRequest> {
+  MppBackend &Backend;
+  explicit TwoPhaseBatchSite(MppBackend &B) : Backend(B) {}
+  ompfile::batch::ClosePolicy closePolicy() {
+    return {Backend.settings.two_phase_window_adaptive
+                ? ompfile::batch::CloseRule::Adaptive
+                : ompfile::batch::CloseRule::Fixed,
+            Backend.settings.two_phase_window_us, 0};
+  }
+  void execute(std::vector<TwoPhaseReadRequest *> &batch) {
+    Backend.processTwoPhaseBatch(batch);
+  }
+  void traceEnqueue(const TwoPhaseReadRequest &r, size_t queue_before,
+                    bool in_progress) {
+    io_trace(
+        "MPIIOBackend::readAtTwoPhase enqueue req=%llu file=%d offset=%ld "
+        "size=%zu queue_before=%zu in_progress=%d\n",
+        static_cast<unsigned long long>(r.DebugRequestId), r.FileHandle,
+        r.Offset, r.Size, queue_before, static_cast<int>(in_progress));
+  }
+  void traceLeader(const TwoPhaseReadRequest &r, size_t queue_size) {
+    io_trace("MPIIOBackend::readAtTwoPhase leader req=%llu queue_size=%zu "
+             "window_us=%llu\n",
+             static_cast<unsigned long long>(r.DebugRequestId), queue_size,
+             static_cast<unsigned long long>(
+                 Backend.settings.two_phase_window_us));
+  }
+  void traceDrained(const TwoPhaseReadRequest &r, size_t batch_size,
+                    size_t queue_after) {
+    io_trace("MPIIOBackend::readAtTwoPhase leader req=%llu draining batch "
+             "size=%zu queue_after_drain=%zu\n",
+             static_cast<unsigned long long>(r.DebugRequestId), batch_size,
+             queue_after);
+  }
+  void traceFollowerWait(const TwoPhaseReadRequest &r, size_t queue_size) {
+    io_trace("MPIIOBackend::readAtTwoPhase follower wait req=%llu "
+             "queue_size=%zu\n",
+             static_cast<unsigned long long>(r.DebugRequestId), queue_size);
+  }
+};
+
+int MppBackend::readAtTwoPhase(
     const ompfile::OmpFileReadRequestContext &context, void *data,
     size_t size) {
   // Keep zero-length reads on the validated fallback path so invalid handles
@@ -38,115 +84,10 @@ int MPIIOBackend::readAtTwoPhase(
   request.PathKey = request_key;
   request.Hint = context.Hint;
 
-  // Counts the threads inside the two-phase read path, so an adaptive leader
-  // can tell whether any follower could still arrive.
-  struct ActiveReaderGuard {
-    std::atomic<uint32_t> &count;
-    explicit ActiveReaderGuard(std::atomic<uint32_t> &c) : count(c) {
-      count.fetch_add(1, std::memory_order_acq_rel);
-    }
-    ~ActiveReaderGuard() { count.fetch_sub(1, std::memory_order_acq_rel); }
-  } active_reader(two_phase_active_readers);
-
-  const auto enqueue_ts = std::chrono::steady_clock::now();
-  std::vector<TwoPhaseReadRequest *> batch;
-  std::unique_lock<std::mutex> lock(two_phase_mutex);
-  const size_t queue_size_before = two_phase_queue.size();
-  updateAtomicMax(two_phase_queue_max_depth,
-                  static_cast<uint64_t>(queue_size_before + 1));
-  io_trace("MPIIOBackend::readAtTwoPhase enqueue req=%llu file=%d offset=%ld "
-           "size=%zu queue_before=%zu in_progress=%d\n",
-           static_cast<unsigned long long>(request.DebugRequestId),
-           request.FileHandle, request.Offset, request.Size, queue_size_before,
-           static_cast<int>(two_phase_batch_in_progress));
-  two_phase_queue.push_back(&request);
-  two_phase_queue_cv.notify_all();
-
-  while (!request.Done) {
-    if (!two_phase_batch_in_progress) {
-      two_phase_batch_in_progress = true;
-      two_phase_leader_turn_count.fetch_add(1, std::memory_order_relaxed);
-      io_trace("MPIIOBackend::readAtTwoPhase leader req=%llu queue_size=%zu "
-               "window_us=%llu\n",
-               static_cast<unsigned long long>(request.DebugRequestId),
-               two_phase_queue.size(),
-               static_cast<unsigned long long>(two_phase_window_us));
-
-      const bool nobody_can_join =
-          two_phase_window_adaptive && two_phase_queue.size() <= 1 &&
-          two_phase_active_readers.load(std::memory_order_acquire) <= 1;
-      if (two_phase_window_us > 0 && !nobody_can_join) {
-        const auto window_wait_begin = std::chrono::steady_clock::now();
-        waitForTwoPhaseCollectionWindow(lock, two_phase_window_us);
-        const auto window_wait_end = std::chrono::steady_clock::now();
-        const auto window_wait_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                window_wait_end - window_wait_begin)
-                .count();
-        if (window_wait_us > 0) {
-          two_phase_window_wait_us_total.fetch_add(
-              static_cast<uint64_t>(window_wait_us),
-              std::memory_order_relaxed);
-        }
-      }
-
-      while (!two_phase_queue.empty()) {
-        batch.push_back(two_phase_queue.front());
-        two_phase_queue.pop_front();
-      }
-      io_trace("MPIIOBackend::readAtTwoPhase leader req=%llu draining batch "
-               "size=%zu queue_after_drain=%zu\n",
-               static_cast<unsigned long long>(request.DebugRequestId),
-               batch.size(), two_phase_queue.size());
-
-      lock.unlock();
-      const auto batch_exec_begin = std::chrono::steady_clock::now();
-      processTwoPhaseBatch(batch);
-      const auto batch_exec_end = std::chrono::steady_clock::now();
-      const auto batch_exec_us =
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              batch_exec_end - batch_exec_begin)
-              .count();
-      if (batch_exec_us > 0) {
-        two_phase_batch_exec_us_total.fetch_add(
-            static_cast<uint64_t>(batch_exec_us), std::memory_order_relaxed);
-      }
-      batch.clear();
-      lock.lock();
-
-      two_phase_batch_in_progress = false;
-      two_phase_queue_cv.notify_all();
-    } else {
-      two_phase_follower_wait_count.fetch_add(1, std::memory_order_relaxed);
-      io_trace("MPIIOBackend::readAtTwoPhase follower wait req=%llu "
-               "queue_size=%zu\n",
-               static_cast<unsigned long long>(request.DebugRequestId),
-               two_phase_queue.size());
-      const auto follower_wait_begin = std::chrono::steady_clock::now();
-      two_phase_queue_cv.wait(lock, [this, &request] {
-        return request.Done || !two_phase_batch_in_progress;
-      });
-      const auto follower_wait_end = std::chrono::steady_clock::now();
-      const auto follower_wait_us =
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              follower_wait_end - follower_wait_begin)
-              .count();
-      if (follower_wait_us > 0) {
-        two_phase_follower_wait_us_total.fetch_add(
-            static_cast<uint64_t>(follower_wait_us),
-            std::memory_order_relaxed);
-      }
-    }
-  }
-
-  const auto done_ts = std::chrono::steady_clock::now();
-  const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           done_ts - enqueue_ts)
-                           .count();
-  if (wait_us > 0) {
-    two_phase_request_wait_us_total.fetch_add(static_cast<uint64_t>(wait_us),
-                                              std::memory_order_relaxed);
-  }
+  // Queue, leader election, collection window and per-member completion
+  // live in ompfile_batcher.h; TwoPhaseBatchSite binds this path to them.
+  TwoPhaseBatchSite site(*this);
+  const int64_t wait_us = two_phase_batcher.submit(request, site);
   if (request.Status != 0) {
     errno = request.Errno;
     io_trace("MPIIOBackend::readAtTwoPhase done req=%llu status=%d errno=%d "
@@ -162,25 +103,14 @@ int MPIIOBackend::readAtTwoPhase(
   return 0;
 }
 
-void MPIIOBackend::waitForTwoPhaseCollectionWindow(
-    std::unique_lock<std::mutex> &lock, uint64_t window_us) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::microseconds(window_us);
-  // Enqueue and completion notifications serve followers, but they must not
-  // shorten the leader's configured collection window. The predicate remains
-  // false so wait_until resumes waiting after both notifications and spurious
-  // wakeups, returning only when the absolute deadline is reached.
-  two_phase_queue_cv.wait_until(lock, deadline, [] { return false; });
-}
-
-void MPIIOBackend::processTwoPhaseBatch(
+void MppBackend::processTwoPhaseBatch(
     std::vector<TwoPhaseReadRequest *> &batch) {
   if (batch.empty())
     return;
 
   io_trace("MPIIOBackend::processTwoPhaseBatch enter this=%p batch_size=%zu\n",
            static_cast<void *>(this), batch.size());
-  two_phase_batch_count.fetch_add(1, std::memory_order_relaxed);
+  counters.two_phase_batch_count.fetch_add(1, std::memory_order_relaxed);
 
   std::unordered_map<uint64_t, std::vector<TwoPhaseReadRequest *>> grouped;
   grouped.reserve(batch.size());
@@ -193,7 +123,7 @@ void MPIIOBackend::processTwoPhaseBatch(
     processTwoPhaseGroup(entry.second);
 }
 
-void MPIIOBackend::processTwoPhaseGroup(
+void MppBackend::processTwoPhaseGroup(
     std::vector<TwoPhaseReadRequest *> &group) {
   if (group.empty())
     return;
@@ -212,13 +142,6 @@ void MPIIOBackend::processTwoPhaseGroup(
            group[dbg_i]->ClientRank);
   }
 
-  std::sort(group.begin(), group.end(),
-            [](const TwoPhaseReadRequest *lhs, const TwoPhaseReadRequest *rhs) {
-              if (lhs->Offset != rhs->Offset)
-                return lhs->Offset < rhs->Offset;
-              return lhs->Size < rhs->Size;
-            });
-
   struct CoalescedRead {
     long Start = 0;
     long End = 0;
@@ -233,52 +156,13 @@ void MPIIOBackend::processTwoPhaseGroup(
   };
 
   std::vector<CoalescedRead> coalesced;
-  coalesced.reserve(group.size());
-  for (TwoPhaseReadRequest *request : group) {
-    if (request->Offset < 0) {
-      completeTwoPhaseRequest(*request, -1, EINVAL);
-      continue;
-    }
-    if (request->Size >
-            static_cast<size_t>(std::numeric_limits<long>::max()) ||
-        request->Offset >
-            std::numeric_limits<long>::max() -
-                static_cast<long>(request->Size)) {
-      completeTwoPhaseRequest(*request, -1, EOVERFLOW);
-      continue;
-    }
-
-    const long start = request->Offset;
-    const long end = start + static_cast<long>(request->Size);
-    if (coalesced.empty()) {
-      CoalescedRead item{};
-      item.Start = start;
-      item.End = end;
-      item.Requests.push_back(request);
-      coalesced.push_back(std::move(item));
-      continue;
-    }
-
-    CoalescedRead &tail = coalesced.back();
-    const bool contiguous = start <= tail.End;
-    const long merged_end = std::max(tail.End, end);
-    const uint64_t merged_size =
-        static_cast<uint64_t>(merged_end - tail.Start);
-    const bool exceeds_max_batch =
-        two_phase_max_batch_bytes > 0 && merged_size > two_phase_max_batch_bytes;
-
-    if (contiguous && !exceeds_max_batch) {
-      tail.End = merged_end;
-      tail.Requests.push_back(request);
-      continue;
-    }
-
-    CoalescedRead item{};
-    item.Start = start;
-    item.End = end;
-    item.Requests.push_back(request);
-    coalesced.push_back(std::move(item));
-  }
+  ompfile::batch::coalesceSortedRuns(
+      group, settings.two_phase_max_batch_bytes, coalesced,
+      [](const TwoPhaseReadRequest &r) { return r.Offset; },
+      [](const TwoPhaseReadRequest &r) { return r.Size; },
+      [this](TwoPhaseReadRequest &r, int errnum) {
+        completeTwoPhaseRequest(r, -1, errnum);
+      });
   if (coalesced.empty())
     return;
 
@@ -308,7 +192,7 @@ void MPIIOBackend::processTwoPhaseGroup(
     segment.Offset = item.Start;
     segment.Size = static_cast<uint64_t>(computeTwoPhaseTargetReadSize(
         item.Start, item.End, item.Requests.size(), /*remote_only=*/true,
-        two_phase_sieve_bytes, two_phase_max_batch_bytes));
+        settings.two_phase_sieve_bytes, settings.two_phase_max_batch_bytes));
     segment.PathKey = item.Requests.front()->PathKey;
     segment.SegmentFlags = item.Requests.front()->Hint.HintFlags;
     segment.EpochId = item.Requests.front()->Hint.EpochId;
@@ -323,7 +207,7 @@ void MPIIOBackend::processTwoPhaseGroup(
            "batch_id=%llu\n",
            coalesced.size(),
            static_cast<unsigned long long>(batch_request.BatchId));
-  if (sched_once_per_handle) {
+  if (settings.sched_once_per_handle) {
     // No planner round trip: every segment continues on the opened-handle
     // owner path, which is what the client does with a non-rebalanced plan
     // anyway. Nothing to record; `planner_batches=` stays at 0 as evidence.
@@ -332,17 +216,19 @@ void MPIIOBackend::processTwoPhaseGroup(
              static_cast<unsigned long long>(batch_request.BatchId));
   } else if (ompfile::mpp::schedBatchRequest(batch_request, batch_segments,
                                              batch_plan, batch_entries)) {
-    two_phase_planner_batch_count.fetch_add(1, std::memory_order_relaxed);
-    two_phase_planner_segment_count.fetch_add(batch_entries.size(),
-                                              std::memory_order_relaxed);
+    counters.two_phase_planner_batch_count.fetch_add(1,
+                                                     std::memory_order_relaxed);
+    counters.two_phase_planner_segment_count.fetch_add(
+        batch_entries.size(), std::memory_order_relaxed);
     if ((batch_plan.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_SCALAR_FALLBACK) !=
         0) {
-      two_phase_planner_scalar_fallback_count.fetch_add(
+      counters.two_phase_planner_scalar_fallback_count.fetch_add(
           1, std::memory_order_relaxed);
     }
 
     if (batch_entries.size() != coalesced.size()) {
-      two_phase_planner_error_count.fetch_add(1, std::memory_order_relaxed);
+      counters.two_phase_planner_error_count.fetch_add(
+          1, std::memory_order_relaxed);
       io_log("Two-phase planner returned mismatched entry count: expected=%zu "
              "actual=%zu\n",
              coalesced.size(), batch_entries.size());
@@ -355,10 +241,10 @@ void MPIIOBackend::processTwoPhaseGroup(
         const ompfile::OmpFileIOBatchPlanEntry &entry = batch_entries[i];
         CoalescedRead &item = coalesced[i];
         if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_FILE_AFFINITY) != 0)
-          two_phase_planner_affinity_count.fetch_add(1,
-                                                     std::memory_order_relaxed);
+          counters.two_phase_planner_affinity_count.fetch_add(
+              1, std::memory_order_relaxed);
         if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_REBALANCED) != 0)
-          two_phase_planner_rebalanced_count.fetch_add(
+          counters.two_phase_planner_rebalanced_count.fetch_add(
               1, std::memory_order_relaxed);
         if ((entry.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_REBALANCED) != 0) {
           item.PlannerRebalanced = true;
@@ -392,13 +278,14 @@ void MPIIOBackend::processTwoPhaseGroup(
       }
     }
   } else {
-    two_phase_planner_error_count.fetch_add(1, std::memory_order_relaxed);
+    counters.two_phase_planner_error_count.fetch_add(1,
+                                                     std::memory_order_relaxed);
     io_trace("MPIIOBackend::processTwoPhaseGroup planner failed batch_id=%llu\n",
              static_cast<unsigned long long>(batch_request.BatchId));
   }
 
-  two_phase_coalesced_read_count.fetch_add(coalesced.size(),
-                                           std::memory_order_relaxed);
+  counters.two_phase_coalesced_read_count.fetch_add(coalesced.size(),
+                                                    std::memory_order_relaxed);
 
   for (CoalescedRead &item : coalesced) {
     if (item.Skip) {
@@ -413,9 +300,9 @@ void MPIIOBackend::processTwoPhaseGroup(
 
     const size_t read_size = computeTwoPhaseTargetReadSize(
         item.Start, item.End, item.Requests.size(), /*remote_only=*/true,
-        two_phase_sieve_bytes, two_phase_max_batch_bytes);
-    two_phase_coalesced_bytes_total.fetch_add(read_size,
-                                              std::memory_order_relaxed);
+        settings.two_phase_sieve_bytes, settings.two_phase_max_batch_bytes);
+    counters.two_phase_coalesced_bytes_total.fetch_add(
+        read_size, std::memory_order_relaxed);
     std::vector<char> buffer(read_size);
     size_t bytes_read = 0;
 
@@ -451,9 +338,9 @@ void MPIIOBackend::processTwoPhaseGroup(
       } else {
         rc = -1;
         read_errno = fallback_errno != 0 ? fallback_errno : EAGAIN;
-        two_phase_planner_rebalanced_conflict_count.fetch_add(
+        counters.two_phase_planner_rebalanced_conflict_count.fetch_add(
             1, std::memory_order_relaxed);
-        two_phase_planner_rebalanced_skipped_count.fetch_add(
+        counters.two_phase_planner_rebalanced_skipped_count.fetch_add(
             1, std::memory_order_relaxed);
         io_log("Rebalanced segment fallback file=%d target_rank=%d offset=%ld "
                "size=%zu reason=%s errno=%d\n",
@@ -462,12 +349,12 @@ void MPIIOBackend::processTwoPhaseGroup(
       }
 
       if (remote_rebalanced_ok) {
-        two_phase_planner_rebalanced_applied_count.fetch_add(
+        counters.two_phase_planner_rebalanced_applied_count.fetch_add(
             1, std::memory_order_relaxed);
         noteAppliedRebalancedReadForFile(file_id);
       } else if (eligible_for_rebalance) {
         read_errno = errno != 0 ? errno : EIO;
-        two_phase_planner_rebalanced_skipped_count.fetch_add(
+        counters.two_phase_planner_rebalanced_skipped_count.fetch_add(
             1, std::memory_order_relaxed);
         io_log("Rebalanced segment fallback file=%d target_rank=%d offset=%ld "
                "size=%zu reason=remote-read-fail errno=%d\n",
@@ -519,24 +406,22 @@ void MPIIOBackend::processTwoPhaseGroup(
   }
 }
 
-uint64_t MPIIOBackend::getTwoPhaseGroupKey(
+uint64_t MppBackend::getTwoPhaseGroupKey(
     const TwoPhaseReadRequest &request) const {
   return request.PathKey;
 }
 
-void MPIIOBackend::completeTwoPhaseRequest(TwoPhaseReadRequest &request,
-                                           int status, int errnum) {
-  const std::lock_guard<std::mutex> lock(two_phase_mutex);
-  request.Status = status;
-  request.Errno = errnum;
-  request.Done = true;
-  io_trace("MPIIOBackend::completeTwoPhaseRequest req=%llu file=%d offset=%ld "
-           "size=%zu status=%d errno=%d\n",
-           static_cast<unsigned long long>(request.DebugRequestId),
-           request.FileHandle, request.Offset, request.Size, status, errnum);
-  two_phase_queue_cv.notify_all();
+void MppBackend::completeTwoPhaseRequest(TwoPhaseReadRequest &request,
+                                         int status, int errnum) {
+  two_phase_batcher.complete(request, status, errnum, [&] {
+    io_trace(
+        "MPIIOBackend::completeTwoPhaseRequest req=%llu file=%d offset=%ld "
+        "size=%zu status=%d errno=%d\n",
+        static_cast<unsigned long long>(request.DebugRequestId),
+        request.FileHandle, request.Offset, request.Size, status, errnum);
+  });
 }
 
-bool MPIIOBackend::isTwoPhaseActive() const {
-  return two_phase_enabled;
+bool MppBackend::isTwoPhaseActive() const {
+  return settings.two_phase_enabled;
 }

@@ -29,7 +29,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "EventSystem.h"
+#include "EventSystemOmpFile.h"
 
 class OmpFileHeadnodeManager {
 public:
@@ -84,13 +84,6 @@ public:
 
   static OmpFileHeadnodeManager &instance();
 
-  // Public path-key hash for callers outside the manager (e.g. the proxy
-  // computing a path key for a dirty-flush completion). Mirrors the private
-  // computePathKey so the canonical FNV-1a hashing stays in one place.
-  static uint64_t computePathKeyForPath(std::string_view Path) {
-    return computePathKey(Path);
-  }
-
   /// WorkerCount is the size of the proxy partition (ranks [0, WorkerCount)
   /// are the I/O workers this manager may hand out); origin ranks above it
   /// are clients, never aggregators.
@@ -141,9 +134,6 @@ public:
 private:
   OmpFileHeadnodeManager() = default;
 
-  static uint64_t computePathKey(std::string_view Path);
-  static uint64_t parseUint64Env(const char *Name, uint64_t DefaultValue);
-  static bool parseBoolEnv(const char *Name, bool DefaultValue);
   bool segmentRangesOverlap(int64_t ReadOffset, uint64_t ReadSize,
                             int64_t WriteOffset, uint64_t WriteSize) const;
   uint64_t nextWriteSequenceUnlocked();

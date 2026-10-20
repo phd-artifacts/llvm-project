@@ -28,6 +28,7 @@ add_target_library(omptarget.rtl.mpi MPI)
 
 target_sources(omptarget.rtl.mpi PRIVATE
   src/rtl.cpp
+  src/OriginOmpFileBridge.cpp
 )
 
 target_link_libraries(omptarget.rtl.mpi PRIVATE
@@ -106,6 +107,12 @@ configure_file(
 
 llvm_add_tool(OPENMP llvm-offload-mpi-proxy-device
   src/ProxyDevice.cpp
+  src/ProxyOmpFileConfig.cpp
+  src/ProxyOmpFileStage.cpp
+  src/ProxyOmpFileServer.cpp
+  src/ProxyOmpFileStats.cpp
+  src/ProxyOmpFileForward.cpp
+  src/ProxyOmpFileBridge.cpp
   src/OmpFileHeadnodeManager.cpp
   src/RemotePluginManager.cpp
   ${LIBOMPTARGET_SRC_DIR}/OpenMP/OMPT/Callback.cpp

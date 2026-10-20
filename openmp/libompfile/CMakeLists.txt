@@ -9,7 +9,7 @@ add_compile_definitions(OMP_IO_DEBUG)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/OmpFileSources.cmake)
 add_library(ompfile SHARED
     ${OMPFILE_FRONTEND_SOURCES_REL}
-    ${OMPFILE_MPI_BACKEND_SOURCES_REL}
+    ${OMPFILE_MPP_BACKEND_SOURCES_REL}
 )
 
 find_package(MPI REQUIRED)
@@ -80,9 +80,10 @@ add_custom_target(copy_ompfile_headers ALL
     DEPENDS "${CMAKE_BINARY_DIR}/include/file_interface.h"
 )
 
-# Unit tests of the pure units (wire codec, extent algebra, env readers). A
-# plain executable in the default target, so every runtime build compiles it;
-# the cluster build jobs run it after the build.
+# Unit tests of the pure units (wire codec, extent algebra, env readers, keys,
+# batcher, route resolution). A plain executable in the default target, so
+# every runtime build compiles it; the cluster build jobs run it after the
+# build.
 option(OMPFILE_BUILD_UNIT_TESTS "Build libompfile's unit tests (tests/)" ON)
 if (OMPFILE_BUILD_UNIT_TESTS)
     enable_testing()

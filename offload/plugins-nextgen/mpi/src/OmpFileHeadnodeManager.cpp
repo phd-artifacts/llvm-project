@@ -8,6 +8,9 @@
 
 #include "OmpFileHeadnodeManager.h"
 
+#include "ompfile_keys.h"
+#include "ompfile_config.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
@@ -20,46 +23,6 @@
 OmpFileHeadnodeManager &OmpFileHeadnodeManager::instance() {
   static OmpFileHeadnodeManager Manager;
   return Manager;
-}
-
-uint64_t OmpFileHeadnodeManager::computePathKey(std::string_view Path) {
-  constexpr uint64_t OffsetBasis = 1469598103934665603ULL;
-  constexpr uint64_t Prime = 1099511628211ULL;
-
-  uint64_t Hash = OffsetBasis;
-  for (const unsigned char C : Path) {
-    Hash ^= static_cast<uint64_t>(C);
-    Hash *= Prime;
-  }
-  return Hash;
-}
-
-uint64_t OmpFileHeadnodeManager::parseUint64Env(const char *Name,
-                                                 uint64_t DefaultValue) {
-  const char *Env = std::getenv(Name);
-  if (!Env)
-    return DefaultValue;
-
-  errno = 0;
-  char *End = nullptr;
-  const unsigned long long Value = std::strtoull(Env, &End, 10);
-  if (errno != 0 || End == Env || (End && *End != '\0'))
-    return DefaultValue;
-
-  return static_cast<uint64_t>(Value);
-}
-
-bool OmpFileHeadnodeManager::parseBoolEnv(const char *Name,
-                                          bool DefaultValue) {
-  const char *Env = std::getenv(Name);
-  if (!Env)
-    return DefaultValue;
-
-  if (Env[0] == '\0')
-    return false;
-  if (Env[0] == '0' && Env[1] == '\0')
-    return false;
-  return true;
 }
 
 bool OmpFileHeadnodeManager::isFreshnessTraceEnabled() const {
@@ -204,22 +167,14 @@ void OmpFileHeadnodeManager::initialize(int NewWorkerCount,
 
   WorkerCount = std::max(NewWorkerCount, 1);
   HeadnodeRank = NewHeadnodeRank;
-  MaxAffinityLoadSkew = parseUint64Env(
-      "LIBOMPFILE_SCHED_MAX_AFFINITY_LOAD_SKEW",
-      std::numeric_limits<uint64_t>::max());
-  BatchStatsReportEvery =
-      std::max<uint64_t>(1, parseUint64Env("LIBOMPFILE_SCHED_STATS_REPORT_EVERY",
-                                           128));
-  UsePlannedLoadForSkew =
-      parseUint64Env("LIBOMPFILE_SCHED_USE_PLANNED_LOAD_FOR_SKEW", 0) != 0;
-  SpreadSamePathOpens =
-      parseUint64Env("LIBOMPFILE_MPP_OPEN_SPREAD", 0) != 0;
-  FreshnessTraceEnabled = parseBoolEnv("LIBOMPFILE_FRESHNESS_TRACE", false);
-  {
-    // Same rule as every other LIBOMPFILE_DEBUG_TRACE reader: exactly "1".
-    const char *TraceEnv = std::getenv("LIBOMPFILE_DEBUG_TRACE");
-    SchedTraceEnabled = TraceEnv && TraceEnv[0] == '1' && TraceEnv[1] == '\0';
-  }
+  const ompfile::config::HeadnodeConfig Cfg =
+      ompfile::config::HeadnodeConfig::fromEnvironment();
+  MaxAffinityLoadSkew = Cfg.MaxAffinityLoadSkew;
+  BatchStatsReportEvery = Cfg.BatchStatsReportEvery;
+  UsePlannedLoadForSkew = Cfg.UsePlannedLoadForSkew;
+  SpreadSamePathOpens = Cfg.SpreadSamePathOpens;
+  FreshnessTraceEnabled = Cfg.FreshnessTrace;
+  SchedTraceEnabled = Cfg.SchedTrace;
   ensureHandlersUnlocked();
   Initialized = true;
 }
@@ -783,7 +738,7 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
                                                          : 0);
     auto [It, Inserted] = GlobalFileTable.try_emplace(std::string(PathView));
     GlobalFileEntry &Entry = It->second;
-    const uint64_t PathKey = computePathKey(PathView);
+    const uint64_t PathKey = ompfile::keys::pathKey(PathView);
 
     if (Inserted)
       Entry.GlobalFileId = NextGlobalFileId++;
@@ -837,7 +792,7 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
       std::string_view PathView(Path,
                                 Request.PathSize > 0 ? Request.PathSize - 1 : 0);
       if (!PathView.empty()) {
-        PathKey = computePathKey(PathView);
+        PathKey = ompfile::keys::pathKey(PathView);
         HasPathKey = true;
       }
     }

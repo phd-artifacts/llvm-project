@@ -2,12 +2,14 @@
 #define OMPFILE_ENV_H
 
 // One set of environment-knob readers for the client library (libompfile)
-// and the proxy (ProxyDevice.cpp). Both sides used to carry their own copies
-// with different acceptance rules; the one documented difference that
+// and the proxy (ProxyOmpFile*.cpp). Both sides used to carry their own
+// copies with different acceptance rules; the one documented difference that
 // mattered (the proxy accepting "writeback" for LIBOMPFILE_STAGE_WRITE_MODE
 // while the client required "write-back") lives here once, in
 // normalizeStageWriteMode. Knob semantics are documented in
 // docs/runtime-configuration.md.
+// The rules live here; the parsed-once snapshots consumers read are in
+// ompfile_config.h.
 
 #include <cassert>
 #include <cerrno>
@@ -50,6 +52,20 @@ inline bool equals(const char *name, const char *expected) {
   return value && std::strcmp(value, expected) == 0;
 }
 
+// NAME's raw value. True, with *out set to the value, when NAME is set (even
+// to the empty string); false, with *out cleared, when it is unset.
+inline bool raw(const char *name, std::string *out) {
+  const char *value = std::getenv(name);
+  if (!value) {
+    if (out)
+      out->clear();
+    return false;
+  }
+  if (out)
+    *out = value;
+  return true;
+}
+
 // Strictly positive decimal that fits an unsigned; the default (0 unless
 // given) for unset, empty, garbage, zero, a trailing suffix or overflow.
 inline unsigned positiveOr(const char *name, unsigned default_value = 0) {
@@ -65,17 +81,30 @@ inline unsigned positiveOr(const char *name, unsigned default_value = 0) {
   return static_cast<unsigned>(parsed);
 }
 
+// The strict decimal rule behind uint64Or (and the backend's integer knobs):
+// errno = 0, then strtoull; valid iff errno stays 0, at least one digit was
+// read and nothing follows. strtoull's own leniency stays (leading
+// whitespace, a sign: "-1" is UINT64_MAX). *out is written only when valid.
+inline bool parseUint64Strict(const char *value, uint64_t *out) {
+  if (!value)
+    return false;
+  char *end = nullptr;
+  errno = 0;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (errno != 0 || end == value || (end && *end != '\0'))
+    return false;
+  if (out)
+    *out = static_cast<uint64_t>(parsed);
+  return true;
+}
+
 // Whole decimal; the default for unset, empty, garbage or a trailing suffix.
 inline uint64_t uint64Or(const char *name, uint64_t default_value) {
   const char *value = std::getenv(name);
   if (!value || value[0] == '\0')
     return default_value;
-  char *end = nullptr;
-  errno = 0;
-  const unsigned long long parsed = std::strtoull(value, &end, 10);
-  if (errno != 0 || end == value || (end && *end != '\0'))
-    return default_value;
-  return static_cast<uint64_t>(parsed);
+  uint64_t parsed = 0;
+  return parseUint64Strict(value, &parsed) ? parsed : default_value;
 }
 
 inline double doubleOr(const char *name, double default_value) {
@@ -95,6 +124,38 @@ inline std::string stringOr(const char *name, const char *default_value) {
   if (!value || value[0] == '\0')
     return default_value ? std::string(default_value) : std::string();
   return value;
+}
+
+// Unset -> the default; empty or exactly "0" -> false; any other value,
+// "false" included, -> true. The headnode's LIBOMPFILE_FRESHNESS_TRACE rule.
+inline bool setAndNotZeroOr(const char *name, bool default_value) {
+  const char *value = std::getenv(name);
+  if (!value)
+    return default_value;
+  if (value[0] == '\0')
+    return false;
+  if (value[0] == '0' && value[1] == '\0')
+    return false;
+  return true;
+}
+
+// On unless exactly "0" (unset and empty are on): LIBOMPFILE_DEBUG,
+// LIBOMPFILE_OPEN_FAILURE_DIAG.
+inline bool onUnlessZero(const char *name) { return !equals(name, "0"); }
+
+// Leading-decimal rule (strtol prefix): unset or empty -> the default;
+// otherwise the parsed prefix when at least one digit was read and it is
+// positive, else the default. Trailing text is ignored ("4abc" is 4) and
+// errno is not reset. LIBOMPFILE_ASYNC_QUEUE_DEPTH.
+inline long positiveLongPrefixOr(const char *name, long default_value) {
+  const char *value = std::getenv(name);
+  if (!value || value[0] == '\0')
+    return default_value;
+  char *end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end != value && parsed > 0)
+    return parsed;
+  return default_value;
 }
 
 // Stage write policy, normalized to "write-through", "write-back" or "off".
@@ -164,8 +225,9 @@ inline unsigned writebackDistributeRankCount() {
 // proxy: LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES=1 and a rank count above
 // 1. WRITES=1 without such a count is a configuration error: routing stays
 // off and *misconfigured is set, so libompfile's backend init can print its
-// one error line; every other caller stays silent. Not cached: it reads the
-// environment on every call.
+// one error line; every other caller stays silent. The parser behind
+// SharedConfig::WritebackDistributeActive; runtime consumers read the
+// snapshot (ompfile_config.h).
 inline bool writebackDistributeActive(bool *misconfigured = nullptr) {
   if (misconfigured)
     *misconfigured = false;

@@ -10,6 +10,8 @@
 #include <thread>
 #include <unistd.h>
 
+#include "ompfile_env.h"
+
 // -DOMP_IO_DEBUG should enable the logging
 #ifdef OMP_IO_DEBUG
 constexpr bool kOmpIoDebug = true;
@@ -20,10 +22,7 @@ constexpr bool kOmpIoDebug = false;
 inline bool io_trace_enabled() {
   if (!kOmpIoDebug)
     return false;
-  static const bool enabled = []() {
-    const char *env = std::getenv("LIBOMPFILE_DEBUG_TRACE");
-    return env && env[0] == '1' && env[1] == '\0';
-  }();
+  static const bool enabled = ompfile::env::flag("LIBOMPFILE_DEBUG_TRACE");
   return enabled;
 }
 
@@ -40,10 +39,7 @@ inline uint64_t io_next_trace_seq() {
 // LIBOMPFILE_DEBUG=0 silences io_log at run time. Unset keeps every line
 // the lanes have always seen (the compile-time OMP_IO_DEBUG default is on).
 inline bool io_log_enabled() {
-  static const bool enabled = []() {
-    const char *env = std::getenv("LIBOMPFILE_DEBUG");
-    return !(env && env[0] == '0' && env[1] == '\0');
-  }();
+  static const bool enabled = ompfile::env::onUnlessZero("LIBOMPFILE_DEBUG");
   return enabled;
 }
 

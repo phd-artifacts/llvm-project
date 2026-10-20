@@ -2,9 +2,10 @@
 #define OMPFILE_MPP_ABI_H
 
 // The C ABI between libompfile's MPP shim (mpp_shim.cpp, which resolves every
-// entrypoint with dlsym) and the MPI plugin's two runtime bridges: rtl.cpp on
-// the origin rank (omptarget.rtl.mpi) and ProxyDevice.cpp on a proxy rank
-// (llvm-offload-mpi-proxy-device). The test hook
+// entrypoint with dlsym) and the MPI plugin's two runtime bridges:
+// src/OriginOmpFileBridge.cpp on the origin rank (omptarget.rtl.mpi) and
+// src/ProxyOmpFileBridge.cpp on a proxy rank (llvm-offload-mpi-proxy-device),
+// which forwards to ProxyOmpFile. The test hook
 // ompfile_freshness_query_proxy_test_hook.cpp stubs a subset for the
 // out-of-tree regression apps.
 //
@@ -14,13 +15,14 @@
 // below, so a signature that drifts between the sides is a compile error in
 // the TU that drifted, not a silent mismatch at run time.
 //
-// Adding an entrypoint: one row here, then the definition in rtl.cpp (origin
-// side) and/or ProxyDevice.cpp (proxy side). A side that does not define a
-// row yields a null pointer to the shim there. Five rows are proxy-only:
-// handle_owner_rank, pread_no_stage_ex, dirty_owner_pread_ex,
-// dirty_owner_pread_batch_ex and dirty_owner_query_ex. The shim treats each
-// as optional: preadNoStageEx falls back to preadEx, the others fail with
-// ENOSYS. The origin's offload/src/exports must list exactly the rows rtl.cpp
+// Adding an entrypoint: one row here, then the definition in
+// src/OriginOmpFileBridge.cpp (origin side) and/or src/ProxyOmpFileBridge.cpp
+// (proxy side). A side that does not define a row yields a null pointer to
+// the shim there. Five rows are proxy-only: handle_owner_rank,
+// pread_no_stage_ex, dirty_owner_pread_ex, dirty_owner_pread_batch_ex and
+// dirty_owner_query_ex. The shim treats each as optional: preadNoStageEx
+// falls back to preadEx, the others fail with ENOSYS. The origin's
+// offload/src/exports must list exactly the rows src/OriginOmpFileBridge.cpp
 // defines.
 
 #include "ompfile_sched.h"

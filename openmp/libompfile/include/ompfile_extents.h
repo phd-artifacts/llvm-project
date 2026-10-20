@@ -4,7 +4,7 @@
 // Byte-range extent algebra of the proxy stage: which [Begin, End) ranges of
 // a staged file are covered, merged as they are added, split as they are
 // removed. Pure functions over a sorted, non-overlapping vector, moved out
-// of ProxyDevice so they can be unit-tested; ProxyDevice keeps thin
+// of ProxyOmpFile so they can be unit-tested; ProxyOmpFile keeps thin
 // forwarders at its call sites.
 
 #include <algorithm>

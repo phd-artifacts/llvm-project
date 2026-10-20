@@ -1,163 +1,179 @@
-#include "mpi_io_backend.h"
+#include "mpp_backend.h"
 #include "debug_log.h"
 
 #include <atomic>
 
-bool MPIIOBackend::shouldReportStats() {
-  return parseBoolEnv("LIBOMPFILE_OPT_STATS", false);
+bool MppBackend::shouldReportStats() const {
+  return resolveBoolKnob(config_.OptStats);
 }
 
-void MPIIOBackend::reportPhase0Stats() const {
-  if (!two_phase_enabled && !shouldReportStats())
+void MppBackend::reportPhase0Stats() const {
+  if (!settings.two_phase_enabled && !shouldReportStats())
     return;
 
   const uint64_t pread_reqs =
-      pread_request_count.load(std::memory_order_relaxed);
+      counters.pread_request_count.load(std::memory_order_relaxed);
   const uint64_t remote_events =
-      remote_pread_event_count.load(std::memory_order_relaxed);
+      counters.remote_pread_event_count.load(std::memory_order_relaxed);
   const uint64_t remote_bytes =
-      remote_pread_bytes_total.load(std::memory_order_relaxed);
+      counters.remote_pread_bytes_total.load(std::memory_order_relaxed);
   const uint64_t pwrite_reqs =
-      pwrite_request_count.load(std::memory_order_relaxed);
+      counters.pwrite_request_count.load(std::memory_order_relaxed);
   const uint64_t remote_pwrite_events =
-      remote_pwrite_event_count.load(std::memory_order_relaxed);
+      counters.remote_pwrite_event_count.load(std::memory_order_relaxed);
   const uint64_t remote_pwrite_bytes =
-      remote_pwrite_bytes_total.load(std::memory_order_relaxed);
+      counters.remote_pwrite_bytes_total.load(std::memory_order_relaxed);
   const uint64_t short_reads =
-      short_read_count.load(std::memory_order_relaxed);
+      counters.short_read_count.load(std::memory_order_relaxed);
   const uint64_t short_read_bytes =
-      short_read_bytes_total.load(std::memory_order_relaxed);
+      counters.short_read_bytes_total.load(std::memory_order_relaxed);
   const uint64_t short_writes =
-      short_write_count.load(std::memory_order_relaxed);
+      counters.short_write_count.load(std::memory_order_relaxed);
   const uint64_t short_write_bytes =
-      short_write_bytes_total.load(std::memory_order_relaxed);
+      counters.short_write_bytes_total.load(std::memory_order_relaxed);
   const uint64_t fallback_count =
-      two_phase_fallback_count.load(std::memory_order_relaxed);
+      counters.two_phase_fallback_count.load(std::memory_order_relaxed);
   const uint64_t batch_count =
-      two_phase_batch_count.load(std::memory_order_relaxed);
+      counters.two_phase_batch_count.load(std::memory_order_relaxed);
   const uint64_t coalesced_reads =
-      two_phase_coalesced_read_count.load(std::memory_order_relaxed);
+      counters.two_phase_coalesced_read_count.load(std::memory_order_relaxed);
   const uint64_t coalesced_bytes =
-      two_phase_coalesced_bytes_total.load(std::memory_order_relaxed);
+      counters.two_phase_coalesced_bytes_total.load(std::memory_order_relaxed);
   const uint64_t planner_batches =
-      two_phase_planner_batch_count.load(std::memory_order_relaxed);
+      counters.two_phase_planner_batch_count.load(std::memory_order_relaxed);
   const uint64_t planner_segments =
-      two_phase_planner_segment_count.load(std::memory_order_relaxed);
+      counters.two_phase_planner_segment_count.load(std::memory_order_relaxed);
   const uint64_t planner_affinity =
-      two_phase_planner_affinity_count.load(std::memory_order_relaxed);
+      counters.two_phase_planner_affinity_count.load(std::memory_order_relaxed);
   const uint64_t planner_rebalanced =
-      two_phase_planner_rebalanced_count.load(std::memory_order_relaxed);
+      counters.two_phase_planner_rebalanced_count.load(
+          std::memory_order_relaxed);
   const uint64_t planner_rebalanced_applied =
-      two_phase_planner_rebalanced_applied_count.load(
+      counters.two_phase_planner_rebalanced_applied_count.load(
           std::memory_order_relaxed);
   const uint64_t planner_rebalanced_skipped =
-      two_phase_planner_rebalanced_skipped_count.load(
+      counters.two_phase_planner_rebalanced_skipped_count.load(
           std::memory_order_relaxed);
   const uint64_t planner_rebalanced_conflicts =
-      two_phase_planner_rebalanced_conflict_count.load(
+      counters.two_phase_planner_rebalanced_conflict_count.load(
           std::memory_order_relaxed);
   const uint64_t writable_read_candidates =
-      writable_read_rebalance_candidate_count.load(std::memory_order_relaxed);
+      counters.writable_read_rebalance_candidate_count.load(
+          std::memory_order_relaxed);
   const uint64_t writable_read_eligible =
-      writable_read_rebalance_eligible_count.load(std::memory_order_relaxed);
+      counters.writable_read_rebalance_eligible_count.load(
+          std::memory_order_relaxed);
   const uint64_t writable_read_applied =
-      writable_read_rebalance_applied_count.load(std::memory_order_relaxed);
+      counters.writable_read_rebalance_applied_count.load(
+          std::memory_order_relaxed);
   const uint64_t writable_read_blocked =
-      writable_read_rebalance_blocked_count.load(std::memory_order_relaxed);
+      counters.writable_read_rebalance_blocked_count.load(
+          std::memory_order_relaxed);
   const uint64_t writable_read_blocked_disabled =
-      writable_read_rebalance_blocked_disabled_count.load(
+      counters.writable_read_rebalance_blocked_disabled_count.load(
           std::memory_order_relaxed);
   const uint64_t writable_read_blocked_missing_metadata =
-      writable_read_rebalance_blocked_missing_metadata_count.load(
+      counters.writable_read_rebalance_blocked_missing_metadata_count.load(
           std::memory_order_relaxed);
   const uint64_t writable_read_blocked_stale_metadata =
-      writable_read_rebalance_blocked_stale_metadata_count.load(
+      counters.writable_read_rebalance_blocked_stale_metadata_count.load(
           std::memory_order_relaxed);
   const uint64_t writable_read_blocked_unsafe_overlap =
-      writable_read_rebalance_blocked_unsafe_overlap_count.load(
+      counters.writable_read_rebalance_blocked_unsafe_overlap_count.load(
           std::memory_order_relaxed);
   const uint64_t writable_read_blocked_invalid_destination =
-      writable_read_rebalance_blocked_invalid_destination_count.load(
+      counters.writable_read_rebalance_blocked_invalid_destination_count.load(
           std::memory_order_relaxed);
   const uint64_t dirty_owner_forward_attempts =
-      dirty_owner_forward_attempt_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_forward_attempt_count.load(
+          std::memory_order_relaxed);
   const uint64_t dirty_owner_forward_successes =
-      dirty_owner_forward_success_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_forward_success_count.load(
+          std::memory_order_relaxed);
   const uint64_t dirty_owner_forward_failures =
-      dirty_owner_forward_failure_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_forward_failure_count.load(
+          std::memory_order_relaxed);
   const uint64_t dirty_owner_forward_bytes =
-      dirty_owner_forward_bytes_total.load(std::memory_order_relaxed);
+      counters.dirty_owner_forward_bytes_total.load(std::memory_order_relaxed);
   const uint64_t writable_read_blocked_pending_invalidation =
-      writable_read_rebalance_blocked_pending_invalidation.load(
+      counters.writable_read_rebalance_blocked_pending_invalidation.load(
           std::memory_order_relaxed);
   const uint64_t planner_scalar_fallbacks =
-      two_phase_planner_scalar_fallback_count.load(std::memory_order_relaxed);
+      counters.two_phase_planner_scalar_fallback_count.load(
+          std::memory_order_relaxed);
   const uint64_t planner_errors =
-      two_phase_planner_error_count.load(std::memory_order_relaxed);
+      counters.two_phase_planner_error_count.load(std::memory_order_relaxed);
   const uint64_t write_batches =
-      write_batch_count.load(std::memory_order_relaxed);
+      counters.write_batch_count.load(std::memory_order_relaxed);
   const uint64_t coalesced_writes =
-      write_batch_coalesced_write_count.load(std::memory_order_relaxed);
+      counters.write_batch_coalesced_write_count.load(
+          std::memory_order_relaxed);
   const uint64_t coalesced_write_bytes =
-      write_batch_coalesced_bytes_total.load(std::memory_order_relaxed);
+      counters.write_batch_coalesced_bytes_total.load(
+          std::memory_order_relaxed);
   const uint64_t write_saved_events =
-      write_batch_saved_events.load(std::memory_order_relaxed);
+      counters.write_batch_saved_events.load(std::memory_order_relaxed);
   const uint64_t write_batch_failures =
-      write_batch_failure_count.load(std::memory_order_relaxed);
+      counters.write_batch_failure_count.load(std::memory_order_relaxed);
   const uint64_t two_phase_queue_depth_max =
-      two_phase_queue_max_depth.load(std::memory_order_relaxed);
+      counters.two_phase_queue_max_depth.load(std::memory_order_relaxed);
   const uint64_t two_phase_leader_turns =
-      two_phase_leader_turn_count.load(std::memory_order_relaxed);
+      counters.two_phase_leader_turn_count.load(std::memory_order_relaxed);
   const uint64_t two_phase_follower_waits =
-      two_phase_follower_wait_count.load(std::memory_order_relaxed);
+      counters.two_phase_follower_wait_count.load(std::memory_order_relaxed);
   const uint64_t two_phase_follower_wait_us =
-      two_phase_follower_wait_us_total.load(std::memory_order_relaxed);
+      counters.two_phase_follower_wait_us_total.load(std::memory_order_relaxed);
   const uint64_t two_phase_window_wait_us =
-      two_phase_window_wait_us_total.load(std::memory_order_relaxed);
+      counters.two_phase_window_wait_us_total.load(std::memory_order_relaxed);
   const uint64_t two_phase_batch_exec_us =
-      two_phase_batch_exec_us_total.load(std::memory_order_relaxed);
+      counters.two_phase_batch_exec_us_total.load(std::memory_order_relaxed);
   const uint64_t two_phase_request_wait_us =
-      two_phase_request_wait_us_total.load(std::memory_order_relaxed);
+      counters.two_phase_request_wait_us_total.load(std::memory_order_relaxed);
   const uint64_t write_queue_depth_max =
-      write_queue_max_depth.load(std::memory_order_relaxed);
+      counters.write_queue_max_depth.load(std::memory_order_relaxed);
   const uint64_t write_leader_turns =
-      write_leader_turn_count.load(std::memory_order_relaxed);
+      counters.write_leader_turn_count.load(std::memory_order_relaxed);
   const uint64_t write_follower_waits =
-      write_follower_wait_count.load(std::memory_order_relaxed);
+      counters.write_follower_wait_count.load(std::memory_order_relaxed);
   const uint64_t write_follower_wait_us =
-      write_follower_wait_us_total.load(std::memory_order_relaxed);
+      counters.write_follower_wait_us_total.load(std::memory_order_relaxed);
   const uint64_t write_window_wait_us =
-      write_window_wait_us_total.load(std::memory_order_relaxed);
+      counters.write_window_wait_us_total.load(std::memory_order_relaxed);
   const uint64_t write_batch_exec_us =
-      write_batch_exec_us_total.load(std::memory_order_relaxed);
+      counters.write_batch_exec_us_total.load(std::memory_order_relaxed);
   const uint64_t write_request_wait_us =
-      write_request_wait_us_total.load(std::memory_order_relaxed);
+      counters.write_request_wait_us_total.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_candidates =
-      dirty_owner_batch_candidate_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_batch_candidate_count.load(
+          std::memory_order_relaxed);
   const uint64_t dirty_owner_batches =
-      dirty_owner_batch_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_batch_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_single_reads =
-      dirty_owner_single_read_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_single_read_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_remote_read_events =
-      dirty_owner_remote_read_event_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_remote_read_event_count.load(
+          std::memory_order_relaxed);
   const uint64_t dirty_owner_remote_read_bytes =
-      dirty_owner_remote_read_bytes_total.load(std::memory_order_relaxed);
+      counters.dirty_owner_remote_read_bytes_total.load(
+          std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_segments =
-      dirty_owner_batch_segment_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_batch_segment_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_saved =
-      dirty_owner_batch_saved_events.load(std::memory_order_relaxed);
+      counters.dirty_owner_batch_saved_events.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_total_bytes =
-      dirty_owner_batch_bytes.load(std::memory_order_relaxed);
+      counters.dirty_owner_batch_bytes.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_failures =
-      dirty_owner_batch_failure_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_batch_failure_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_queue_depth_max =
-      dirty_owner_queue_max_depth.load(std::memory_order_relaxed);
+      counters.dirty_owner_queue_max_depth.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_follower_waits =
-      dirty_owner_follower_wait_count.load(std::memory_order_relaxed);
+      counters.dirty_owner_follower_wait_count.load(std::memory_order_relaxed);
   const uint64_t dirty_owner_follower_wait_us =
-      dirty_owner_follower_wait_us_total.load(std::memory_order_relaxed);
+      counters.dirty_owner_follower_wait_us_total.load(
+          std::memory_order_relaxed);
   const uint64_t dirty_owner_batch_window_wait_us =
-      dirty_owner_batch_window_wait_us_total.load(std::memory_order_relaxed);
+      counters.dirty_owner_batch_window_wait_us_total.load(
+          std::memory_order_relaxed);
 
   const double avg_remote_bytes =
       remote_events == 0 ? 0.0
@@ -314,31 +330,39 @@ void MPIIOBackend::reportPhase0Stats() const {
           static_cast<unsigned long long>(dirty_owner_follower_waits),
           static_cast<unsigned long long>(dirty_owner_follower_wait_us),
           static_cast<unsigned long long>(dirty_owner_batch_window_wait_us),
-          static_cast<int>(write_batch_enabled),
-         static_cast<int>(two_phase_enabled),
+          static_cast<int>(settings.write_batch_enabled),
+         static_cast<int>(settings.two_phase_enabled),
          static_cast<int>(isTwoPhaseActive()),
-         twoPhasePolicyToString(two_phase_policy),
-         static_cast<unsigned long long>(two_phase_window_us),
-         static_cast<unsigned long long>(two_phase_max_batch_bytes),
-         static_cast<unsigned long long>(two_phase_sieve_bytes),
-         twoPhasePolicyToString(write_batch_policy),
-         static_cast<unsigned long long>(write_batch_window_us),
-         static_cast<unsigned long long>(write_batch_max_batch_bytes),
-         mpi_provided_thread_level,
+         twoPhasePolicyToString(settings.two_phase_policy),
+         static_cast<unsigned long long>(settings.two_phase_window_us),
+         static_cast<unsigned long long>(settings.two_phase_max_batch_bytes),
+         static_cast<unsigned long long>(settings.two_phase_sieve_bytes),
+         twoPhasePolicyToString(settings.write_batch_policy),
+         static_cast<unsigned long long>(settings.write_batch_window_us),
+         static_cast<unsigned long long>(settings.write_batch_max_batch_bytes),
+         settings.mpi_provided_thread_level,
          static_cast<unsigned long long>(
-             handle_mutex_acquire_count.load(std::memory_order_relaxed)),
+             counters.handle_mutex_acquire_count.load(
+                 std::memory_order_relaxed)),
          static_cast<unsigned long long>(
-             handle_mutex_contended_count.load(std::memory_order_relaxed)),
+             counters.handle_mutex_contended_count.load(
+                 std::memory_order_relaxed)),
          static_cast<unsigned long long>(
-             handle_mutex_wait_us_total.load(std::memory_order_relaxed)),
+             counters.handle_mutex_wait_us_total.load(
+                 std::memory_order_relaxed)),
          static_cast<unsigned long long>(
-             handle_mutex_hold_us_total.load(std::memory_order_relaxed)),
+             counters.handle_mutex_hold_us_total.load(
+                 std::memory_order_relaxed)),
          static_cast<unsigned long long>(
-             mpp_call_mutex_acquire_count.load(std::memory_order_relaxed)),
+             counters.mpp_call_mutex_acquire_count.load(
+                 std::memory_order_relaxed)),
          static_cast<unsigned long long>(
-             mpp_call_mutex_contended_count.load(std::memory_order_relaxed)),
+             counters.mpp_call_mutex_contended_count.load(
+                 std::memory_order_relaxed)),
          static_cast<unsigned long long>(
-             mpp_call_mutex_wait_us_total.load(std::memory_order_relaxed)),
+             counters.mpp_call_mutex_wait_us_total.load(
+                 std::memory_order_relaxed)),
          static_cast<unsigned long long>(
-             mpp_call_mutex_hold_us_total.load(std::memory_order_relaxed)));
+             counters.mpp_call_mutex_hold_us_total.load(
+                 std::memory_order_relaxed)));
 }

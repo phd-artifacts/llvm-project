@@ -1,5 +1,5 @@
-#include "mpi_io_backend.h"
-#include "ompfile_env.h"
+#include "mpp_backend.h"
+#include "ompfile_config.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -7,25 +7,12 @@
 #include <limits>
 #include <mutex>
 
-namespace {
-
-bool isWritebackStageModeEnv() {
-  const char *StageMode = std::getenv("LIBOMPFILE_STAGE_MODE");
-  const char *WriteMode = std::getenv("LIBOMPFILE_STAGE_WRITE_MODE");
-  return StageMode && std::strcmp(StageMode, "readthrough") == 0 &&
-         ompfile::env::isWriteBackMode(WriteMode);
+bool MppBackend::rangesOverlap(long a_start, long a_end, long b_start,
+                               long b_end) const {
+  return ompfile::route::rangesOverlap(a_start, a_end, b_start, b_end);
 }
 
-} // namespace
-
-bool MPIIOBackend::rangesOverlap(long a_start, long a_end, long b_start,
-                                 long b_end) const {
-  if (a_end <= a_start || b_end <= b_start)
-    return false;
-  return a_start < b_end && b_start < a_end;
-}
-
-void MPIIOBackend::recordWriteEpochForContext(
+void MppBackend::recordWriteEpochForContext(
     int file_id, long offset, size_t size, const ompfile::OmpFileIOHint &hint) {
   if (size == 0)
     return;
@@ -44,8 +31,8 @@ void MPIIOBackend::recordWriteEpochForContext(
   entry.TileId = entry.HasTile ? hint.TileId : 0;
 
   const auto lock = instrumentedHandleLock();
-  entry.Sequence = next_write_sequence++;
-  auto &history = file_write_epoch_history[file_id];
+  entry.Sequence = write_epochs.next_write_sequence++;
+  auto &history = write_epochs.file_write_epoch_history[file_id];
   history.push_back(entry);
   constexpr size_t kMaxWriteEpochHistory = 8192;
   if (history.size() > kMaxWriteEpochHistory) {
@@ -54,76 +41,83 @@ void MPIIOBackend::recordWriteEpochForContext(
   }
 }
 
-void MPIIOBackend::noteAppliedRebalancedReadForFile(int file_id) {
+void MppBackend::noteAppliedRebalancedReadForFile(int file_id) {
   bool count_writable_read_applied = false;
   {
     const auto lock = instrumentedHandleLock();
-    auto it = file_write_epoch_history.find(file_id);
+    auto it = write_epochs.file_write_epoch_history.find(file_id);
     const bool has_local_write_history =
-        it != file_write_epoch_history.end() && !it->second.empty();
+        it != write_epochs.file_write_epoch_history.end() &&
+        !it->second.empty();
     const bool has_file_metadata =
-        logical_handle_set.find(file_id) != logical_handle_set.end() ||
-        file_path_map.find(file_id) != file_path_map.end() ||
-        file_path_key_map.find(file_id) != file_path_key_map.end();
+        handles.logical_handle_set.find(file_id) !=
+            handles.logical_handle_set.end() ||
+        handles.file_path_map.find(file_id) != handles.file_path_map.end() ||
+        handles.file_path_key_map.find(file_id) !=
+            handles.file_path_key_map.end();
     count_writable_read_applied = has_file_metadata || has_local_write_history;
   }
   if (count_writable_read_applied) {
-    writable_read_rebalance_applied_count.fetch_add(1,
-                                                    std::memory_order_relaxed);
+    counters.writable_read_rebalance_applied_count.fetch_add(
+        1, std::memory_order_relaxed);
   }
 }
 
-void MPIIOBackend::noteWritableReadRebalanceBlocked(const char *reason) {
-  writable_read_rebalance_blocked_count.fetch_add(1, std::memory_order_relaxed);
+void MppBackend::noteWritableReadRebalanceBlocked(const char *reason) {
+  counters.writable_read_rebalance_blocked_count.fetch_add(
+      1, std::memory_order_relaxed);
   if (!reason || std::strcmp(reason, "remote-only-writable-file") == 0) {
-    writable_read_rebalance_blocked_disabled_count.fetch_add(
+    counters.writable_read_rebalance_blocked_disabled_count.fetch_add(
         1, std::memory_order_relaxed);
     return;
   }
   if (std::strcmp(reason, "missing-file-metadata") == 0 ||
       std::strcmp(reason, "missing-read-epoch") == 0 ||
       std::strcmp(reason, "missing-write-epoch") == 0) {
-    writable_read_rebalance_blocked_missing_metadata_count.fetch_add(
+    counters.writable_read_rebalance_blocked_missing_metadata_count.fetch_add(
         1, std::memory_order_relaxed);
     return;
   }
   if (std::strcmp(reason, "newer-write-epoch") == 0) {
-    writable_read_rebalance_blocked_stale_metadata_count.fetch_add(
+    counters.writable_read_rebalance_blocked_stale_metadata_count.fetch_add(
         1, std::memory_order_relaxed);
     return;
   }
   if (std::strcmp(reason, "invalid-read-range") == 0) {
-    writable_read_rebalance_blocked_invalid_destination_count.fetch_add(
-        1, std::memory_order_relaxed);
+    counters.writable_read_rebalance_blocked_invalid_destination_count
+        .fetch_add(1, std::memory_order_relaxed);
     return;
   }
   if (std::strcmp(reason, "unsafe-write-history") == 0) {
-    writable_read_rebalance_blocked_pending_invalidation.fetch_add(
+    counters.writable_read_rebalance_blocked_pending_invalidation.fetch_add(
         1, std::memory_order_relaxed);
     return;
   }
-  writable_read_rebalance_blocked_unsafe_overlap_count.fetch_add(
+  counters.writable_read_rebalance_blocked_unsafe_overlap_count.fetch_add(
       1, std::memory_order_relaxed);
 }
 
-bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
-                                          int file_id, long start, size_t size,
-                                          const char *&reason_out,
-                                          int &reason_errno_out) {
+bool MppBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
+                                        int file_id, long start, size_t size,
+                                        const char *&reason_out,
+                                        int &reason_errno_out) {
   reason_out = "none";
   reason_errno_out = 0;
   const auto lock = instrumentedHandleLock();
-  auto it = file_write_epoch_history.find(file_id);
+  auto it = write_epochs.file_write_epoch_history.find(file_id);
   const bool has_local_write_history =
-      (it != file_write_epoch_history.end()) && !it->second.empty();
+      (it != write_epochs.file_write_epoch_history.end()) &&
+      !it->second.empty();
   const bool has_file_metadata =
-      logical_handle_set.find(file_id) != logical_handle_set.end() ||
-      file_path_map.find(file_id) != file_path_map.end() ||
-      file_path_key_map.find(file_id) != file_path_key_map.end();
+      handles.logical_handle_set.find(file_id) !=
+          handles.logical_handle_set.end() ||
+      handles.file_path_map.find(file_id) != handles.file_path_map.end() ||
+      handles.file_path_key_map.find(file_id) !=
+          handles.file_path_key_map.end();
   const bool has_remote_only_writable_context =
       has_file_metadata || has_local_write_history;
   if (has_remote_only_writable_context) {
-    writable_read_rebalance_candidate_count.fetch_add(
+    counters.writable_read_rebalance_candidate_count.fetch_add(
         1, std::memory_order_relaxed);
   }
 
@@ -137,7 +131,8 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
     return false;
   }
 
-  if (has_remote_only_writable_context && !writable_read_rebalance_enabled) {
+  if (has_remote_only_writable_context &&
+      !settings.writable_read_rebalance_enabled) {
     reason_out = "remote-only-writable-file";
     reason_errno_out = EAGAIN;
     noteWritableReadRebalanceBlocked(reason_out);
@@ -146,14 +141,14 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
 
   if (size == 0) {
     if (has_remote_only_writable_context) {
-      writable_read_rebalance_eligible_count.fetch_add(
+      counters.writable_read_rebalance_eligible_count.fetch_add(
           1, std::memory_order_relaxed);
     }
     return true;
   }
 
   if (has_remote_only_writable_context && has_local_write_history &&
-      isWritebackStageModeEnv()) {
+      (config_.Shared.stageReadthrough() && config_.Shared.stageWriteBack())) {
     reason_out = "unsafe-write-history";
     reason_errno_out = EAGAIN;
     noteWritableReadRebalanceBlocked(reason_out);
@@ -167,7 +162,7 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
       (hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0;
   const uint64_t read_epoch = hint.EpochId;
 
-  if (it == file_write_epoch_history.end() || it->second.empty()) {
+  if (it == write_epochs.file_write_epoch_history.end() || it->second.empty()) {
     if (!has_file_metadata) {
       reason_out = "missing-file-metadata";
       reason_errno_out = ENOKEY;
@@ -176,7 +171,7 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
       return false;
     }
     if (has_remote_only_writable_context) {
-      writable_read_rebalance_eligible_count.fetch_add(
+      counters.writable_read_rebalance_eligible_count.fetch_add(
           1, std::memory_order_relaxed);
     }
     return true;
@@ -238,8 +233,8 @@ bool MPIIOBackend::canApplyRebalancedRead(const ompfile::OmpFileIOHint &hint,
   }
 
   if (has_remote_only_writable_context) {
-    writable_read_rebalance_eligible_count.fetch_add(1,
-                                                     std::memory_order_relaxed);
+    counters.writable_read_rebalance_eligible_count.fetch_add(
+        1, std::memory_order_relaxed);
   }
   return true;
 }
