@@ -122,11 +122,28 @@ int MppBackend::writeAtWithContext(
 
   ompfile::route::WriteRouteConfig route_config{};
   route_config.WriteBatchActive = isWriteBatchActive();
-  if (!route_config.WriteBatchActive)
-    route_config.Distribute = snapshotDistributeConfig();
   const ompfile::route::WriteDecision decision =
-      ompfile::route::resolveWriteRoute(context, size, route_config);
+      ompfile::route::resolveWriteRoute(route_config);
   return executeWrite(context, decision, group_key, data, size);
+}
+
+int MppBackend::writeAtPlacedRank(
+    const ompfile::OmpFileWriteRequestContext &context, int target_rank,
+    const void *data, size_t size) {
+  if (settings.strict_mpp_init_failed)
+    return failStrictMpp("pwrite");
+  counters.pwrite_request_count.fetch_add(1, std::memory_order_relaxed);
+  if (context.Offset < 0 || target_rank < 0 || (!data && size > 0)) {
+    errno = EINVAL;
+    return -1;
+  }
+  ompfile::route::WriteDecision decision{};
+  decision.Route = ompfile::route::WriteRoute::PlacedRank;
+  decision.TargetRank = target_rank;
+  io_log("Writing %zu bytes to file %d at offset %lld on placed rank %d\n",
+         size, context.FileHandle, static_cast<long long>(context.Offset),
+         target_rank);
+  return executeWrite(context, decision, /*group_key=*/0, data, size);
 }
 
 int MppBackend::executeWrite(
@@ -149,28 +166,33 @@ int MppBackend::executeWrite(
     return batched_rc;
   }
 
-  if (decision.Route == ompfile::route::WriteRoute::DistributedRank) {
-    size_t distributed_bytes_written = 0;
-    if (writeAtRemoteRankWithBytes(file_id, decision.TargetRank, offset,
-                                   data, size,
-                                   distributed_bytes_written)) {
-      assert(distributed_bytes_written == size &&
-             "Distributed remote pwrite must complete full request");
-      recordWriteEpochForContext(file_id, offset, size, context.Hint);
-      if (!reportFreshnessWriteCommit(context, decision.TargetRank)) {
-        if (errno == 0)
-          errno = EIO;
-        return -1;
-      }
-      io_log("MPP distributed write at offset completed: file=%d rank=%d "
-             "bytes=%zu.\n",
-             file_id, decision.TargetRank, distributed_bytes_written);
-      return 0;
+  if (decision.Route == ompfile::route::WriteRoute::PlacedRank) {
+    // Only the test placement hook builds this route (ompfile_test_hooks.h);
+    // it fails closed, so a test that asked for rank N never silently lands
+    // on the owner instead.
+    size_t placed_bytes_written = 0;
+    if (!writeAtRemoteRankWithBytes(file_id, decision.TargetRank, offset,
+                                    data, size, placed_bytes_written)) {
+      io_log("MPP placed pwrite failed for file %d rank=%d offset=%lld "
+             "size=%zu errno=%d; fail-closed.\n",
+             file_id, decision.TargetRank, static_cast<long long>(offset),
+             size, errno);
+      if (errno == 0)
+        errno = EIO;
+      return -1;
     }
-    io_log("MPP distributed pwrite failed for file %d rank=%d offset=%lld "
-           "size=%zu errno=%d; falling back to owner handle.\n",
-           file_id, decision.TargetRank, static_cast<long long>(offset),
-           size, errno);
+    assert(placed_bytes_written == size &&
+           "Placed remote pwrite must complete full request");
+    recordWriteEpochForContext(file_id, offset, size, context.Hint);
+    if (!reportFreshnessWriteCommit(context, decision.TargetRank)) {
+      if (errno == 0)
+        errno = EIO;
+      return -1;
+    }
+    io_log("MPP placed write at offset completed: file=%d rank=%d "
+           "bytes=%zu.\n",
+           file_id, decision.TargetRank, placed_bytes_written);
+    return 0;
   }
 
   int remote_handle = lookupRemoteHandle(file_id);

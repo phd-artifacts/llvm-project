@@ -94,15 +94,9 @@ struct PolicyKnob {
 
 // Knobs libompfile and the proxy both read, by the same rule on both sides.
 struct SharedConfig {
-  bool SchedulerHeadnode = true; // env::schedulerIsHeadnode
-  bool SchedulerUnknown = false;
-  std::string SchedulerRaw;                     // raw LIBOMPFILE_SCHEDULER
   std::string StageMode = "off";                // stringOr(.., "off")
   std::string StageWriteMode = "write-through"; // normalized
   bool StageFreshnessGuard = true;              // boolOr(.., true)
-  unsigned WritebackDistributeRanks = 0;        // writebackDistributeRankCount
-  bool WritebackDistributeActive = false;
-  bool WritebackDistributeMisconfigured = false;
 
   bool stageOff() const { return StageMode == "off"; }
   bool stageReadthrough() const { return StageMode == "readthrough"; }
@@ -110,16 +104,11 @@ struct SharedConfig {
 
   static SharedConfig fromEnvironment() {
     SharedConfig C;
-    C.SchedulerHeadnode = env::schedulerIsHeadnode(&C.SchedulerUnknown);
-    (void)env::raw("LIBOMPFILE_SCHEDULER", &C.SchedulerRaw);
     C.StageMode = env::stringOr("LIBOMPFILE_STAGE_MODE", "off");
     C.StageWriteMode = env::normalizeStageWriteMode(
         env::stringOr("LIBOMPFILE_STAGE_WRITE_MODE", "write-through"));
     C.StageFreshnessGuard =
         env::boolOr("LIBOMPFILE_STAGE_FRESHNESS_GUARD", true);
-    C.WritebackDistributeRanks = env::writebackDistributeRankCount();
-    C.WritebackDistributeActive =
-        env::writebackDistributeActive(&C.WritebackDistributeMisconfigured);
     return C;
   }
 };
@@ -137,10 +126,7 @@ struct ClientConfig {
   OpenMode Open = OpenMode::ReadWrite; // LIBOMPFILE_OPEN_MODE
   bool OpenModeMalformed = false;
   std::string OpenModeRaw;
-  BoolKnob WritableReadRebalance;
   BoolKnob DirtyOwnerForwarding;
-  bool WritebackDistributeRanksSet = false; // raw(.._DISTRIBUTE_RANKS)
-  std::string WritebackDistributeRanksRaw;
   bool MppPing = false; // flag(LIBOMPFILE_MPP_PING)
   PolicyKnob TwoPhase;
   U64Knob TwoPhaseWindowUs;
@@ -158,11 +144,6 @@ struct ClientConfig {
   bool DirtyOwnerBatch = false;          // flag(..._DIRTY_OWNER_BATCH)
   unsigned DirtyOwnerBatchMaxSegs = 16;  // positiveOr, else 16, at least 1
   unsigned DirtyOwnerBatchWindowUs = 0;  // positiveOr, else 0
-  // LIBOMPFILE_ASYNC_READ_WAIT=range: a read (or a synchronous write) waits
-  // only for the queued async writes that could cover its own byte range of
-  // the same file, instead of draining the whole engine. Off (drain) by
-  // default; see the AsyncWriteEngine::waitForRange comment for the contract.
-  bool AsyncReadWaitRange = false;
   bool LocalDisjointExpress = false; // flag(..._LOCAL_DISJOINT_EXPRESS)
   // LIBOMPFILE_IO_TOKENS, raw: std::stoi stays in the client (exceptions).
   bool IoTokensSet = false;
@@ -191,13 +172,8 @@ struct ClientConfig {
         C.OpenModeRaw = Mode;
       }
     }
-    C.WritableReadRebalance =
-        BoolKnob::read("LIBOMPFILE_OPT_WRITABLE_READ_REBALANCE", false);
     C.DirtyOwnerForwarding =
         BoolKnob::read("LIBOMPFILE_OPT_DIRTY_OWNER_FORWARDING", false);
-    C.WritebackDistributeRanksSet =
-        env::raw("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS",
-                 &C.WritebackDistributeRanksRaw);
     C.MppPing = env::flag("LIBOMPFILE_MPP_PING");
     C.TwoPhase = PolicyKnob::read("LIBOMPFILE_OPT_TWO_PHASE");
     C.TwoPhaseWindowUs = U64Knob::read("LIBOMPFILE_OPT_TWO_PHASE_WINDOW_US");
@@ -233,7 +209,6 @@ struct ClientConfig {
     }
     C.DirtyOwnerBatchWindowUs =
         env::positiveOr("LIBOMPFILE_OPT_DIRTY_OWNER_BATCH_WINDOW_US");
-    C.AsyncReadWaitRange = env::equals("LIBOMPFILE_ASYNC_READ_WAIT", "range");
     C.LocalDisjointExpress = env::flag("LIBOMPFILE_OPT_LOCAL_DISJOINT_EXPRESS");
     C.IoTokensSet = env::raw("LIBOMPFILE_IO_TOKENS", &C.IoTokensRaw);
     C.AsyncQueueDepth = static_cast<size_t>(

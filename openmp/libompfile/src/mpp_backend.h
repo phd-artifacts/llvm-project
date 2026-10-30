@@ -23,10 +23,27 @@
 #include <vector>
 
 class MppBackendTestAccess;
+extern "C" int ompfile_test_open_relative(const char *, int, int *, int *);
+
+// The test placement hook (include/ompfile_test_hooks.h), declared here
+// rather than included: that header pulls in file_interface.h, whose global
+// OMPFILE_IO_HINT_* enumerators collide with the `using ompfile::OMPFILE_*`
+// declarations of EventSystemOmpFile.h in translation units that include both
+// (the rebalance regression). Must match the declaration in that header.
+struct omp_file_io_hint_v1;
+extern "C" int ompfile_test_pwrite_on_rank(int file_handle, long offset,
+                                           const void *data, size_t size,
+                                           int rank,
+                                           const omp_file_io_hint_v1 *hint);
 
 class MppBackend : public IOBackend {
 private:
   friend class MppBackendTestAccess;
+  // The test placement hook (ompfile_test_hooks.h, defined in
+  // test_hooks.cpp) is the only caller of writeAtPlacedRank.
+  friend int(::ompfile_test_pwrite_on_rank)(int, long, const void *, size_t,
+                                           int, const omp_file_io_hint_v1 *);
+  friend int(::ompfile_test_open_relative)(const char *, int, int *, int *);
 
   using TwoPhasePolicy = ompfile::config::BatchPolicy;
   // Every knob this backend acts on, parsed once at construction
@@ -59,7 +76,6 @@ private:
     bool mpp_init_succeeded = false;
     bool strict_mpp_init_failed = false;
     int open_flags = O_RDWR;
-    bool writable_read_rebalance_enabled = false;
     bool dirty_owner_forwarding_enabled = false;
     TwoPhasePolicy two_phase_policy = TwoPhasePolicy::Disabled;
     bool two_phase_enabled = false;
@@ -583,7 +599,6 @@ private:
   // finished with that return code; nullopt falls through to the next route
   // (PlannedOwner, then Fallback).
   ompfile::route::ReadRouteConfig snapshotReadRouteConfig() const;
-  ompfile::route::DistributeConfig snapshotDistributeConfig() const;
   ompfile::route::CoherentObservation
   observeCoherentRead(const ompfile::OmpFileReadRequestContext &context);
   ompfile::route::RebalanceVerdict
@@ -619,13 +634,18 @@ private:
                        void *data, size_t size);
   // Write route execution: writeAtWithContext resolves the route with
   // ompfile::route::resolveWriteRoute and executeWrite runs it (MPP calls,
-  // counters, logs, errno). A DistributedRank write that fails falls back to
-  // the owner handle. reportFreshnessWriteCommit commits a tiled write's
-  // freshness version; a negative writer_rank_override means the file's
-  // remote owner rank. On false the caller turns errno 0 into EIO.
+  // counters, logs, errno). A PlacedRank write that fails fails closed.
+  // reportFreshnessWriteCommit commits a tiled write's freshness version; a
+  // negative writer_rank_override means the file's remote owner rank. On
+  // false the caller turns errno 0 into EIO.
   int executeWrite(const ompfile::OmpFileWriteRequestContext &context,
                    const ompfile::route::WriteDecision &decision,
                    uint64_t group_key, const void *data, size_t size);
+  // A PlacedRank write on target_rank (writeAtRemoteRankWithBytes through
+  // the per-(file, rank) handle cache), with writeAtWithContext's argument
+  // checks. Reached only from the test placement hook.
+  int writeAtPlacedRank(const ompfile::OmpFileWriteRequestContext &context,
+                        int target_rank, const void *data, size_t size);
   bool reportFreshnessWriteCommit(
       const ompfile::OmpFileWriteRequestContext &context,
       int writer_rank_override);
@@ -668,7 +688,6 @@ private:
   void rememberFilePath(int file_id, const char *path);
   uint64_t resolveTwoPhaseKey(
       const ompfile::OmpFileReadRequestContext &context);
-  bool rangesOverlap(long a_start, long a_end, long b_start, long b_end) const;
   void recordWriteEpochForContext(int file_id, long offset, size_t size,
                                    const ompfile::OmpFileIOHint &hint);
   void noteAppliedRebalancedReadForFile(int file_id);

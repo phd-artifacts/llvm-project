@@ -60,6 +60,8 @@ enum OmpFileIORequestFlags : int32_t {
   // placement is unaffected: it is placed, and counted as a plan, like any
   // OPEN.
   OMPFILE_IO_REQUEST_PLACEMENT_ONLY = 1 << 0,
+  // Test hook only: OPEN's AggregatorRank is an exact requested owner.
+  OMPFILE_IO_REQUEST_TEST_OPEN_OWNER = 1 << 1,
 };
 
 struct OmpFileIORequest {
@@ -72,7 +74,8 @@ struct OmpFileIORequest {
   // CLOSE only: the AggregatorRank of the OPEN plan whose live-handle count
   // this close releases on the headnode; -1 releases nothing. A CLOSE with
   // FileHandle < 0 only releases (the headnode plans nothing for it). Ignored
-  // by every other op. Occupies what was padding, so sizeof stays 80.
+  // by every other op except TEST_OPEN_OWNER OPEN. Occupies former padding,
+  // so sizeof stays 80. The test OPEN flag has no environment/public API.
   int32_t AggregatorRank = -1;
   int64_t Offset = 0;
   uint64_t Size = 0;

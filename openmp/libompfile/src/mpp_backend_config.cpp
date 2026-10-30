@@ -41,12 +41,3 @@ MppBackend::twoPhasePolicyToString(TwoPhasePolicy policy) {
   }
   return "unknown";
 }
-
-ompfile::route::DistributeConfig
-MppBackend::snapshotDistributeConfig() const {
-  ompfile::route::DistributeConfig distribute{};
-  distribute.Active = config_.Shared.WritebackDistributeActive;
-  if (distribute.Active)
-    distribute.Ranks = config_.Shared.WritebackDistributeRanks;
-  return distribute;
-}

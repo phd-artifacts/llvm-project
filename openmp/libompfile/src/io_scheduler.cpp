@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+thread_local int OmpFileTestOpenOwnerRank = -1;
+
 static const char *schedulerOpToString(ompfile::OmpFileIOOp op) {
   switch (op) {
   case ompfile::OmpFileIOOp::OPEN:
@@ -32,54 +34,6 @@ static const char *schedulerOpToString(ompfile::OmpFileIOOp op) {
   }
   return "UNKNOWN";
 }
-
-class LocalScheduler final : public IOScheduler {
-public:
-  explicit LocalScheduler(IOBackend &backend) : backend(backend) {}
-
-  int open(const char *filename) override { return backend.open(filename); }
-  int write(int file_handle, const void *data, size_t size) override {
-    return backend.write(file_handle, data, size);
-  }
-  int read(int file_handle, void *data, size_t size) override {
-    return backend.read(file_handle, data, size);
-  }
-  int close(int file_handle) override { return backend.close(file_handle); }
-  int commit(int file_handle) override { return backend.commit(file_handle); }
-  int seek(int file_handle, long offset) override {
-    return backend.seek(file_handle, offset);
-  }
-  int readAt(int file_handle, long offset, void *data, size_t size) override {
-    return backend.readAt(file_handle, offset, data, size);
-  }
-  int readAtHint(int file_handle, long offset, void *data, size_t size,
-                 const ompfile::OmpFileIOHint *hint) override {
-    ompfile::OmpFileReadRequestContext context{};
-    context.FileHandle = file_handle;
-    context.Offset = static_cast<int64_t>(offset);
-    context.Size = static_cast<uint64_t>(size);
-    if (hint)
-      context.Hint = *hint;
-    return backend.readAtWithContext(context, data, size);
-  }
-  int writeAt(int file_handle, long offset, const void *data,
-              size_t size) override {
-    return backend.writeAt(file_handle, offset, data, size);
-  }
-  int writeAtHint(int file_handle, long offset, const void *data, size_t size,
-                  const ompfile::OmpFileIOHint *hint) override {
-    ompfile::OmpFileWriteRequestContext context{};
-    context.FileHandle = file_handle;
-    context.Offset = static_cast<int64_t>(offset);
-    context.Size = static_cast<uint64_t>(size);
-    if (hint)
-      context.Hint = *hint;
-    return backend.writeAtWithContext(context, data, size);
-  }
-
-private:
-  IOBackend &backend;
-};
 
 class HeadnodeScheduler final : public IOScheduler {
 public:
@@ -394,6 +348,10 @@ private:
     req.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
     req.Op = ompfile::OmpFileIOOp::OPEN;
     req.ClientRank = client_rank;
+    if (OmpFileTestOpenOwnerRank >= 0) {
+      req.Flags |= ompfile::OMPFILE_IO_REQUEST_TEST_OPEN_OWNER;
+      req.AggregatorRank = OmpFileTestOpenOwnerRank;
+    }
     req.PathSize = static_cast<uint32_t>(std::strlen(path) + 1);
     io_trace("HeadnodeScheduler::scheduleOpen scheduler=%p req_id=%llu path=%s\n",
              static_cast<void *>(this),
@@ -525,10 +483,6 @@ private:
     return true;
   }
 };
-
-std::unique_ptr<IOScheduler> createLocalScheduler(IOBackend &backend) {
-  return std::make_unique<LocalScheduler>(backend);
-}
 
 std::unique_ptr<IOScheduler>
 createHeadnodeScheduler(IOBackend &backend,

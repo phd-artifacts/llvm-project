@@ -26,9 +26,9 @@ libompfile backend behavior and MPP shim usage.
   - `client_context.{h,cpp}`: `OmpFileClientContext` (token guard, async
     wiring, handle set; it takes the `ClientConfig` snapshot and builds the
     backend);
-  - `io_scheduler.{h,cpp}`: `IOScheduler`, `LocalScheduler` and
-    `HeadnodeScheduler`, built through `createLocalScheduler` /
-    `createHeadnodeScheduler`;
+  - `io_scheduler.{h,cpp}`: `IOScheduler` and `HeadnodeScheduler`, built
+    through `createHeadnodeScheduler` (the only scheduler since
+    `LIBOMPFILE_SCHEDULER` and the `LocalScheduler` went, Oct 2026);
   - `async_write_engine.h`: the header-only `AsyncWriteEngine`.
 - Backend: `src/mpp_backend.h` and the twelve `src/mpp_backend_*.cpp`
   (`MppBackend`, renamed from `MPIIOBackend` in Oct 2026; the test accessor is
@@ -92,7 +92,7 @@ libompfile backend behavior and MPP shim usage.
   - `HeadnodeConfig`, in `OmpFileHeadnodeManager::initialize()`.
 
   A knob both sides read sits in `SharedConfig` (scheduler, stage mode, stage
-  write mode, freshness guard, write-back distribution) with one rule.
+  write mode, freshness guard) with one rule.
   Consumers read fields, never `getenv` or `ompfile::env::` directly. The
   exceptions are the once-per-process gates: `debug_log.h`
   (`LIBOMPFILE_DEBUG`, `_DEBUG_TRACE`), the proxy's `ompfileProxyTraceEnabled`,
@@ -156,11 +156,30 @@ libompfile backend behavior and MPP shim usage.
   not add an MPI call that does more. The MPI link stays for those queries.
 - `omp_file_read` / `omp_file_write` / `omp_file_seek` (no explicit offset)
   return -1 with ENOTSUP; sequential I/O has no MPP path.
-- `LIBOMPFILE_SCHEDULER` defaults to HEADNODE (Oct 2026). `LOCAL` stays
-  selectable, but an origin-side open under it fails: the unplanned open
-  (`ompfile::mpp::open`, then `handleOwnerRank`) needs
-  `ompfile_mpp_handle_owner_rank`, which only the proxy defines. Semantics
-  are in `docs/runtime-configuration.md`.
+- HEADNODE scheduling is unconditional. The Oct 2026 knob deletion removed
+  `LIBOMPFILE_SCHEDULER` (and the `LocalScheduler`),
+  `LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES` / `_RANKS` (the hash-routed
+  write owners, the read path's tile-hash / history-scan source guess; the
+  proxy's derived-tile completion stays, triggered by a `source-not-fresh`
+  refusal instead), `LIBOMPFILE_OPT_WRITABLE_READ_REBALANCE`
+  (`canApplyRebalancedRead` now blocks every read of a known file as
+  `remote-only-writable-file`) and `LIBOMPFILE_ASYNC_READ_WAIT` (the engine's
+  `waitForRange`; every read drains the queue). All five are in
+  `kRemovedKnobs`. Do not reintroduce a placement or wait knob: Phase E plans
+  them from the task graph.
+- Multi-owner coherence stays (freshness `COPY_FROM_RANK`, dirty-owner
+  forwarding, `WritebackLocalDirty`, the per-(file, rank)
+  `remote_read_handle_cache`, `writeAtRemoteRankWithBytes`). Its only way to
+  get dirty data onto a chosen proxy is the test placement hook:
+  `include/ompfile_test_hooks.h` (`ompfile_test_pwrite_on_rank`, defined in
+  `src/test_hooks.cpp`, a friend of `OmpFileClientContext` and `MppBackend`)
+  drives the private `MppBackend::writeAtPlacedRank`, i.e. the
+  `WriteRoute::PlacedRank` route `resolveWriteRoute` never returns. It is not
+  public API: the header is not installed, `file_interface.h` must not
+  declare it, and the rebalance regression's probes
+  (`test_public_header_no_test_hooks.cpp`, `HasPublicPlacedWrite` in
+  `test_runtime_test_access_hidden.cpp`) fail to build if that changes. Users:
+  `test-mpp-global-oracle-coherence`, `test-remote-read-handle-retry-leak`.
 
 ## MPP shim behavior
 
@@ -197,8 +216,6 @@ libompfile backend behavior and MPP shim usage.
 - `LIBOMPFILE_MPP_PING=1` for health check.
 - `LIBOMPFILE_DEBUG=0` silences `io_log`; the stats lines lanes parse go
   through `io_report` and cannot be silenced.
-- `LIBOMPFILE_SCHEDULER`: HEADNODE is the default since Oct 2026; `LOCAL`
-  turns the headnode scheduler off.
 - `LIBOMPFILE_OPT_OPEN_CACHE`, `LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN`,
   `LIBOMPFILE_OPT_STATS` influence proxy-side behavior.
 - The `Two-phase stats:` and `Async IO stats:` lines are a parser contract:

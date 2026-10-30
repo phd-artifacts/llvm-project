@@ -647,7 +647,6 @@ private:
   std::atomic<uint64_t> OmpFileStatsLocalDisjointCombineFlushes{0};
   std::atomic<uint64_t> OmpFileStatsLocalDisjointReadaheadHits{0};
   std::atomic<uint64_t> OmpFileStatsLocalDisjointReadaheadFills{0};
-  bool OmpFileHeadnodeScheduler = false;
   std::string OmpFileStageMode;
   std::string OmpFileStageWriteMode;
   std::string OmpFileStageSyncPolicy;

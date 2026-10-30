@@ -16,11 +16,6 @@
 #include <utility>
 #include <vector>
 
-enum class IOSchedulerTy {
-  LOCAL,
-  HEADNODE,
-};
-
 static void applyIoHint(ompfile::OmpFileIOHint &dst,
                         const omp_file_io_hint_v1 *src) {
   dst = {};
@@ -66,15 +61,6 @@ static int resolveDefaultIOTokens(const ompfile::config::ClientConfig &config) {
   return tokens;
 }
 
-static IOSchedulerTy getSchedulerType(
-    const ompfile::config::ClientConfig &config) {
-  if (config.Shared.SchedulerUnknown)
-    io_log("Unknown LIBOMPFILE_SCHEDULER '%s', defaulting to HEADNODE\n",
-           config.Shared.SchedulerRaw.c_str());
-  return config.Shared.SchedulerHeadnode ? IOSchedulerTy::HEADNODE
-                                         : IOSchedulerTy::LOCAL;
-}
-
 static std::mutex &getClientContextInitMutex() {
   static std::mutex init_mutex;
   return init_mutex;
@@ -82,27 +68,8 @@ static std::mutex &getClientContextInitMutex() {
 
 OmpFileClientContext *OmpFileClientContext::instance = nullptr;
 
-std::vector<int> OmpFileClientContext::sameFileHandles(int file_handle) {
-  std::lock_guard<std::mutex> lock(open_handles_mutex);
-  std::vector<int> out;
-  auto it = handle_paths.find(file_handle);
-  if (it == handle_paths.end()) {
-    out.push_back(file_handle);
-    return out;
-  }
-  for (const auto &entry : handle_paths)
-    if (entry.second == it->second)
-      out.push_back(entry.first);
-  return out;
-}
-
-void OmpFileClientContext::waitForQueuedWrites(int file_handle, long offset,
-                                               size_t size) {
-  if (!async_engine.active())
-    return;
-  if (config_.AsyncReadWaitRange)
-    async_engine.waitForRange(sameFileHandles(file_handle), offset, size);
-  else
+void OmpFileClientContext::waitForQueuedWrites() {
+  if (async_engine.active())
     async_engine.drain();
 }
 
@@ -116,14 +83,9 @@ OmpFileClientContext::OmpFileClientContext()
   io_log("MPI backend selected\n");
   io_backend = std::make_unique<MppBackend>(config_);
 
-  IOSchedulerTy scheduler_type = getSchedulerType(config_);
-  if (scheduler_type == IOSchedulerTy::HEADNODE) {
-    io_log("HEADNODE scheduler selected (client mode)\n");
-    io_scheduler = createHeadnodeScheduler(*io_backend, config_);
-  } else {
-    io_log("LOCAL scheduler selected (client mode)\n");
-    io_scheduler = createLocalScheduler(*io_backend);
-  }
+  // HEADNODE is the only scheduler (LIBOMPFILE_SCHEDULER went in Oct 2026).
+  io_log("HEADNODE scheduler selected (client mode)\n");
+  io_scheduler = createHeadnodeScheduler(*io_backend, config_);
 
   // Wire the async engine to drain queued writes through the same scheduler
   // path (and token semaphore) a synchronous write would take.
@@ -194,7 +156,6 @@ int OmpFileClientContext::openFile(const char *filename) {
     {
       std::lock_guard<std::mutex> lock(open_handles_mutex);
       open_handles.insert(rc);
-      handle_paths[rc] = filename ? filename : "";
     }
     // A recycled file id must not inherit the previous owner's async rc.
     async_engine.forgetHandle(rc);
@@ -242,7 +203,6 @@ int OmpFileClientContext::closeFile(int file_handle) {
     {
       std::lock_guard<std::mutex> lock(open_handles_mutex);
       open_handles.erase(file_handle);
-      handle_paths.erase(file_handle);
     }
     async_engine.forgetHandle(file_handle);
   }
@@ -395,9 +355,8 @@ int OmpFileClientContext::submitWrite(int file_handle, long offset,
     return async_engine.enqueue(std::move(task));
   }
   if (has_offset) {
-    // A synchronous pwrite behind queued async ones must land after any of
-    // them that cover its range; the rest may keep draining.
-    waitForQueuedWrites(file_handle, offset, size);
+    // A synchronous pwrite behind queued async ones must land after them.
+    waitForQueuedWrites();
     if (hint)
       return writeFileAtHint(file_handle, data, size, offset, hint);
     return writeFileAt(file_handle, data, size, offset);
@@ -451,7 +410,7 @@ int OmpFileClientContext::readFileAt(int file_handle, void *data, size_t size,
            static_cast<void *>(this),
            static_cast<unsigned long long>(call_id), file_handle, offset,
            size, io_resource_token.load());
-  waitForQueuedWrites(file_handle, offset, size);
+  waitForQueuedWrites();
   IOResourceGuard guard(io_resource_token);
   const int rc = io_scheduler->readAt(file_handle, offset, data, size);
   io_trace("ctx=%p call=%llu readFileAt exit rc=%d tokens=%d\n",
@@ -473,7 +432,7 @@ int OmpFileClientContext::readFileAtHint(int file_handle, void *data,
            size, io_resource_token.load());
   ompfile::OmpFileIOHint internal_hint{};
   applyIoHint(internal_hint, hint);
-  waitForQueuedWrites(file_handle, offset, size);
+  waitForQueuedWrites();
   IOResourceGuard guard(io_resource_token);
   const int rc = io_scheduler->readAtHint(file_handle, offset, data, size,
                                           hint ? &internal_hint : nullptr);

@@ -175,71 +175,6 @@ inline bool isWriteBackMode(const char *value) {
   return value && normalizeStageWriteMode(value) == "write-back";
 }
 
-// ASCII case-insensitive string equality; both pointers must be non-null.
-inline bool equalsIgnoreAsciiCase(const char *a, const char *b) {
-  assert(a && b && "equalsIgnoreAsciiCase needs two strings");
-  for (;; ++a, ++b) {
-    char ca = *a;
-    char cb = *b;
-    if (ca >= 'a' && ca <= 'z')
-      ca = static_cast<char>(ca - 'a' + 'A');
-    if (cb >= 'a' && cb <= 'z')
-      cb = static_cast<char>(cb - 'a' + 'A');
-    if (ca != cb)
-      return false;
-    if (ca == '\0')
-      return true;
-  }
-}
-
-// LIBOMPFILE_SCHEDULER, the one reader for libompfile and the proxy. HEADNODE
-// is the default (Oct 2026): remote-only MPP is the only mode and an
-// origin-side open under LOCAL fails. Unset, empty or "HEADNODE" -> true;
-// "LOCAL" -> false (still selectable explicitly); both compared ignoring ASCII
-// case. Any other value reads as the default (true) and sets *unknown, so a
-// caller that wants to log it can.
-inline bool schedulerIsHeadnode(bool *unknown = nullptr) {
-  if (unknown)
-    *unknown = false;
-  const char *value = std::getenv("LIBOMPFILE_SCHEDULER");
-  if (!value || value[0] == '\0')
-    return true;
-  if (equalsIgnoreAsciiCase(value, "HEADNODE"))
-    return true;
-  if (equalsIgnoreAsciiCase(value, "LOCAL"))
-    return false;
-  if (unknown)
-    *unknown = true;
-  return true;
-}
-
-// LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS as a strictly positive integer,
-// else 0. The one rank count for distributed write-back routing: libompfile's
-// read and write paths and the proxy all read it here, and the application's
-// Cholesky worker-node / target-region knobs are not read.
-inline unsigned writebackDistributeRankCount() {
-  return positiveOr("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS");
-}
-
-// Distributed write-back routing, the one predicate for libompfile and the
-// proxy: LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES=1 and a rank count above
-// 1. WRITES=1 without such a count is a configuration error: routing stays
-// off and *misconfigured is set, so libompfile's backend init can print its
-// one error line; every other caller stays silent. The parser behind
-// SharedConfig::WritebackDistributeActive; runtime consumers read the
-// snapshot (ompfile_config.h).
-inline bool writebackDistributeActive(bool *misconfigured = nullptr) {
-  if (misconfigured)
-    *misconfigured = false;
-  if (!flag("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES"))
-    return false;
-  if (writebackDistributeRankCount() > 1)
-    return true;
-  if (misconfigured)
-    *misconfigured = true;
-  return false;
-}
-
 // Remote-only MPP is libompfile's only mode (Oct 2026). These knobs used to
 // select another backend or mode; they are read only so that a request for a
 // removed mode fails loudly. Unset, empty, or the accepted value passes.
@@ -290,6 +225,14 @@ inline constexpr const char *kRemovedKnobs[] = {
     "LIBOMPFILE_OPT_REMOTE_DIRTY_OWNER_PFS_REBALANCE",
     "LIBOMPFILE_ASYNC_TRACE",
     "LIBOMPFILE_ASYNC_DISABLE",
+    // Knob deletion (Oct 2026): HEADNODE scheduling, owner-routed writes,
+    // owner-path reads of writable files and the full-queue drain are the
+    // only behavior.
+    "LIBOMPFILE_SCHEDULER",
+    "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES",
+    "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS",
+    "LIBOMPFILE_OPT_WRITABLE_READ_REBALANCE",
+    "LIBOMPFILE_ASYNC_READ_WAIT",
 };
 
 // Names from kRemovedKnobs set to a non-empty value, joined by ", "; empty

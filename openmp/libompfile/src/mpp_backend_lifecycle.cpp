@@ -82,18 +82,8 @@ MppBackend::MppBackend(const ompfile::config::ClientConfig &config)
       config_.Open == ompfile::config::OpenMode::ReadOnly ? O_RDONLY : O_RDWR;
   if (settings.open_flags == O_RDONLY)
     io_log("LIBOMPFILE_OPEN_MODE=readonly: opening files read-only.\n");
-  settings.writable_read_rebalance_enabled =
-      resolveBoolKnob(config_.WritableReadRebalance);
   settings.dirty_owner_forwarding_enabled =
       resolveBoolKnob(config_.DirtyOwnerForwarding);
-  if (config_.Shared.WritebackDistributeMisconfigured) {
-    io_report("Error: LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES=1 requires "
-              "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS > 1 (got '%s'); "
-              "distributed write-back routing stays off.\n",
-              config_.WritebackDistributeRanksSet
-                  ? config_.WritebackDistributeRanksRaw.c_str()
-                  : "unset");
-  }
 
   if (!mode_knobs_valid) {
     settings.strict_mpp_init_failed = true;
@@ -108,16 +98,11 @@ MppBackend::MppBackend(const ompfile::config::ClientConfig &config)
     io_log("MPP init failed; all I/O calls will fail.\n");
   }
 
-  const bool scheduler_headnode = config_.Shared.SchedulerHeadnode;
-
+  // HEADNODE scheduling is unconditional (LIBOMPFILE_SCHEDULER went in
+  // Oct 2026), so auto resolves to enabled exactly like an explicit 1.
   settings.two_phase_policy = resolvePolicyKnob(config_.TwoPhase);
-  if (settings.two_phase_policy == TwoPhasePolicy::Enabled) {
-    settings.two_phase_enabled = true;
-  } else if (settings.two_phase_policy == TwoPhasePolicy::Auto) {
-    settings.two_phase_enabled = scheduler_headnode;
-  } else {
-    settings.two_phase_enabled = false;
-  }
+  settings.two_phase_enabled =
+      settings.two_phase_policy != TwoPhasePolicy::Disabled;
   settings.two_phase_window_us = resolveU64Knob(
       config_.TwoPhaseWindowUs,
       settings.two_phase_enabled ? kDefaultTwoPhaseWindowUs : 0);
@@ -156,8 +141,7 @@ MppBackend::MppBackend(const ompfile::config::ClientConfig &config)
   io_log("Two-phase guard config: policy=%s enabled=%d window_us=%llu "
          "max_batch_bytes=%llu sieve_bytes=%llu write_batch_policy=%s "
          "write_batch_enabled=%d write_batch_window_us=%llu "
-         "write_batch_max_batch_bytes=%llu scheduler=%s "
-         "writable_read_rebalance=%d dirty_owner_forwarding=%d\n",
+         "write_batch_max_batch_bytes=%llu dirty_owner_forwarding=%d\n",
          twoPhasePolicyToString(settings.two_phase_policy),
          static_cast<int>(settings.two_phase_enabled),
          static_cast<unsigned long long>(settings.two_phase_window_us),
@@ -167,17 +151,10 @@ MppBackend::MppBackend(const ompfile::config::ClientConfig &config)
          static_cast<int>(settings.write_batch_enabled),
          static_cast<unsigned long long>(settings.write_batch_window_us),
          static_cast<unsigned long long>(settings.write_batch_max_batch_bytes),
-         scheduler_headnode ? "HEADNODE" : "LOCAL",
-         static_cast<int>(settings.writable_read_rebalance_enabled),
          static_cast<int>(settings.dirty_owner_forwarding_enabled));
 
-  if (isTwoPhaseActive()) {
+  if (isTwoPhaseActive())
     io_log("Two-phase batching active (leader/follower mode).\n");
-  } else if (settings.two_phase_policy == TwoPhasePolicy::Auto) {
-    io_log("Two-phase auto policy resolved to disabled for this run: "
-           "scheduler_headnode=%d.\n",
-           static_cast<int>(scheduler_headnode));
-  }
 
   int rank = -1;
   int mpi_initialized_for_rank = 0;

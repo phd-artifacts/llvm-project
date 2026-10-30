@@ -347,27 +347,8 @@ std::optional<int> MppBackend::readWritebackOracle(
   const bool has_local_write_history = state.Coherent.HasLocalWriteHistory;
   const bool file_has_writeback_epoch =
       ompfile::route::fileHasWritebackEpoch(state.Coherent);
-  const ompfile::route::DistributeConfig distribute =
-      snapshotDistributeConfig();
-  ompfile::route::DirtySourcePlan source = ompfile::route::resolveDirtySource(
-      state.Coherent, context.Hint, distribute);
-  if (source.NeedsHistoryScan) {
-    const long read_end = ompfile::route::readEndOrOffset(offset, size);
-    // The rank count comes from the distribute snapshot taken above; it is
-    // read once, outside handle_mutex.
-    const unsigned distribute_ranks = distribute.Ranks;
-    int range_owner_rank = -1;
-    {
-      const auto lock = instrumentedHandleLock();
-      auto write_it = write_epochs.file_write_epoch_history.find(file_id);
-      if (distribute_ranks > 1 &&
-          write_it != write_epochs.file_write_epoch_history.end() &&
-          read_end > offset)
-        range_owner_rank = ompfile::route::latestOverlappingWriteOwnerRank(
-            write_it->second, offset, read_end, distribute_ranks);
-    }
-    ompfile::route::applyHistoryScan(source, range_owner_rank);
-  }
+  const ompfile::route::DirtySourcePlan source =
+      ompfile::route::resolveDirtySource(state.Coherent);
   const int DirtySourceRank = source.SourceRank;
   const uint64_t DirtyExpectedVersion = source.ExpectedVersion;
   // Dirty-owner forwarding is independent from the optional clean-PFS
@@ -408,7 +389,6 @@ std::optional<int> MppBackend::readWritebackOracle(
                 remote_handle, data, size))
           return rc;
       } else if (outcome == ompfile::route::DirtyOracleOutcome::Clean) {
-        state.DirtySourceKnownClean = true;
         counters.dirty_owner_forward_failure_count.fetch_add(
             1, std::memory_order_relaxed);
         io_log("Phase 1 dirty-clean pfs rebalanced disabled: "
@@ -422,7 +402,6 @@ std::optional<int> MppBackend::readWritebackOracle(
                static_cast<unsigned long long>(
                    InitialFreshnessRoute.SelectedVersion));
       } else {
-        state.DirtySourceUnknown = true;
         counters.dirty_owner_forward_failure_count.fetch_add(
             1, std::memory_order_relaxed);
         io_log("Phase 1 dirty-worker oracle unavailable: request_id=%llu "
@@ -438,7 +417,6 @@ std::optional<int> MppBackend::readWritebackOracle(
                oracle_state, oracle_errno);
       }
     } else {
-      state.DirtySourceUnknown = true;
       io_log("Phase 1 dirty-worker oracle skipped: request_id=%llu "
              "file=%d aggregator_rank=%d source_rank=%d reason=no-handle\n",
              static_cast<unsigned long long>(context.RequestId), file_id,
@@ -446,8 +424,7 @@ std::optional<int> MppBackend::readWritebackOracle(
     }
   }
   decision = ompfile::route::resolveWritebackOwnerTail(
-      source, context.Plan.AggregatorRank, distribute,
-      state.DirtySourceKnownClean, state.DirtySourceUnknown);
+      source, context.Plan.AggregatorRank);
   return std::nullopt;
 }
 
@@ -488,7 +465,6 @@ std::optional<int> MppBackend::readWritebackDirtyForward(
            dirty_source_bytes_read);
     return 0;
   }
-  state.DirtySourceUnknown = true;
   errno = dirty_source_read_errno != 0 ? dirty_source_read_errno
                                        : EIO;
   io_log("Phase 1 dirty-worker staged read failed: request_id=%llu "
@@ -515,8 +491,6 @@ std::optional<int> MppBackend::executeCoherentRoute(
       ompfile::route::fileHasWritebackEpoch(state.Coherent);
   const int DirtySourceRank = decision.SourceRank;
   const uint64_t DirtyExpectedVersion = decision.ExpectedVersion;
-  const bool dirty_source_known_clean = state.DirtySourceKnownClean;
-  const bool dirty_source_unknown = state.DirtySourceUnknown;
   const char *rebalance_reason = state.Rebalance.Reason;
   const int rebalance_errno = state.Rebalance.ReasonErrno;
   switch (decision.Route) {
@@ -595,35 +569,6 @@ std::optional<int> MppBackend::executeCoherentRoute(
            static_cast<unsigned long long>(context.RequestId), file_id,
            context.Plan.AggregatorRank, DirtySourceRank,
            static_cast<unsigned long long>(DirtyExpectedVersion), errno);
-    return -1;
-  }
-  case ompfile::route::ReadRoute::WritebackRefuseSourceClean: {
-    io_log("Phase 1 dirty-worker source-clean pfs disabled: "
-           "request_id=%llu file=%d aggregator_rank=%d source_rank=%d "
-           "offset=%lld size=%zu tile=%llu version=%llu; fail-closed.\n",
-           static_cast<unsigned long long>(context.RequestId), file_id,
-           context.Plan.AggregatorRank, DirtySourceRank,
-           static_cast<long long>(offset), size,
-           static_cast<unsigned long long>(context.Hint.TileId),
-           static_cast<unsigned long long>(
-               InitialFreshnessRoute.SelectedVersion));
-    errno = ESTALE;
-    return -1;
-  }
-  case ompfile::route::ReadRoute::WritebackRefuseDistributed: {
-    io_log("Phase 1 dirty-worker distributed fallback refused: "
-           "request_id=%llu file=%d aggregator_rank=%d source_rank=%d "
-           "offset=%lld size=%zu tile=%llu version=%llu clean=%d "
-           "unknown=%d; fail-closed.\n",
-           static_cast<unsigned long long>(context.RequestId), file_id,
-           context.Plan.AggregatorRank, DirtySourceRank,
-           static_cast<long long>(offset), size,
-           static_cast<unsigned long long>(context.Hint.TileId),
-           static_cast<unsigned long long>(
-               InitialFreshnessRoute.SelectedVersion),
-           static_cast<int>(dirty_source_known_clean),
-           static_cast<int>(dirty_source_unknown));
-    errno = ESTALE;
     return -1;
   }
   case ompfile::route::ReadRoute::WritebackConservativeOwner: {

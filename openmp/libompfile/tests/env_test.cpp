@@ -133,27 +133,30 @@ OMPFILE_TEST(removed_knobs_set_lists_only_present_names) {
   OMPFILE_CHECK(R.find("LIBOMPFILE_ASYNC_TRACE") == std::string::npos);
 }
 
-OMPFILE_TEST(scheduler_defaults_to_headnode) {
-  bool Unknown = true;
-  { ScopedEnv E("LIBOMPFILE_SCHEDULER", nullptr); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
-  { ScopedEnv E("LIBOMPFILE_SCHEDULER", ""); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
-  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "HEADNODE"); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
-  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "headnode"); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
-  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "LOCAL"); OMPFILE_CHECK(!schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
-  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "Local"); OMPFILE_CHECK(!schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(!Unknown); }
-  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "HEADNODEX"); OMPFILE_CHECK(schedulerIsHeadnode(&Unknown)); OMPFILE_CHECK(Unknown); }
-  { ScopedEnv E("LIBOMPFILE_SCHEDULER", "LOC"); OMPFILE_CHECK(schedulerIsHeadnode()); }
-}
-
-OMPFILE_TEST(writeback_distribute_needs_writes_and_ranks) {
-  const char *W = "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES";
-  const char *R = "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS";
-  bool Bad = true;
-  { ScopedEnv EW(W, nullptr); ScopedEnv ER(R, "4"); OMPFILE_CHECK(!writebackDistributeActive(&Bad)); OMPFILE_CHECK(!Bad); OMPFILE_CHECK_EQ(writebackDistributeRankCount(), 4u); }
-  { ScopedEnv EW(W, "1"); ScopedEnv ER(R, "4"); OMPFILE_CHECK(writebackDistributeActive(&Bad)); OMPFILE_CHECK(!Bad); }
-  { ScopedEnv EW(W, "1"); ScopedEnv ER(R, "1"); OMPFILE_CHECK(!writebackDistributeActive(&Bad)); OMPFILE_CHECK(Bad); }
-  { ScopedEnv EW(W, "1"); ScopedEnv ER(R, nullptr); OMPFILE_CHECK(!writebackDistributeActive(&Bad)); OMPFILE_CHECK(Bad); OMPFILE_CHECK_EQ(writebackDistributeRankCount(), 0u); }
-  { ScopedEnv EW(W, "true"); ScopedEnv ER(R, "4"); OMPFILE_CHECK(!writebackDistributeActive(&Bad)); OMPFILE_CHECK(!Bad); }
+OMPFILE_TEST(knob_deletion_names_are_removed_knobs) {
+  // Oct 2026 knob deletion: any non-empty value of these is now only a
+  // `removed knob ignored` line (rule L2), including the old defaults.
+  const char *Names[] = {
+      "LIBOMPFILE_SCHEDULER",
+      "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES",
+      "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS",
+      "LIBOMPFILE_OPT_WRITABLE_READ_REBALANCE",
+      "LIBOMPFILE_ASYNC_READ_WAIT",
+  };
+  for (const char *N : Names) {
+    { ScopedEnv E(N, "HEADNODE"); OMPFILE_CHECK(removedKnobsSet().find(N) != std::string::npos); }
+    { ScopedEnv E(N, "0"); OMPFILE_CHECK(removedKnobsSet().find(N) != std::string::npos); }
+    { ScopedEnv E(N, ""); OMPFILE_CHECK(removedKnobsSet().find(N) == std::string::npos); }
+    { ScopedEnv E(N, nullptr); OMPFILE_CHECK(removedKnobsSet().find(N) == std::string::npos); }
+  }
+  {
+    ScopedEnv S("LIBOMPFILE_SCHEDULER", "LOCAL");
+    ScopedEnv W("LIBOMPFILE_ASYNC_READ_WAIT", "range");
+    const std::string R = removedKnobsSet();
+    OMPFILE_CHECK(R.find("LIBOMPFILE_SCHEDULER") != std::string::npos);
+    OMPFILE_CHECK(R.find("LIBOMPFILE_ASYNC_READ_WAIT") != std::string::npos);
+    OMPFILE_CHECK(R.find(", ") != std::string::npos);
+  }
 }
 
 namespace {
@@ -299,8 +302,6 @@ OMPFILE_TEST(client_dirty_owner_and_async_knobs) {
   { ScopedEnv E(Segs, "5x"); OMPFILE_CHECK_EQ(clientNow().DirtyOwnerBatchMaxSegs, 16u); }
   { ScopedEnv E("LIBOMPFILE_OPT_DIRTY_OWNER_BATCH_WINDOW_US", "100"); OMPFILE_CHECK_EQ(clientNow().DirtyOwnerBatchWindowUs, 100u); }
   { ScopedEnv E("LIBOMPFILE_OPT_DIRTY_OWNER_BATCH_WINDOW_US", "x"); OMPFILE_CHECK_EQ(clientNow().DirtyOwnerBatchWindowUs, 0u); }
-  { ScopedEnv E("LIBOMPFILE_ASYNC_READ_WAIT", "range"); OMPFILE_CHECK(clientNow().AsyncReadWaitRange); }
-  { ScopedEnv E("LIBOMPFILE_ASYNC_READ_WAIT", "Range"); OMPFILE_CHECK(!clientNow().AsyncReadWaitRange); }
   { ScopedEnv E("LIBOMPFILE_ASYNC_QUEUE_DEPTH", "4abc"); OMPFILE_CHECK_EQ(clientNow().AsyncQueueDepth, size_t{4}); }
   { ScopedEnv E("LIBOMPFILE_ASYNC_QUEUE_DEPTH", nullptr); OMPFILE_CHECK_EQ(clientNow().AsyncQueueDepth, size_t{2}); }
   { ScopedEnv E("LIBOMPFILE_OPT_LOCAL_DISJOINT_EXPRESS", "1"); OMPFILE_CHECK(clientNow().LocalDisjointExpress); }
@@ -310,14 +311,16 @@ OMPFILE_TEST(client_dirty_owner_and_async_knobs) {
   { ScopedEnv E("LIBOMPFILE_MPP_PING", "true"); OMPFILE_CHECK(!clientNow().MppPing); }
 }
 
-OMPFILE_TEST(client_distribute_raw_ranks) {
-  const char *W = "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES";
-  const char *R = "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS";
-  { ScopedEnv E1(W, "1"); ScopedEnv E2(R, ""); const ClientConfig C = clientNow();
-    OMPFILE_CHECK(C.Shared.WritebackDistributeMisconfigured && C.WritebackDistributeRanksSet && C.WritebackDistributeRanksRaw.empty()); }
-  { ScopedEnv E1(W, "1"); ScopedEnv E2(R, nullptr); OMPFILE_CHECK(!clientNow().WritebackDistributeRanksSet); }
-  { ScopedEnv E1(W, "1"); ScopedEnv E2(R, "3"); const ClientConfig C = clientNow();
-    OMPFILE_CHECK(C.Shared.WritebackDistributeActive && C.Shared.WritebackDistributeRanks == 3u); }
+OMPFILE_TEST(client_removed_knob_snapshot) {
+  ScopedEnv W("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES", "1");
+  ScopedEnv R("LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS", "3");
+  const ClientConfig C = clientNow();
+  OMPFILE_CHECK(C.RemovedKnobsSet.find(
+                    "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_WRITES") !=
+                std::string::npos);
+  OMPFILE_CHECK(C.RemovedKnobsSet.find(
+                    "LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_RANKS") !=
+                std::string::npos);
 }
 
 OMPFILE_TEST(headnode_config_rules) {

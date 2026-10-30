@@ -6,6 +6,7 @@
 #include "io_scheduler.h"
 #include "ompfile_config.h"
 #include "file_interface.h"
+#include "ompfile_test_hooks.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -20,6 +21,11 @@
 #include <vector>
 
 class OmpFileClientContext {
+  // The test placement hook (ompfile_test_hooks.h, test_hooks.cpp) reaches
+  // the backend through the context's own queue and token discipline.
+  friend int(::ompfile_test_pwrite_on_rank)(int, long, const void *, size_t,
+                                           int, const omp_file_io_hint_v1 *);
+  friend int(::ompfile_test_open_relative)(const char *, int, int *, int *);
 
 private:
   static OmpFileClientContext *instance;
@@ -37,21 +43,11 @@ private:
   // "all writes completed" for a file that was never open.
   std::mutex open_handles_mutex;
   std::unordered_set<int> open_handles;
-  // The path each open handle was opened with, so a range-scoped wait can
-  // treat every handle on one file as that file (the OOC apps open a path
-  // once per lane). Compared as the strings the app passed; two spellings of
-  // one file are two files here, which errs toward waiting less than a
-  // drain would but never toward a stale read of a range this process wrote
-  // through the same string.
-  std::unordered_map<int, std::string> handle_paths;
 
-  // Every open handle on the same path as `file_handle`, itself included.
-  std::vector<int> sameFileHandles(int file_handle);
-
-  // The wait a read or synchronous write of [offset, offset+size) on
-  // `file_handle` owes the async queue: everything (the historical drain), or
-  // only the queued writes that could cover that range of the same file.
-  void waitForQueuedWrites(int file_handle, long offset, size_t size);
+  // The wait a read or synchronous pwrite owes the async queue: the whole
+  // queue (LIBOMPFILE_ASYNC_READ_WAIT=range went in Oct 2026; Phase E keys
+  // the wait on task-graph edges instead).
+  void waitForQueuedWrites();
 
   // RAII guard for IO resource token
   class IOResourceGuard {

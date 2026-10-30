@@ -6,11 +6,13 @@
 # every consumer automatically.
 
 # The frontend list is the client side (C ABI, client context, scheduler
-# clients); the rebalance regression compiles only the backend list.
+# client, the test-only hooks of include/ompfile_test_hooks.h); the rebalance
+# regression compiles only the backend list.
 set(OMPFILE_FRONTEND_SOURCES_REL
     src/file_interface.cpp
     src/client_context.cpp
     src/io_scheduler.cpp
+    src/test_hooks.cpp
 )
 
 set(OMPFILE_MPP_BACKEND_SOURCES_REL

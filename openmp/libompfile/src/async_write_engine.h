@@ -205,58 +205,6 @@ public:
     eraseHandleRange(epoch_error_, handle);
   }
 
-  // Range-scoped alternative to drain() for a read or synchronous write of
-  // [offset, offset+size) on a file that `handles` are open on: waits until
-  // no queued or in-flight task on one of those handles could cover that
-  // range, and returns at once when none can. A sequential (no-offset) write
-  // has no known range and always counts. This is the wait a dependency
-  // actually needs — a read of bytes nobody has queued a write to proceeds
-  // while the worker drains unrelated ranges of the same file — and the
-  // engine keeps FIFO order among the writes themselves, so two queued writes
-  // to one range still land in issue order. Opt-in through
-  // LIBOMPFILE_ASYNC_READ_WAIT=range; the caller passes every handle open on
-  // the read's path, since a file open twice is still one file.
-  void waitForRange(const std::vector<int> &handles, long offset,
-                    size_t size) {
-    std::unique_lock<std::mutex> lock(mtx_);
-    if (!worker_started_)
-      return;
-    const auto covers = [&](int handle, bool has_offset, long task_offset,
-                            size_t task_size) {
-      if (std::find(handles.begin(), handles.end(), handle) == handles.end())
-        return false;
-      if (!has_offset)
-        return true; // cursor write: range unknown, be conservative
-      const long lo = task_offset;
-      const long hi = task_offset + static_cast<long>(task_size);
-      return lo < offset + static_cast<long>(size) && offset < hi;
-    };
-    const auto pending = [&] {
-      if (current_.active &&
-          covers(current_.handle, current_.has_offset, current_.offset,
-                 current_.size))
-        return true;
-      for (const Task &t : queue_)
-        if (covers(t.handle, t.has_offset, t.offset, t.payloadSize()))
-          return true;
-      return false;
-    };
-    if (!pending()) {
-      // Counted only when something was outstanding: these are the reads a
-      // drain would have stalled and this wait let through.
-      if (current_.active || !queue_.empty())
-        ++range_wait_free_;
-      return;
-    }
-    ++range_waits_;
-    const auto start = std::chrono::steady_clock::now();
-    handle_done_.wait(lock, [&] { return !pending(); });
-    range_wait_ns_ += static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start)
-            .count());
-  }
-
   // Waits until the whole queue has drained and the worker is idle.
   int drain() {
     const auto start = std::chrono::steady_clock::now();
@@ -291,8 +239,7 @@ public:
     if (report_stats_)
       io_report("Async IO stats: enqueued=%llu completed=%llu "
              "max_queue_depth=%zu drain_calls=%llu drain_wait_ns=%llu "
-             "owned_enqueued=%llu owned_bytes=%llu range_waits=%llu "
-             "range_wait_ns=%llu range_wait_free=%llu enqueue_waits=%llu "
+             "owned_enqueued=%llu owned_bytes=%llu enqueue_waits=%llu "
              "enqueue_wait_ns=%llu\n",
              static_cast<unsigned long long>(enqueued_),
              static_cast<unsigned long long>(completed_), max_queue_depth_,
@@ -300,9 +247,6 @@ public:
              static_cast<unsigned long long>(drain_wait_ns_),
              static_cast<unsigned long long>(owned_enqueued_),
              static_cast<unsigned long long>(owned_bytes_),
-             static_cast<unsigned long long>(range_waits_),
-             static_cast<unsigned long long>(range_wait_ns_),
-             static_cast<unsigned long long>(range_wait_free_),
              static_cast<unsigned long long>(enqueue_waits_),
              static_cast<unsigned long long>(enqueue_wait_ns_));
   }
@@ -350,10 +294,6 @@ private:
       Task task = std::move(queue_.front());
       queue_.pop_front();
       busy_ = true;
-      // Keep the in-flight task's range visible to waitForRange while it is
-      // no longer in the queue.
-      current_ = {true, task.handle, task.has_offset, task.offset,
-                  task.payloadSize()};
       not_full_.notify_one();
       lock.unlock();
       int rc = -1;
@@ -372,7 +312,6 @@ private:
       task.releaseOwned();
       lock.lock();
       busy_ = false;
-      current_.active = false;
       auto it = pending_.find(task.handle);
       if (it != pending_.end() && --it->second == 0)
         pending_.erase(it);
@@ -407,14 +346,6 @@ private:
   std::condition_variable handle_done_;
   std::condition_variable idle_;
   std::deque<Task> queue_;
-  struct InFlight {
-    bool active = false;
-    int handle = -1;
-    bool has_offset = false;
-    long offset = 0;
-    size_t size = 0;
-  };
-  InFlight current_;
   std::unordered_map<int, uint64_t> pending_;
   // First failing rc per handle; entries are dropped on close (see
   // forgetHandle) so a reused file id starts clean.
@@ -440,9 +371,6 @@ private:
   size_t max_queue_depth_ = 0;
   uint64_t drain_calls_ = 0;
   uint64_t drain_wait_ns_ = 0;
-  uint64_t range_waits_ = 0;
-  uint64_t range_wait_ns_ = 0;
-  uint64_t range_wait_free_ = 0;
   uint64_t enqueue_waits_ = 0;
   uint64_t enqueue_wait_ns_ = 0;
 };
