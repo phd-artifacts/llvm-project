@@ -77,11 +77,11 @@ ompfile code sits in files of its own beside each (Oct 2026 layout):
 - Shared configuration: `openmp/libompfile/include/ompfile_config.h`, parsed
   by the rules in `ompfile_env.h`. The proxy's snapshot is `ProxyConfig` (the
   `ProxyOmpFile` member `OmpFileConfig`); a knob libompfile reads too sits in
-  its `SharedConfig` with one rule: `SharedConfig::SchedulerHeadnode`
-  (`env::schedulerIsHeadnode()`) for `LIBOMPFILE_SCHEDULER`, the stage mode,
-  write mode and freshness guard, and `WritebackDistributeActive` for
-  distributed write-back (the proxy's derived-tile dirty-flush completion uses
-  it). The headnode reads `HeadnodeConfig` in
+  its `SharedConfig` with one rule: the stage mode, write mode and freshness
+  guard. (`LIBOMPFILE_SCHEDULER` and the distributed write-back knobs, with
+  `SharedConfig::SchedulerHeadnode` / `WritebackDistributeActive`, were
+  removed in Oct 2026.)
+  The headnode reads `HeadnodeConfig` in
   `OmpFileHeadnodeManager::initialize()`. Never a local `getenv` for a
   `LIBOMPFILE_*` knob. The five LLVM `BoolEnvar` knobs (`OPEN_CACHE`,
   `OPEN_CACHE_KEEP_OPEN`, `OPT_STATS`, `OPEN_CREATE_ON_WRITE`,
@@ -200,12 +200,22 @@ ompfile code sits in files of its own beside each (Oct 2026 layout):
 
 ## Scheduler behavior
 
-- HEADNODE is the scheduler default since Oct 2026: `LIBOMPFILE_SCHEDULER`
-  unset, empty, `HEADNODE` (any case) or an unknown value all mean HEADNODE,
-  and only `LOCAL` turns it off (`ompfile::env::schedulerIsHeadnode()`, read
-  once into `SharedConfig::SchedulerHeadnode`; the proxy's own open placement
-  reads the `ProxyOmpFile` member `OmpFileHeadnodeScheduler`). Under HEADNODE
-  an open sends a scheduler request.
+- HEADNODE scheduling is unconditional: `LIBOMPFILE_SCHEDULER` is a removed
+  knob (Oct 2026), so every open sends a scheduler request, the proxy
+  bridge's own opens always ask the headnode for placement
+  (`selectAggregatorRankForOpen`), and the coherent read refresh is gated
+  only by `LIBOMPFILE_OPT_COHERENT_READ_REFRESH`
+  (`shouldRefreshTrackedOmpFileFdForRead`).
+- A dirty flush completes one path-key epoch on the headnode
+  (`flushDirtyRangesToSource`). When the headnode refuses that with
+  `source-not-fresh` (EHOSTUNREACH: another proxy wrote the file later, so
+  dirty tiles of one file sit on several proxies, e.g. placed by the test
+  placement hook), the flush completes per tile instead
+  (`completeDerivedTileFlushesOnHeadnode`), and a close-time flush defers
+  that metadata completion entirely (the bytes are already fdatasync'd; the
+  per-tile loop at shutdown reproduced `internal_Testall` aborts on AMD).
+  Before Oct 2026 the same path was keyed on the removed distributed
+  write-back knob instead of on the refusal.
 - `OmpFileHeadnodeManager` keeps:
   - handler table, per worker rank: `PlansIssued` (one per scalar plan, OPEN
     included, batch segments not; monotonic; the load of every pick),
@@ -319,8 +329,9 @@ ompfile code sits in files of its own beside each (Oct 2026 layout):
   and whether plugin init is valid in that role (`ActiveMPIPlugin` is set by
   `ompfilePublishMPIPlugin` in `OriginOmpFileBridge.cpp`, called from
   `createPlugin_mpi` in `rtl.cpp`).
-- If scheduling seems ignored, check that `LIBOMPFILE_SCHEDULER` is not
-  `LOCAL` in the process environment (unset means HEADNODE since Oct 2026).
+- If scheduling seems ignored, look for a `removed knob ignored:` line (a
+  stale `LIBOMPFILE_SCHEDULER` in the environment changes nothing) and for
+  the scheduler request logs; HEADNODE has no off switch since Oct 2026.
 - Use `LIBOMPFILE_OPT_STATS=1` to inspect open/close cache counters
   printed by proxy.
 - Readthrough stage entries are process-local; if multiple proxies can

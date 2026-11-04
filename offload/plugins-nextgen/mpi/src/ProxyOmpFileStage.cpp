@@ -694,46 +694,9 @@ bool ProxyOmpFile::flushDirtyRangesToSource(OmpFileStageEntry &Entry,
       return failDirtyFlush("fdatasync-source", SyncErrno, 0, 0, Epoch);
     }
 
-    bool CompletedViaDerivedTileKeys = false;
+    // One path-key completion per flush, unless the headnode refuses it
+    // because this proxy is no longer the path key's fresh owner (below).
     if (Epoch > 0 && !SourcePath.empty()) {
-      // The same distributed write-back predicate libompfile routes by:
-      // DISTRIBUTE_WRITES=1 and DISTRIBUTE_RANKS > 1.
-      const uint64_t TileBytes = configuredStageTileBytes();
-      if (OmpFileConfig.Shared.WritebackDistributeActive && TileBytes > 0) {
-        if (DeferCloseMetadataCompletion) {
-          // The close path already copied dirty bytes to the shared source and
-          // fdatasync'd them above. Avoid one metadata-completion operation per
-          // dirty tile during shutdown on every proxy, including the headnode:
-          // the headnode-local loop reproduced MPI internal_Testall aborts on
-          // AMD 8192x128/9-proxy runs after thousands of close-time derived
-          // completions, and remote completion events had already reproduced
-          // the same class of abort on Sorgan. Active in-run reads remain
-          // protected by the tile oracle because this deferral is used only by
-          // close-time flushes; in-run watermark flushes still complete
-          // metadata immediately.
-          CompletedViaDerivedTileKeys = true;
-          REPORT("MPIProxyDevice --> OMPFile derived tile dirty flush "
-                 "completion deferred rank=%d path=%s tile_bytes=%llu "
-                 "extents=%zu headnode=%d\n",
-                 EventSystem.LocalRank, SourcePath.c_str(),
-                 static_cast<unsigned long long>(TileBytes), Extents.size(),
-                 EventSystem.LocalRank == getHeadnodeRank() ? 1 : 0);
-        } else {
-          errno = 0;
-          CompletedViaDerivedTileKeys = completeDerivedTileFlushesOnHeadnode(
-              PathKey, Extents, TileBytes, SourcePath);
-          if (!CompletedViaDerivedTileKeys) {
-            REPORT("MPIProxyDevice --> OMPFile derived tile dirty flush "
-                   "completion unavailable rank=%d errno=%d path=%s "
-                   "tile_bytes=%llu; falling back to path-key completion\n",
-                   EventSystem.LocalRank, errno, SourcePath.c_str(),
-                   static_cast<unsigned long long>(TileBytes));
-          }
-        }
-      }
-    }
-
-    if (Epoch > 0 && !SourcePath.empty() && !CompletedViaDerivedTileKeys) {
       errno = 0;
       if (PathKey == 0 ||
           !completeDirtyFlushOnHeadnode(PathKey, EventSystem.LocalRank,
@@ -752,9 +715,51 @@ bool ProxyOmpFile::flushDirtyRangesToSource(OmpFileStageEntry &Entry,
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
           continue;
         }
-        closeFlushFd();
-        return failDirtyFlush("headnode-complete", CompletionErrno, 0, 0,
-                              Epoch);
+        // EHOSTUNREACH is the headnode's source-not-fresh: another proxy
+        // committed a later write to this file after this proxy's epoch, so
+        // dirty tiles of one file sit on several proxies (placed writes; the
+        // test placement hook reaches this). The path key names only the last
+        // writer, so complete per tile instead, as distributed write-back did
+        // before its knob was removed (Oct 2026).
+        bool CompletedViaDerivedTileKeys = false;
+        const uint64_t TileBytes = configuredStageTileBytes();
+        if (CompletionErrno == EHOSTUNREACH && PathKey != 0 && TileBytes > 0) {
+          if (DeferCloseMetadataCompletion) {
+            // The close path already copied dirty bytes to the shared source
+            // and fdatasync'd them above. Avoid one metadata-completion
+            // operation per dirty tile during shutdown on every proxy: the
+            // headnode-local loop reproduced MPI internal_Testall aborts on
+            // AMD 8192x128/9-proxy runs after thousands of close-time derived
+            // completions, and remote completion events had already
+            // reproduced the same class of abort on Sorgan. Active in-run
+            // reads remain protected by the tile oracle because this deferral
+            // is used only by close-time flushes; in-run watermark flushes
+            // still complete metadata immediately.
+            CompletedViaDerivedTileKeys = true;
+            REPORT("MPIProxyDevice --> OMPFile derived tile dirty flush "
+                   "completion deferred rank=%d path=%s tile_bytes=%llu "
+                   "extents=%zu headnode=%d\n",
+                   EventSystem.LocalRank, SourcePath.c_str(),
+                   static_cast<unsigned long long>(TileBytes), Extents.size(),
+                   EventSystem.LocalRank == getHeadnodeRank() ? 1 : 0);
+          } else {
+            errno = 0;
+            CompletedViaDerivedTileKeys = completeDerivedTileFlushesOnHeadnode(
+                PathKey, Extents, TileBytes, SourcePath);
+            if (!CompletedViaDerivedTileKeys) {
+              REPORT("MPIProxyDevice --> OMPFile derived tile dirty flush "
+                     "completion unavailable rank=%d errno=%d path=%s "
+                     "tile_bytes=%llu\n",
+                     EventSystem.LocalRank, errno, SourcePath.c_str(),
+                     static_cast<unsigned long long>(TileBytes));
+            }
+          }
+        }
+        if (!CompletedViaDerivedTileKeys) {
+          closeFlushFd();
+          return failDirtyFlush("headnode-complete", CompletionErrno, 0, 0,
+                                Epoch);
+        }
       }
     }
 

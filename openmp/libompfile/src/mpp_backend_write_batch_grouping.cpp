@@ -2,6 +2,7 @@
 #include "mpp_backend.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -56,30 +57,14 @@ void MppBackend::processWriteGroup(std::vector<WriteBatchRequest *> &group) {
   // Byte content is NOT materialized here. A member rejected here (EINVAL,
   // EOVERFLOW) is completed at once and joins no run.
   //
-  // The remote handle is the lowest-offset member's, as before: group.front()
-  // once sorted. A completed member's owner may return and destroy it, so the
-  // handle is read before the first completion (the first reject runs after
-  // the sort and before anything is completed) or, with no rejects, after
-  // the pass, when every member is still alive.
-  std::vector<WriteBatchRequest *> rejected;
   std::vector<CoalescedWrite> coalesced;
-  int file_id = -1;
-  bool file_id_taken = false;
   ompfile::batch::coalesceSortedRuns(
       group, settings.write_batch_max_batch_bytes, coalesced,
       [](const WriteBatchRequest &r) { return r.Offset; },
       [](const WriteBatchRequest &r) { return r.Data.size(); },
-      [this, &rejected, &group, &file_id,
-       &file_id_taken](WriteBatchRequest &r, int errnum) {
-        if (!file_id_taken) {
-          file_id = group.front()->FileHandle;
-          file_id_taken = true;
-        }
+      [this](WriteBatchRequest &r, int errnum) {
         completeWriteBatchRequest(r, -1, errnum);
-        rejected.push_back(&r);
       });
-  if (!file_id_taken)
-    file_id = group.front()->FileHandle;
 
   // Pass 2: materialize each group's bytes by applying member requests in
   // real submission order (ascending DebugRequestId, assigned when the
@@ -111,19 +96,19 @@ void MppBackend::processWriteGroup(std::vector<WriteBatchRequest *> &group) {
            coalesced[dbg_i].Data.size(), coalesced[dbg_i].Requests.size());
   }
 
-  int remote_handle = lookupRemoteHandle(file_id);
-  if (remote_handle < 0) {
-    counters.write_batch_failure_count.fetch_add(1, std::memory_order_relaxed);
-    // A member pass 1 rejected is already complete and may be gone; only
-    // its address is compared.
-    for (WriteBatchRequest *request : group)
-      if (std::find(rejected.begin(), rejected.end(), request) ==
-          rejected.end())
-        completeWriteBatchRequest(*request, -1, EBADF);
-    return;
-  }
-
   for (CoalescedWrite &item : coalesced) {
+    assert(!item.Requests.empty() && "a coalesced write has a pending member");
+    // Independent opens of one path share a group. Once a run completes,
+    // its callers may close their handles immediately; none of those handles
+    // can be borrowed by a later run. This run's members are still blocked
+    // in pwrite, so one of their handles stays live until this I/O completes.
+    const int remote_handle = lookupRemoteHandle(item.Requests.front()->FileHandle);
+    if (remote_handle < 0) {
+      counters.write_batch_failure_count.fetch_add(1, std::memory_order_relaxed);
+      for (WriteBatchRequest *request : item.Requests)
+        completeWriteBatchRequest(*request, -1, EBADF);
+      continue;
+    }
     counters.write_batch_coalesced_write_count.fetch_add(
         1, std::memory_order_relaxed);
     counters.write_batch_coalesced_bytes_total.fetch_add(

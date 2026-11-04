@@ -484,8 +484,6 @@ bool ProxyOmpFile::completeDirtyFlushOnHeadnode(uint64_t PathKey,
 
 int ProxyOmpFile::selectAggregatorRankForOpen(const char *Path, int Mode) {
   int Rank = isWorkerRank(EventSystem.LocalRank) ? EventSystem.LocalRank : 0;
-  if (!OmpFileHeadnodeScheduler)
-    return Rank;
 
   OmpFileIORequest Request{};
   Request.RequestId =

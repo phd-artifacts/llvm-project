@@ -29,12 +29,6 @@ inline constexpr int kConservativeWritebackOwnerRank = 0;
 // The dirty-owner retry loop runs attempts 0..kMaxDirtyOwnerForwardRetries.
 inline constexpr unsigned kMaxDirtyOwnerForwardRetries = 8;
 
-// Distributed write-back routing, sampled by snapshotDistributeConfig().
-struct DistributeConfig {
-  bool Active = false; // SharedConfig::WritebackDistributeActive
-  unsigned Ranks = 0;  // SharedConfig::WritebackDistributeRanks when Active
-};
-
 // Read-path knobs, sampled once per request (snapshotReadRouteConfig()).
 struct ReadRouteConfig {
   bool TwoPhaseActive = false;       // isTwoPhaseActive()
@@ -65,8 +59,6 @@ enum class ReadRoute : uint8_t {
   // dirtyForwardDecision / resolveWritebackOwnerTail
   WritebackDirtyForward,      // dirty-owner read from SourceRank
   WritebackLocalDirty,        // dirty-owner read on SourceRank == aggregator
-  WritebackRefuseSourceClean, // ESTALE
-  WritebackRefuseDistributed, // ESTALE
   WritebackConservativeOwner, // staged read on TargetRank (rank 0)
   // resolveRebalanceRoute
   PlannedRebalanced, // staged read on TargetRank (the aggregator)
@@ -99,16 +91,12 @@ struct DirtySourcePlan {
   int SourceRank = kConservativeWritebackOwnerRank;
   uint64_t ExpectedVersion = 0;
   bool FreshnessHasSource = false;
-  bool HasRangeWritebackOwner = false;
-  bool NeedsHistoryScan = false;
 };
 
 // What the executor of one read has observed; the routes' logs read it.
 struct ReadRouteState {
   CoherentObservation Coherent{};
   RebalanceVerdict Rebalance{};
-  bool DirtySourceKnownClean = false;
-  bool DirtySourceUnknown = false;
 };
 
 enum class DirtyOracleOutcome : uint8_t { Dirty, Clean, Unavailable };
@@ -129,39 +117,28 @@ struct ForwardFailure {
 };
 
 enum class WriteRoute : uint8_t {
-  Batched,         // writeAtBatched
-  DistributedRank, // writeAtRemoteRankWithBytes; OwnerHandle on failure
-  OwnerHandle,     // the opened owner handle
+  Batched,     // writeAtBatched
+  OwnerHandle, // the opened owner handle
+  // writeAtRemoteRankWithBytes on TargetRank, fail-closed (no owner
+  // fallback). resolveWriteRoute never returns it: only the test placement
+  // hook (ompfile_test_hooks.h) builds it, so multi-owner coherence keeps a
+  // way to put dirty data on a chosen proxy until Phase E plans placement.
+  PlacedRank,
 };
 
 struct WriteRouteConfig {
   bool WriteBatchActive = false; // isWriteBatchActive()
-  DistributeConfig Distribute{}; // sampled only when !WriteBatchActive
 };
 
 struct WriteDecision {
   WriteRoute Route = WriteRoute::OwnerHandle;
-  int TargetRank = -1; // DistributedRank: the write's and commit's rank
+  int TargetRank = -1; // PlacedRank: the write's and commit's rank
 };
 
 inline bool rangesOverlap(long a_start, long a_end, long b_start, long b_end) {
   if (a_end <= a_start || b_end <= b_start)
     return false;
   return a_start < b_end && b_start < a_end;
-}
-
-inline int distributedRankForKey(uint64_t key, unsigned ranks) {
-  if (ranks <= 1)
-    return -1;
-  return static_cast<int>(key % ranks);
-}
-
-// End of [offset, offset + size), or offset itself when that overflows long.
-inline long readEndOrOffset(long offset, size_t size) {
-  return (size <= static_cast<size_t>(std::numeric_limits<long>::max()) &&
-          offset <= std::numeric_limits<long>::max() - static_cast<long>(size))
-             ? offset + static_cast<long>(size)
-             : offset;
 }
 
 inline bool hasUsablePlan(const OmpFileReadRequestContext &context) {
@@ -215,13 +192,11 @@ inline ReadDecision resolveCoherentReadRoute(const CoherentObservation &obs,
   return decision;
 }
 
-// Freshness commits report the rank that actually completed a write. This is
-// authoritative when write batching falls back to a file owner, whereas the
-// tile hash is only a prospective destination. Use the hash solely before a
-// committed source is available.
-inline DirtySourcePlan resolveDirtySource(const CoherentObservation &obs,
-                                          const OmpFileIOHint &hint,
-                                          const DistributeConfig &distribute) {
+// Freshness commits report the rank that actually completed a write: the
+// COPY_FROM_RANK source is the dirty source. Without one the read falls back
+// to the conservative owner (rank 0); there is no prospective placement to
+// guess from since the hash-routed write owners went (Oct 2026).
+inline DirtySourcePlan resolveDirtySource(const CoherentObservation &obs) {
   const FreshnessView &freshness = obs.Initial;
   DirtySourcePlan plan{};
   plan.FreshnessHasSource =
@@ -230,58 +205,10 @@ inline DirtySourcePlan resolveDirtySource(const CoherentObservation &obs,
       freshness.SourceRank >= 0;
   plan.SourceRank = plan.FreshnessHasSource ? freshness.SourceRank
                                             : kConservativeWritebackOwnerRank;
-  if (distribute.Active && !plan.FreshnessHasSource &&
-      (hint.HintFlags & OMPFILE_IO_HINT_HAS_TILE) != 0) {
-    const int tile_owner_rank =
-        distributedRankForKey(hint.TileId, distribute.Ranks);
-    if (tile_owner_rank >= 0) {
-      plan.SourceRank = tile_owner_rank;
-      plan.HasRangeWritebackOwner = true;
-    }
-  }
-  plan.NeedsHistoryScan = distribute.Active && !plan.HasRangeWritebackOwner &&
-                          !plan.FreshnessHasSource;
   plan.ExpectedVersion = (freshness.Valid && freshness.SelectedVersion != 0)
                              ? freshness.SelectedVersion
                              : 0;
   return plan;
-}
-
-// Rank of the latest-sequence write overlapping [offset, read_end), -1 if
-// none. The caller holds the backend's handle lock. EntryRange elements need
-// Start, End, Sequence, HasTile and TileId (the backend's WriteEpochEntry).
-template <typename EntryRange>
-inline int latestOverlappingWriteOwnerRank(const EntryRange &entries,
-                                           long offset, long read_end,
-                                           unsigned distribute_ranks) {
-  assert(distribute_ranks > 1 && "history scan needs more than one rank");
-  uint64_t latest_sequence = 0;
-  int range_owner_rank = -1;
-  for (const auto &entry : entries) {
-    if (entry.Sequence < latest_sequence)
-      continue;
-    if (!rangesOverlap(offset, read_end, entry.Start, entry.End))
-      continue;
-    // Without a tile hint, key on the write's start offset alone (not its own
-    // byte width): two writes covering the same physical region but with
-    // differing widths must still route to the same rank, which dividing by
-    // (End-Start) breaks.
-    const uint64_t key =
-        entry.HasTile ? entry.TileId : static_cast<uint64_t>(entry.Start);
-    latest_sequence = entry.Sequence;
-    range_owner_rank = static_cast<int>(key % distribute_ranks);
-  }
-  return range_owner_rank;
-}
-
-inline void applyHistoryScan(DirtySourcePlan &plan, int range_owner_rank) {
-  assert(plan.NeedsHistoryScan && "history scan result without a scan");
-  if (range_owner_rank >= 0) {
-    plan.SourceRank = range_owner_rank;
-    plan.HasRangeWritebackOwner = true;
-  } else {
-    plan.SourceRank = kConservativeWritebackOwnerRank;
-  }
 }
 
 inline DirtyOracleOutcome classifyDirtyOracle(bool query_ok, int oracle_state) {
@@ -301,24 +228,20 @@ inline ReadDecision dirtyForwardDecision(const DirtySourcePlan &plan) {
   return decision;
 }
 
-inline ReadDecision
-resolveWritebackOwnerTail(const DirtySourcePlan &plan, int aggregator_rank,
-                          const DistributeConfig &distribute, bool known_clean,
-                          bool unknown) {
+// What a write-back read does when no dirty forward served it. When the
+// freshness oracle named the aggregator itself as the COPY_FROM_RANK source,
+// the dirty bytes sit in the aggregator's stage: a dirty-owner read there
+// (before Oct 2026 only under the removed distributed write-back, whose hashed
+// owners were the only way a non-zero rank held dirty data). Otherwise a
+// staged read on the conservative owner, whatever the oracle said.
+inline ReadDecision resolveWritebackOwnerTail(const DirtySourcePlan &plan,
+                                              int aggregator_rank) {
   ReadDecision decision{};
   decision.SourceRank = plan.SourceRank;
   decision.ExpectedVersion = plan.ExpectedVersion;
-  if (distribute.Active && plan.SourceRank == aggregator_rank) {
+  if (plan.FreshnessHasSource && plan.SourceRank == aggregator_rank) {
     decision.Route = ReadRoute::WritebackLocalDirty;
     decision.TargetRank = plan.SourceRank;
-    return decision;
-  }
-  if (distribute.Active && known_clean && !unknown) {
-    decision.Route = ReadRoute::WritebackRefuseSourceClean;
-    return decision;
-  }
-  if (distribute.Active) {
-    decision.Route = ReadRoute::WritebackRefuseDistributed;
     return decision;
   }
   decision.Route = ReadRoute::WritebackConservativeOwner;
@@ -414,39 +337,14 @@ inline ForwardFailure classifyForwardFailure(int forward_errno,
   return failure;
 }
 
-// The write path's old chooseDistributedWriteRank, minus the environment.
-inline int distributedWriteRank(const OmpFileWriteRequestContext &context,
-                                size_t size, unsigned ranks) {
-  if (ranks <= 1)
-    return -1;
-  uint64_t key = 0;
-  if ((context.Hint.HintFlags & OMPFILE_IO_HINT_HAS_TILE) != 0)
-    key = context.Hint.TileId;
-  else if (context.Offset >= 0 && size > 0)
-    key = static_cast<uint64_t>(context.Offset / static_cast<int64_t>(size));
-  else if (context.Offset >= 0)
-    key = static_cast<uint64_t>(context.Offset);
-  else
-    return -1;
-  return static_cast<int>(key % ranks);
-}
-
-inline WriteDecision resolveWriteRoute(const OmpFileWriteRequestContext &context,
-                                       size_t size,
-                                       const WriteRouteConfig &config) {
+// Batched when write batching is active, else the owner handle. A write
+// goes where the file was opened (the HEADNODE placement); the hash-routed
+// write owners (LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_*) were removed in
+// Oct 2026.
+inline WriteDecision resolveWriteRoute(const WriteRouteConfig &config) {
   WriteDecision decision{};
-  if (config.WriteBatchActive) {
+  if (config.WriteBatchActive)
     decision.Route = WriteRoute::Batched;
-    return decision;
-  }
-  const int rank = config.Distribute.Active
-                       ? distributedWriteRank(context, size,
-                                              config.Distribute.Ranks)
-                       : -1;
-  if (rank >= 0) {
-    decision.Route = WriteRoute::DistributedRank;
-    decision.TargetRank = rank;
-  }
   return decision;
 }
 

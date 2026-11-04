@@ -81,8 +81,6 @@ bool ProxyOmpFile::shouldRefreshTrackedOmpFileFdForRead(
     const OmpFileTrackedFdEntry &Entry) const {
   if (!OmpFileCoherentReadRefresh)
     return false;
-  if (!OmpFileHeadnodeScheduler)
-    return false;
   if (Entry.Path.empty())
     return false;
   if (Entry.Flags & (O_CREAT | O_EXCL | O_TRUNC))

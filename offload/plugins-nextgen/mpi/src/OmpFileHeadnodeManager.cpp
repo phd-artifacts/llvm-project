@@ -736,6 +736,20 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
 
     std::string_view PathView(Path, Request.PathSize > 0 ? Request.PathSize - 1
                                                          : 0);
+    const bool TestOwner =
+        (Request.Flags & ompfile::OMPFILE_IO_REQUEST_TEST_OPEN_OWNER) != 0;
+    if (TestOwner && !isWorkerRankUnlocked(Request.AggregatorRank)) {
+      Plan.Status = -1;
+      Plan.Errno = EINVAL;
+      return Plan;
+    }
+    auto Existing = GlobalFileTable.find(std::string(PathView));
+    if (TestOwner && Existing != GlobalFileTable.end() &&
+        Existing->second.PreferredAggregatorRank != Request.AggregatorRank) {
+      Plan.Status = -1;
+      Plan.Errno = EBUSY;
+      return Plan;
+    }
     auto [It, Inserted] = GlobalFileTable.try_emplace(std::string(PathView));
     GlobalFileEntry &Entry = It->second;
     const uint64_t PathKey = ompfile::keys::pathKey(PathView);
@@ -749,7 +763,11 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
 
     bool AffinityHit = false;
     bool Rebalanced = false;
-    if (Inserted) {
+    if (TestOwner) {
+      HandlerRank = Request.AggregatorRank;
+      Entry.PreferredAggregatorRank = HandlerRank;
+      registerPathAffinityUnlocked(PathKey, HandlerRank);
+    } else if (Inserted) {
       HandlerRank = pickRankForPathKeyUnlocked(PathKey, /*HasPathKey=*/true,
                                                Request.ClientRank, AffinityHit,
                                                Rebalanced);

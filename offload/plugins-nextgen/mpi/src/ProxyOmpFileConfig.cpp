@@ -612,7 +612,6 @@ ProxyOmpFile::ProxyOmpFile(EventSystemTy &ES)
       OmpFileLocalDisjointStripeMinBytes(
           OmpFileConfig.LocalDisjointStripeMinBytes),
       OmpFileLocalDisjointReadStreams(OmpFileConfig.LocalDisjointReadStreams),
-      OmpFileHeadnodeScheduler(OmpFileConfig.Shared.SchedulerHeadnode),
       OmpFileStageMode(OmpFileConfig.Shared.StageMode),
       OmpFileStageWriteMode(OmpFileConfig.Shared.StageWriteMode),
       OmpFileStageSyncPolicy(OmpFileConfig.StageSyncPolicy),

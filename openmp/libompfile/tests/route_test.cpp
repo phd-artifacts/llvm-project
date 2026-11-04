@@ -57,21 +57,6 @@ RebalanceVerdict routeTestVerdict(bool Safe, const char *Reason) {
   return R;
 }
 
-DistributeConfig routeTestDistribute(bool Active, unsigned Ranks) {
-  DistributeConfig D;
-  D.Active = Active;
-  D.Ranks = Ranks;
-  return D;
-}
-
-struct HistoryEntry {
-  long Start = 0;
-  long End = 0;
-  uint64_t TileId = 0;
-  uint64_t Sequence = 0;
-  bool HasTile = false;
-};
-
 const auto kUseLocal = OmpFileFreshnessDecision::USE_LOCAL;
 const auto kReadPfs = OmpFileFreshnessDecision::READ_PFS;
 const auto kWait = OmpFileFreshnessDecision::WAIT_OR_FAIL;
@@ -108,43 +93,19 @@ OMPFILE_TEST(route_coherent) {
 }
 
 OMPFILE_TEST(route_dirty_source) {
-  ompfile::OmpFileIOHint Tile4{};
-  Tile4.HintFlags = ompfile::OMPFILE_IO_HINT_HAS_TILE;
-  Tile4.TileId = 4;
-  ompfile::OmpFileIOHint Tile7 = Tile4;
-  Tile7.TileId = 7;
-  const ompfile::OmpFileIOHint NoTile{};
-  const DirtySourcePlan A = resolveDirtySource(routeTestObs(routeTestView(kCopy, 2, 7), false), Tile4, routeTestDistribute(true, 3));
-  OMPFILE_CHECK(A.SourceRank == 2 && A.FreshnessHasSource && !A.NeedsHistoryScan && A.ExpectedVersion == 7u);
-  const DirtySourcePlan B = resolveDirtySource(routeTestObs(routeTestView(kWait, -1, 0, false), false), Tile7, routeTestDistribute(true, 3));
-  OMPFILE_CHECK(B.SourceRank == 1 && B.HasRangeWritebackOwner && !B.NeedsHistoryScan);
-  DirtySourcePlan S = resolveDirtySource(routeTestObs(routeTestView(kWait, -1, 0, false), false), NoTile, routeTestDistribute(true, 3));
-  OMPFILE_CHECK(S.NeedsHistoryScan && S.SourceRank == 0);
-  const DirtySourcePlan Off = resolveDirtySource(routeTestObs(routeTestView(kWait, -1, 0, false), false), NoTile, routeTestDistribute(false, 0));
-  OMPFILE_CHECK(Off.SourceRank == 0 && !Off.NeedsHistoryScan);
-  OMPFILE_CHECK(!resolveDirtySource(routeTestObs(routeTestView(kCopy, -1, 0), false), NoTile, routeTestDistribute(false, 0)).FreshnessHasSource);
-  DirtySourcePlan S2 = S;
-  applyHistoryScan(S, 2);
-  OMPFILE_CHECK(S.SourceRank == 2 && S.HasRangeWritebackOwner);
-  applyHistoryScan(S2, -1);
-  OMPFILE_CHECK(S2.SourceRank == 0 && !S2.HasRangeWritebackOwner);
+  const DirtySourcePlan A = resolveDirtySource(routeTestObs(routeTestView(kCopy, 2, 7), false));
+  OMPFILE_CHECK(A.SourceRank == 2 && A.FreshnessHasSource && A.ExpectedVersion == 7u);
+  // No committed source: the conservative owner, as with the removed
+  // distributed write-back off (no tile-hash guess).
+  const DirtySourcePlan B = resolveDirtySource(routeTestObs(routeTestView(kWait, -1, 0, false), false));
+  OMPFILE_CHECK(B.SourceRank == 0 && !B.FreshnessHasSource && B.ExpectedVersion == 0u);
+  const DirtySourcePlan C = resolveDirtySource(routeTestObs(routeTestView(kCopy, -1, 0), false));
+  OMPFILE_CHECK(C.SourceRank == 0 && !C.FreshnessHasSource);
+  const DirtySourcePlan D = resolveDirtySource(routeTestObs(routeTestView(kUseLocal, -1, 4), false));
+  OMPFILE_CHECK(D.SourceRank == 0 && !D.FreshnessHasSource && D.ExpectedVersion == 4u);
 }
 
-OMPFILE_TEST(route_history_scan) {
-  std::vector<HistoryEntry> E(3);
-  E[0].Start = 0; E[0].End = 100; E[0].TileId = 5; E[0].Sequence = 1; E[0].HasTile = true;
-  E[1].Start = 200; E[1].End = 300; E[1].Sequence = 2;
-  E[2].Start = 50; E[2].End = 150; E[2].TileId = 9; E[2].Sequence = 3; E[2].HasTile = true;
-  OMPFILE_CHECK_EQ(latestOverlappingWriteOwnerRank(E, 60, 70, 3), 0);
-  OMPFILE_CHECK_EQ(latestOverlappingWriteOwnerRank(E, 210, 220, 3), 2);
-  OMPFILE_CHECK_EQ(latestOverlappingWriteOwnerRank(E, 400, 500, 3), -1);
-  std::vector<HistoryEntry> F(2);
-  F[0].Start = 0; F[0].End = 100; F[0].TileId = 4; F[0].Sequence = 5; F[0].HasTile = true;
-  F[1].Start = 0; F[1].End = 100; F[1].TileId = 5; F[1].Sequence = 2; F[1].HasTile = true;
-  OMPFILE_CHECK_EQ(latestOverlappingWriteOwnerRank(F, 10, 20, 3), 1);
-  OMPFILE_CHECK_EQ(readEndOrOffset(10, 5), 15L);
-  OMPFILE_CHECK_EQ(readEndOrOffset(LONG_MAX - 1, 5), LONG_MAX - 1);
-  OMPFILE_CHECK_EQ(readEndOrOffset(0, SIZE_MAX), 0L);
+OMPFILE_TEST(route_ranges_overlap) {
   OMPFILE_CHECK(rangesOverlap(0, 10, 5, 15));
   OMPFILE_CHECK(!rangesOverlap(0, 10, 10, 20));
   OMPFILE_CHECK(!rangesOverlap(5, 5, 0, 10));
@@ -155,13 +116,15 @@ OMPFILE_TEST(route_writeback_tail) {
   DirtySourcePlan P;
   P.SourceRank = 2;
   P.ExpectedVersion = 9;
-  const ReadDecision L = resolveWritebackOwnerTail(P, 2, routeTestDistribute(true, 3), false, false);
+  P.FreshnessHasSource = true;
+  const ReadDecision L = resolveWritebackOwnerTail(P, 2);
   OMPFILE_CHECK(L.Route == ReadRoute::WritebackLocalDirty && L.TargetRank == 2 && L.SourceRank == 2 && L.ExpectedVersion == 9u);
-  OMPFILE_CHECK(resolveWritebackOwnerTail(P, 1, routeTestDistribute(true, 3), true, false).Route == ReadRoute::WritebackRefuseSourceClean);
-  OMPFILE_CHECK(resolveWritebackOwnerTail(P, 1, routeTestDistribute(true, 3), true, true).Route == ReadRoute::WritebackRefuseDistributed);
-  OMPFILE_CHECK(resolveWritebackOwnerTail(P, 1, routeTestDistribute(true, 3), false, false).Route == ReadRoute::WritebackRefuseDistributed);
-  const ReadDecision C = resolveWritebackOwnerTail(P, 2, routeTestDistribute(false, 0), false, false);
-  OMPFILE_CHECK(C.Route == ReadRoute::WritebackConservativeOwner && C.TargetRank == 0);
+  const ReadDecision C = resolveWritebackOwnerTail(P, 1);
+  OMPFILE_CHECK(C.Route == ReadRoute::WritebackConservativeOwner && C.TargetRank == 0 && C.SourceRank == 2);
+  DirtySourcePlan Guess;
+  Guess.SourceRank = 0;
+  const ReadDecision G = resolveWritebackOwnerTail(Guess, 0);
+  OMPFILE_CHECK(G.Route == ReadRoute::WritebackConservativeOwner && G.TargetRank == 0);
   const ReadDecision D = dirtyForwardDecision(P);
   OMPFILE_CHECK(D.Route == ReadRoute::WritebackDirtyForward && D.SourceRank == 2 && D.TargetRank == 2 && D.ExpectedVersion == 9u);
   OMPFILE_CHECK(classifyDirtyOracle(true, 1) == DirtyOracleOutcome::Dirty);
@@ -218,36 +181,16 @@ OMPFILE_TEST(route_forward_failure) {
 }
 
 OMPFILE_TEST(route_write) {
-  ompfile::OmpFileWriteRequestContext Tile{};
-  Tile.Hint.HintFlags = ompfile::OMPFILE_IO_HINT_HAS_TILE;
-  Tile.Hint.TileId = 7;
   WriteRouteConfig Batched;
   Batched.WriteBatchActive = true;
-  OMPFILE_CHECK(resolveWriteRoute(Tile, 64, Batched).Route == WriteRoute::Batched);
-  WriteRouteConfig D3;
-  D3.Distribute = routeTestDistribute(true, 3);
-  const WriteDecision T = resolveWriteRoute(Tile, 64, D3);
-  OMPFILE_CHECK(T.Route == WriteRoute::DistributedRank && T.TargetRank == 1);
-  ompfile::OmpFileWriteRequestContext Off{};
-  Off.Offset = 4096;
-  OMPFILE_CHECK_EQ(resolveWriteRoute(Off, 1024, D3).TargetRank, 1);
-  Off.Offset = 10;
-  OMPFILE_CHECK_EQ(resolveWriteRoute(Off, 0, D3).TargetRank, 1);
-  Off.Offset = -1;
-  const WriteDecision Neg = resolveWriteRoute(Off, 8, D3);
-  OMPFILE_CHECK(Neg.Route == WriteRoute::OwnerHandle && Neg.TargetRank == -1);
-  WriteRouteConfig D1;
-  D1.Distribute = routeTestDistribute(true, 1);
-  OMPFILE_CHECK(resolveWriteRoute(Tile, 64, D1).Route == WriteRoute::OwnerHandle);
-  WriteRouteConfig Inactive;
-  Inactive.Distribute = routeTestDistribute(false, 3);
-  OMPFILE_CHECK(resolveWriteRoute(Tile, 64, Inactive).Route == WriteRoute::OwnerHandle);
-}
-
-OMPFILE_TEST(route_distributed_rank_for_key) {
-  OMPFILE_CHECK_EQ(distributedRankForKey(5, 3), 2);
-  OMPFILE_CHECK_EQ(distributedRankForKey(5, 1), -1);
-  OMPFILE_CHECK_EQ(distributedRankForKey(5, 0), -1);
+  OMPFILE_CHECK(resolveWriteRoute(Batched).Route == WriteRoute::Batched);
+  // Write batching off: the owner handle, whatever the hint (the hash-routed
+  // DistributedRank route went with LIBOMPFILE_OPT_WRITEBACK_DISTRIBUTE_*).
+  const WriteDecision O = resolveWriteRoute(WriteRouteConfig{});
+  OMPFILE_CHECK(O.Route == WriteRoute::OwnerHandle && O.TargetRank == -1);
+  // PlacedRank is never resolved, only built by the test placement hook.
+  OMPFILE_CHECK(resolveWriteRoute(Batched).Route != WriteRoute::PlacedRank);
+  OMPFILE_CHECK(O.Route != WriteRoute::PlacedRank);
 }
 
 OMPFILE_TEST(route_has_usable_plan) {

@@ -1,15 +1,19 @@
 #ifndef OMPFILE_IO_SCHEDULER_H
 #define OMPFILE_IO_SCHEDULER_H
 
+// Scoped by the test-only open hook on this calling thread, never a knob.
+extern thread_local int OmpFileTestOpenOwnerRank;
+
 #include "abstract_backend.h"
 #include "ompfile_config.h"
 #include "ompfile_sched.h"
 #include <cstddef>
 #include <memory>
 
-// The scheduler clients OmpFileClientContext routes every call through.
-// LocalScheduler calls the backend directly; HeadnodeScheduler asks the
-// headnode first. Both are defined in io_scheduler.cpp.
+// The scheduler client OmpFileClientContext routes every call through:
+// HeadnodeScheduler asks the headnode first, then calls the backend. It is
+// the only one since LIBOMPFILE_SCHEDULER (and its LOCAL scheduler) went in
+// Oct 2026; defined in io_scheduler.cpp.
 class IOScheduler {
 public:
   virtual ~IOScheduler() {}
@@ -29,7 +33,6 @@ public:
                           const ompfile::OmpFileIOHint *hint) = 0;
 };
 
-std::unique_ptr<IOScheduler> createLocalScheduler(IOBackend &backend);
 std::unique_ptr<IOScheduler>
 createHeadnodeScheduler(IOBackend &backend,
                         const ompfile::config::ClientConfig &config);
