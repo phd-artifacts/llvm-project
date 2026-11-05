@@ -226,7 +226,8 @@ double HEFTContext::computeAvgCommCost(const kmp_node_info &A,
   if (ItA != CommunicationCost.end()) {
     auto ItB = ItA->second.find(&B);
     if (ItB != ItA->second.end()) {
-      return ItB->second;
+      // The cache holds bytes; scale them like a freshly computed value.
+      return CommMultiplier * ItB->second;
     }
   }
 
@@ -629,9 +630,11 @@ void HEFTContext::restrictedLinearInterpolation(
       for (auto [profiled_device, profiled_value] : profiled_comp_cost) {
         sum += std::log(profiled_value * beta[profiled_device][device_0]);
       }
-      ComputationCost[Taskptr][actual_device_0] =
-          size > 0 ? std::exp(sum / size)
-                   : ComputationCost[Taskptr][actual_device_0];
+      // Without a profile on any device of this type there is nothing to
+      // interpolate from; leave the pair absent (operator[] would insert a
+      // 0.0 cost) so completeheterogeneousInterpolation fills it.
+      if (size > 0)
+        ComputationCost[Taskptr][actual_device_0] = std::exp(sum / size);
     }
   }
 }
@@ -695,15 +698,12 @@ void HEFTContext::completeheterogeneousInterpolation() {
   for (auto Taskptr : TopologicalOrder(tdg)) {
     if (isTargetDataTask(Taskptr))
       continue;
-    std::vector<int> presence(
-        num_types, -1); // -1 = type not on this task; 0 = missing; 1 = present
-    for (auto CC : ComputationCost[Taskptr]) {
-      int type = deviceTypeMap.at(CC.first);
+    // 1 = some device of the type has a cost for this task; 0 = none does
+    // (absent or negative), so the type is filled from the reference type.
+    std::vector<int> presence(num_types, 0);
+    for (auto CC : ComputationCost[Taskptr])
       if (CC.second >= 0.0)
-        presence[type] = 1;
-      else if (presence[type] != 1)
-        presence[type] = 0;
-    }
+        presence[deviceTypeMap.at(CC.first)] = 1;
 
     int referenceType = -1;
     double referenceEstimate = 0;
@@ -724,9 +724,13 @@ void HEFTContext::completeheterogeneousInterpolation() {
       double estimate = (referenceType != -1) ? referenceEstimate * coef[type] /
                                                     coef[referenceType]
                                               : mean * coef[type];
-      for (auto CC : ComputationCost[Taskptr]) {
-        if (deviceTypeMap.at(CC.first) == type)
-          CC.second = estimate;
+      auto Devices = restricted_to_device_map.find(type);
+      if (Devices == restricted_to_device_map.end())
+        continue;
+      for (kmp_int32 Device : Devices->second) {
+        auto It = ComputationCost[Taskptr].find(Device);
+        if (It == ComputationCost[Taskptr].end() || It->second < 0.0)
+          ComputationCost[Taskptr][Device] = estimate;
       }
     }
   }

@@ -201,7 +201,8 @@ double LegacyHEFTContext::computeAvgCommCost(const kmp_target_task_t &A,
   if (ItA != CommunicationCost.end()) {
     auto ItB = ItA->second.find(&B);
     if (ItB != ItA->second.end()) {
-      return ItB->second;
+      // The cache holds bytes; scale them like a freshly computed value.
+      return CommMultiplier * ItB->second;
     }
   }
 
