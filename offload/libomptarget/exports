@@ -38,6 +38,7 @@ VERS1.0 {
     __kmpc_push_target_tripcount;
     __kmpc_push_target_tripcount_mapper;
     ompx_dump_mapping_tables;
+    __tgt_get_num_devices;
     omp_get_mapped_ptr;
     omp_get_num_devices;
     omp_get_device_num;
@@ -75,6 +76,21 @@ VERS1.0 {
     __llvmPushCallConfiguration;
     __llvmPopCallConfiguration;
     llvmLaunchKernel;
+    ompfile_mpp_init;
+    ompfile_mpp_submit;
+    ompfile_mpp_open;
+    ompfile_mpp_open_on_rank;
+    ompfile_mpp_sched_request;
+    ompfile_mpp_sched_request_batch;
+    ompfile_mpp_freshness_query;
+    ompfile_mpp_freshness_write_commit;
+    ompfile_mpp_flush_dirty_tile;
+    ompfile_mpp_commit_stage_path_key;
+    ompfile_mpp_close;
+    ompfile_mpp_pread_ex;
+    ompfile_mpp_pwrite_ex;
+    ompfile_mpp_poll;
+    ompfile_mpp_finalize;
   local:
     *;
 };

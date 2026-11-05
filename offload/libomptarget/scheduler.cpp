@@ -45,6 +45,12 @@ int Schedule(ident_t *Loc, int DeviceId) {
     ScheduledDevId = __kmpc_scheduleTask(TaskId);
   }
 
+  // No scheduling decision for this task (it is not part of a recorded
+  // graph): honour an explicit device() clause instead of collapsing every
+  // such target region onto device 0, and use device 0 only without one.
+  if (ScheduledDevId < 0)
+    ScheduledDevId = DeviceId >= 0 ? DeviceId : 0;
+
   if (TaskId != -1) {
 
     if (!DMDASOwned) {

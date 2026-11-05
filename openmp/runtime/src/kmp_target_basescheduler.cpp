@@ -193,9 +193,11 @@ kmp_int32 BaseScheduler::scheduleTask(kmp_int32 task_id) {
   KG_TRACE(10, ("scheduleTask start, task_id: %d\n", task_id));
   kmp_int32 active_devices_number = __kmpc_get_num_devices();
   kmp_int32 scheduled_id = -1;
-  // Tasks may execute during TDG recording, before graph acquisition.
+  // Tasks may execute during TDG recording, before graph acquisition. Such a
+  // task has no scheduling decision: return -1 so the caller (libomptarget
+  // Schedule()) keeps the task's device() clause, or device 0 without one.
   if (task_id != -1 && tdg == nullptr)
-    return 0;
+    return -1;
 
   if (task_id == -1) {
     // If the target region is not inside a task (non-nowait), use the
@@ -215,12 +217,13 @@ kmp_int32 BaseScheduler::scheduleTask(kmp_int32 task_id) {
   } else {
 
     if ((*get_schedule_map(tdg->tdg_id)).count(task_id) == 0) {
-      // If the task was not scheduled (serialization), map to the first device
-      // or user-specified device
-      scheduled_id = 0;
+      // The task is not in the recorded schedule (serialization, or a task
+      // created outside the recorded region): no decision, the caller keeps
+      // the user-specified device or falls back to the first device.
       KG_TRACE(50, ("[SCHEDULER] scheduleTask : task_id: %d, task not "
-                    "scheduled : rank = %d\n",
-                    task_id, scheduled_id));
+                    "scheduled\n",
+                    task_id));
+      return -1;
     } else {
       // If the target region is inside a task (nowait), use the result of the
       // graph based scheduling algorithm.

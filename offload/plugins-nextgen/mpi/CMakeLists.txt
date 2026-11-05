@@ -28,6 +28,7 @@ add_target_library(omptarget.rtl.mpi MPI)
 
 target_sources(omptarget.rtl.mpi PRIVATE
   src/rtl.cpp
+  src/OriginOmpFileBridge.cpp
 )
 
 target_link_libraries(omptarget.rtl.mpi PRIVATE
@@ -37,7 +38,8 @@ target_link_libraries(omptarget.rtl.mpi PRIVATE
 
 # Add include directories
 target_include_directories(omptarget.rtl.mpi PRIVATE
-                           ${LIBOMPTARGET_INCLUDE_DIR})
+                           ${LIBOMPTARGET_INCLUDE_DIR}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../../../openmp/libompfile/include)
 
 # Set C++20 as the target standard for this plugin.
 set_target_properties(omptarget.rtl.mpi
@@ -106,6 +108,13 @@ configure_file(
 
 llvm_add_tool(OPENMP llvm-offload-mpi-proxy-device
   src/ProxyDevice.cpp
+  src/ProxyOmpFileConfig.cpp
+  src/ProxyOmpFileStage.cpp
+  src/ProxyOmpFileServer.cpp
+  src/ProxyOmpFileStats.cpp
+  src/ProxyOmpFileForward.cpp
+  src/ProxyOmpFileBridge.cpp
+  src/OmpFileHeadnodeManager.cpp
   src/RemotePluginManager.cpp
   ${LIBOMPTARGET_SRC_DIR}/OpenMP/OMPT/Callback.cpp
 )
@@ -119,6 +128,7 @@ target_link_libraries(llvm-offload-mpi-proxy-device PRIVATE
   LLVMFrontendOpenMP
   omp
 )
+target_link_options(llvm-offload-mpi-proxy-device PRIVATE -Wl,--export-dynamic)
 
 add_dependencies(llvm-offload-mpi-proxy-device omp)
 
@@ -126,6 +136,7 @@ target_include_directories(llvm-offload-mpi-proxy-device PRIVATE
   ${LIBOMPTARGET_INCLUDE_DIR}
   ${LIBOMPTARGET_LLVM_INCLUDE_DIRS}
   ${LIBOMPTARGET_BINARY_INCLUDE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../../openmp/libompfile/include
 )
 
 foreach(plugin IN LISTS LIBOMPTARGET_REMOTE_PLUGINS_TO_BUILD)

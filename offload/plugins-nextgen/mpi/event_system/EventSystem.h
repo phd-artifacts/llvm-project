@@ -16,11 +16,13 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <concepts>
 #include <condition_variable>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -35,6 +37,8 @@
 
 #include "llvm/ADT/SmallVector.h"
 
+#include "ompfile_trace.h"
+
 #include "Shared/APITypes.h"
 #include "Shared/EnvironmentVar.h"
 #include "Shared/Utils.h"
@@ -48,6 +52,64 @@ template <typename... ArgsTy>
 static llvm::Error createError(const char *ErrFmt, ArgsTy... Args) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), ErrFmt,
                                  Args...);
+}
+
+inline bool ompfileSerializeMPICallsEnabled() {
+  static const bool Enabled = []() {
+    const char *Env = std::getenv("LIBOMPFILE_MPI_SERIALIZE");
+    return !(Env && Env[0] == '0' && Env[1] == '\0');
+  }();
+  return Enabled;
+}
+
+inline std::timed_mutex &ompfileMPICallMutex() {
+  static std::timed_mutex M;
+  return M;
+}
+
+/// A wait for the MPI call lock shorter than this is not traced.
+inline constexpr std::chrono::microseconds OmpfileMPILockWaitTraceThreshold{100};
+
+/// Serializes one MPI call against every other MPI call in the process when
+/// LIBOMPFILE_MPI_SERIALIZE is on (the default).
+///
+/// Invariant: only NON-BLOCKING MPI calls go through this lock (MPI_Isend,
+/// MPI_Irecv, MPI_Testany, MPI_Improbe, and the matched MPI_Mrecv on the gate
+/// thread, which completes as soon as it is called). A blocking call that
+/// needs the peer to act — MPI_Send, MPI_Recv — must never be made while
+/// holding it: a rendezvous-sized transfer then blocks inside the lock, and the
+/// threads that would make the progress calls to complete it need the same
+/// lock. With two proxies each writing a file the other owns, that deadlocks
+/// both processes (docs/known-issues.md, "The process-wide MPI serialization
+/// mutex deadlocks..."). The blocking helpers in EventSystemOmpFile.cpp
+/// therefore call MPI directly; the runtime negotiates MPI_THREAD_MULTIPLE,
+/// and concurrent events already run on distinct (communicator, tag) pairs.
+///
+/// Only a wait longer than OmpfileMPILockWaitTraceThreshold is traced, as an
+/// "mpi-lock-wait" range that opens once the threshold has passed (so its width
+/// understates the wait by that much). A stuck process still shows every waiter
+/// as an open range. Short waits are the norm and must not be traced: the
+/// origin's polling threads contend for this lock on almost every resume, 2.5
+/// million times in a 15 s rtm run with a 0.4 us median and a 268 us maximum
+/// (job 828), and a range per contended acquisition made the app rank's nsys
+/// session grow by gigabytes.
+template <typename FnTy>
+inline decltype(auto) ompfileWithMPICallLock(FnTy &&Fn) {
+  if (!ompfileSerializeMPICallsEnabled())
+    return std::forward<FnTy>(Fn)();
+
+  std::timed_mutex &M = ompfileMPICallMutex();
+  if constexpr (ompfile::trace::Enabled) {
+    if (!M.try_lock_for(OmpfileMPILockWaitTraceThreshold)) {
+      ompfile::trace::Scope Wait(ompfile::trace::Domain::MPP, "mpi-lock-wait",
+                                 ompfile::trace::Color::Wait);
+      M.lock();
+    }
+  } else {
+    M.lock();
+  }
+  std::lock_guard<std::timed_mutex> Lock(M, std::adopt_lock);
+  return std::forward<FnTy>(Fn)();
 }
 
 /// The event type (type of action it will performed).
@@ -77,10 +139,9 @@ enum class EventTypeTy : unsigned int {
   DATA_UNLOCK,
   DATA_NOTIFY_MAPPED,
   DATA_NOTIFY_UNMAPPED,
-  GET_DEVICE_TYPE,
 
   // Memory management.
-  ALLOC,  // Allocates a buffer at the remote process.
+  ALLOC = 18, // Allocates a buffer at the remote process.
   DELETE, // Deletes a buffer at the remote process.
 
   // Data movement.
@@ -93,14 +154,87 @@ enum class EventTypeTy : unsigned int {
   // Target region execution.
   LAUNCH_KERNEL, // Executes a target region at the remote process.
 
+  // OMPFile shim events.
+  OMPFILE_PING, // No-op event used to validate the MPP path.
+  OMPFILE_OPEN, // Open a file on the remote worker.
+  OMPFILE_CLOSE, // Close a file on the remote worker.
+  OMPFILE_PREAD, // Read from a file on the remote worker.
+  OMPFILE_PWRITE, // Write to a file on the remote worker.
+  OMPFILE_SCHED_REQUEST, // Scheduler request (client -> scheduler).
+  OMPFILE_SCHED_REQUEST_BATCH, // Batch scheduler request (client -> scheduler).
+  // 33 is reserved: it was OMPFILE_SCHED_PLAN, which nothing ever sent
+  // (removed Oct 2026). Do not reuse it.
+
   // Local event used to wait on other events.
-  SYNC,
+  SYNC = 34,
+  // 36 is reserved: it was OMPFILE_STAGE_INVALIDATE (removed Oct 2026).
+  // Never reuse it.
+  OMPFILE_PREAD_NO_STAGE = 37, // Read from a proxy while bypassing staging.
+  OMPFILE_FRESHNESS_QUERY = 38, // Query freshness decision from headnode.
+  // 39 and 40 are reserved: they were OMPFILE_PROXY_COPY_TILE and
+  // OMPFILE_FRESHNESS_MARK_FRESH (removed Oct 2026, no production sender).
+  // Never reuse them.
+  OMPFILE_FRESHNESS_WRITE_COMMIT = 41, // Report a successful tile write.
+  OMPFILE_FLUSH_DIRTY_TILE = 42, // Flush dirty tile metadata on headnode.
+  OMPFILE_DIRTY_OWNER_PREAD = 43, // Read dirty staged bytes from owner proxy.
+  OMPFILE_DIRTY_OWNER_QUERY = 44, // Classify dirty staged bytes without reading.
+  OMPFILE_DIRTY_OWNER_PREAD_BATCH = 45, // Batched dirty staged reads.
 
   // Internal event system commands.
-  EXIT // Stops the event system execution at the remote process.
+  EXIT = 35, // Stops the event system execution at the remote process.
+
+  // Scheduler range (64+, proposed to OMPC). GET_DEVICE_TYPE came from OMPC
+  // inserted after DATA_NOTIFY_UNMAPPED, which shifted every later value and
+  // made OMPFILE_SCHED_REQUEST_BATCH collide with SYNC = 34; an explicit value
+  // keeps the core and OMPFILE wire values where they are.
+  GET_DEVICE_TYPE = 64, // Query the remote device's type (CPU/GPU).
 };
 
+static_assert(static_cast<unsigned int>(EventTypeTy::ALLOC) == 18);
+static_assert(static_cast<unsigned int>(EventTypeTy::LAUNCH_KERNEL) == 25);
+static_assert(static_cast<unsigned int>(EventTypeTy::GET_DEVICE_TYPE) == 64);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_SCHED_REQUEST) ==
+              31);
+static_assert(
+    static_cast<unsigned int>(EventTypeTy::OMPFILE_SCHED_REQUEST_BATCH) == 32);
+// 33: reserved (formerly OMPFILE_SCHED_PLAN); SYNC below stays pinned at 34.
+static_assert(static_cast<unsigned int>(EventTypeTy::SYNC) == 34);
+static_assert(static_cast<unsigned int>(EventTypeTy::EXIT) == 35);
+// 36: reserved (formerly OMPFILE_STAGE_INVALIDATE).
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_PREAD_NO_STAGE) ==
+              37);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_FRESHNESS_QUERY) ==
+              38);
+// 39, 40: reserved (formerly OMPFILE_PROXY_COPY_TILE / _FRESHNESS_MARK_FRESH).
+static_assert(
+    static_cast<unsigned int>(EventTypeTy::OMPFILE_FRESHNESS_WRITE_COMMIT) ==
+    41);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE) ==
+              42);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD) ==
+              43);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY) ==
+              44);
+static_assert(
+    static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD_BATCH) ==
+    45);
+
 std::string EventTypeToString(EventTypeTy eventType);
+/// Same names, no allocation: for hot paths such as trace range labels.
+const char *eventTypeName(EventTypeTy eventType);
+
+// Aggregate local-clock phase durations, never cross-process timestamps.
+// Disabled unless OMPTARGET_MPI_TRANSFER_STATS=1. No MPI in destruction.
+struct RetrieveTimingTy {
+  bool Enabled;
+  bool Proxy;
+  uint64_t PreviousUs = 0;
+  uint64_t Durations[3] = {};
+  unsigned Phases = 0;
+  explicit RetrieveTimingTy(bool IsProxy);
+  void mark(unsigned Phase);
+  ~RetrieveTimingTy();
+};
 
 /// Coroutine events
 ///
@@ -136,9 +270,24 @@ struct EventTy {
     /// Indicates if the coroutine was completed successfully. Contains the
     /// appropriate error otherwise.
     std::optional<llvm::Error> CoroutineError;
+    /// Proxy-side timing (OMPTARGET_MPI_PROXY_EVENT_STATS): when the gate
+    /// thread created the event, when a handler first resumed it, and how
+    /// many resumes it took. Zero and unused unless the proxy fills them.
+    uint64_t StatCreatedUs = 0;
+    uint64_t StatFirstResumeUs = 0;
+    uint32_t StatResumes = 0;
+    /// NVTX range id for this event's lifetime (ompfile_trace.h). An explicit
+    /// id rather than push/pop because a proxy event is resumed by whichever
+    /// handler pops it next, so its lifetime crosses threads. Zero and unused
+    /// unless the proxy gate starts one; the handler ends it on completion and
+    /// the destructor ends it if the event dies first (teardown, stopped queue).
+    uint64_t TraceRangeId = 0;
 
     promise_type() : CoroutineError(std::nullopt) {
       PrevHandle = RootHandle = CoHandleTy::from_promise(*this);
+    }
+    ~promise_type() {
+      ompfile::trace::rangeEnd(ompfile::trace::Domain::MPP, TraceRangeId);
     }
 
     /// Event coroutines should always suspend upon creation and finalization.
@@ -148,7 +297,12 @@ struct EventTy {
     /// Coroutines should return llvm::Error::success() or an appropriate error
     /// message.
     void return_value(llvm::Error &&GivenError) noexcept {
-      CoroutineError = std::move(GivenError);
+      if (GivenError) {
+        CoroutineError = std::move(GivenError);
+      } else {
+        llvm::consumeError(std::move(GivenError));
+        CoroutineError = std::nullopt;
+      }
     }
 
     /// Any unhandled exception should create an externally visible error.
@@ -168,7 +322,7 @@ struct EventTy {
                                   assert(HandlePtr);
                                   CoHandleTy::from_address(HandlePtr).destroy();
                                 }),
-          IntEnvar("OMPTARGET_EVENT_POLLING_RATE", 1), EventTypeTy::SYNC};
+          IntEnvar("OMPTARGET_EVENT_POLLING_RATE", 0), EventTypeTy::SYNC};
     }
   };
 
@@ -203,7 +357,7 @@ struct EventTy {
   bool empty() const;
 
   /// Get the returned error from the coroutine.
-  llvm::Error getError() const;
+  llvm::Error getError();
 
   /// EventTy instances are also awaitables. This means one can link multiple
   /// EventTy together by calling the co_await operator on one another. For this
@@ -235,7 +389,9 @@ struct EventTy {
     auto &Error = getHandle().promise().CoroutineError;
 
     if (Error) {
-      return std::move(*Error);
+      llvm::Error Result = std::move(*Error);
+      Error.reset();
+      return Result;
     }
 
     return llvm::Error::success();
@@ -250,6 +406,8 @@ class MPIRequestManagerTy {
   const int Tag;
   /// Pending MPI requests.
   llvm::SmallVector<MPI_Request> Requests;
+  /// First MPI API error seen while creating pending requests.
+  int PendingMPIError = MPI_SUCCESS;
   /// Maximum buffer Size to use during data transfer.
   Int64Envar MPIFragmentSize;
 
@@ -265,7 +423,7 @@ public:
   MPIRequestManagerTy(MPI_Comm Comm, int Tag, int OtherRank, int DeviceId,
                       llvm::SmallVector<MPI_Request> InitialRequests =
                           {}) // TODO: Change to initializer_list
-      : Comm(Comm), Tag(Tag), Requests(InitialRequests),
+      : Comm(Comm), Tag(Tag), Requests(std::move(InitialRequests)),
         MPIFragmentSize("OMPTARGET_MPI_FRAGMENT_SIZE", 100e6),
         OtherRank(OtherRank), DeviceId(DeviceId), EventType(-1) {}
 
@@ -274,10 +432,12 @@ public:
   MPIRequestManagerTy &operator=(const MPIRequestManagerTy &) = delete;
 
   MPIRequestManagerTy(MPIRequestManagerTy &&Other) noexcept
-      : Comm(Other.Comm), Tag(Other.Tag), Requests(Other.Requests),
+      : Comm(Other.Comm), Tag(Other.Tag), Requests(std::move(Other.Requests)),
+        PendingMPIError(Other.PendingMPIError),
         MPIFragmentSize(Other.MPIFragmentSize), OtherRank(Other.OtherRank),
         DeviceId(Other.DeviceId), EventType(Other.EventType) {
     Other.Requests = {};
+    Other.PendingMPIError = MPI_SUCCESS;
   }
 
   MPIRequestManagerTy &operator=(MPIRequestManagerTy &&Other) = delete;
@@ -287,15 +447,43 @@ public:
   /// Sends a buffer of given datatype items with determined size to target.
   void send(const void *Buffer, int Size, MPI_Datatype Datatype);
 
+  /// Sends a buffer on this event's reserved tag plus TagOffset.
+  void sendTagged(const void *Buffer, int Size, MPI_Datatype Datatype,
+                  int TagOffset);
+
+  /// Sends a message to target using a blocking MPI call.
+  llvm::Error sendBlocking(const void *Buffer, int Size, MPI_Datatype Datatype);
+
   /// Send a buffer with determined size to target in batchs.
   void sendInBatchs(void *Buffer, int64_t Size);
+
+  /// Send a fragmented buffer on this event's reserved tag plus TagOffset.
+  void sendInBatchsTagged(void *Buffer, int64_t Size, int TagOffset);
+
+  /// Sends a buffer with determined size to target using blocking MPI calls.
+  llvm::Error sendInBatchsBlocking(const void *Buffer, uint64_t Size);
 
   /// Receives a buffer of given datatype items with determined size from
   /// target.
   void receive(void *Buffer, int Size, MPI_Datatype Datatype);
 
+  /// Receives a buffer on this event's reserved tag plus TagOffset.
+  void receiveTagged(void *Buffer, int Size, MPI_Datatype Datatype,
+                     int TagOffset);
+
+  /// Receives a message from target using a blocking MPI call.
+  llvm::Error receiveBlocking(void *Buffer, int Size, MPI_Datatype Datatype);
+
   /// Receives a buffer with determined size from target in batchs.
   void receiveInBatchs(void *Buffer, int64_t Size);
+
+  /// Receives a fragmented buffer on this event's reserved tag plus TagOffset.
+  void receiveInBatchsTagged(void *Buffer, int64_t Size, int TagOffset);
+
+  /// Receives a buffer with determined size from target using blocking MPI
+  /// calls. This is used for payload paths that need to avoid coroutine-owned
+  /// non-blocking receive state.
+  llvm::Error receiveInBatchsBlocking(void *Buffer, int64_t Size);
 
   /// Coroutine that waits on all internal pending requests.
   EventTy wait();
@@ -462,13 +650,29 @@ class EventSystemTy {
   /// generate unique MPI tags for each event.
   std::atomic<int> EventCounter{0};
 
-  /// Event queue between the local gate thread and the event handlers. The exec
-  /// queue is responsible for only running the execution events, while the data
-  /// queue executes all the other ones. This allows for long running execution
-  /// events to not block any data transfers (which are all done in a
-  /// non-blocking fashion).
+  /// Event queues between the local gate thread and the event handlers. This
+  /// comment is the plugin's scheduling policy:
+  ///
+  /// - Exec: LAUNCH_KERNEL only. Long-running execution must not block data
+  ///   transfers or file I/O.
+  /// - Io: every type isFileIoEvent() (EventSystemOmpFile.h) accepts. File I/O
+  ///   has its own queue and pool so it never occupies the kernel pool and so
+  ///   it can be scheduled as a domain of its own. A handler here blocks in
+  ///   EventTy::wait() on one kind of path only: the headnode coherence round
+  ///   trips (ProxyOmpFile::freshnessQueryOnHeadnode /
+  ///   freshnessWriteCommitOnHeadnode / completeDirtyFlushOnHeadnode, also via
+  ///   completeDerivedTileFlushesOnHeadnode) that the stage read/write/flush
+  ///   paths make under write-back staging on a rank other than the headnode.
+  ///   The owner-forwarding helpers (openOnRank / preadOnRank / pwriteOnRank /
+  ///   closeOnRank) wait too, but only on kernel threads through the mpp*
+  ///   bridges, never on an io handler. The pool defaults to more than one
+  ///   thread (OMPTARGET_NUM_IO_EVENT_HANDLERS=4) as a margin for those
+  ///   coherence waits; turning them into co_await is what would let it go
+  ///   back to one.
+  /// - Data: everything else, which is all done in a non-blocking fashion.
   EventQueue ExecEventQueue{};
   EventQueue DataEventQueue{};
+  EventQueue IoEventQueue{};
 
   /// Event System execution state.
   std::atomic<EventSystemStateTy> EventSystemState{};
@@ -477,12 +681,33 @@ class EventSystemTy {
   /// Allows for parallel use of network resources.
   Int64Envar NumMPIComms;
 
+  /// True when the event system called MPI_Init_thread itself and therefore
+  /// owns MPI_Finalize during teardown.
+  bool OwnsMPIInitialization = false;
+
 private:
-  /// Creates a new unique event tag for a new event.
+  /// Creates a new logical event id for a new event. The logical id is carried
+  /// in the control notification and mapped to a physical (communicator, MPI
+  /// tag) pair by getNewEventComm/getEventMPITag. This lets the communicator
+  /// pool extend the usable event id space instead of reusing the same physical
+  /// MPI tag as soon as MPI_TAG_UB is reached.
   int createNewEventTag();
 
-  /// Gets a comm for a new event from the comm pool.
-  MPI_Comm &getNewEventComm(int MPITag);
+  /// Maps a logical event id to the physical MPI tag used on its event
+  /// communicator. The ORIGIN rank is folded into the mapping because every
+  /// process draws event ids from its own local counter: two processes running
+  /// similar event sequences otherwise derive identical tags, and concurrent
+  /// events between the same rank pair in opposite roles (i->j and j->i) then
+  /// share a (source, tag, comm) stream, letting MPI match a large payload
+  /// frame into a small header Irecv ("Message truncated", see the two-phase
+  /// concurrent-read flake). Origin = the event creator's rank: the creator
+  /// passes its own LocalRank; the destination passes the notification's
+  /// MPI_SOURCE, so both sides agree.
+  int getEventMPITag(int EventId, int OriginRank) const;
+
+  /// Gets a comm for a new event from the comm pool. Must use the same
+  /// (EventId, OriginRank) mapping as getEventMPITag.
+  MPI_Comm &getNewEventComm(int EventId, int OriginRank);
 
   /// Creates a local MPI context containing a exclusive comm for the gate
   /// thread, and a comm pool to be used internally by the events. It also
@@ -530,13 +755,19 @@ public:
 
   /// Get the number of workers available.
   ///
-  /// \return the number of MPI available workers.
+  /// \return the number of MPI available workers (0 on a worker itself).
   int getNumWorkers() const;
 
-  /// Check if we are at the host MPI process.
+  /// Size of the worker partition regardless of the local role: the ranks
+  /// [0, numWorkerRanks()) are proxies on every process. An MPP job is always
+  /// one application (origin) rank -- the top one -- over WorldSize - 1
+  /// proxies; the runtime owns MPI and applications never see it.
+  int numWorkerRanks() const { return WorldSize - 1; }
+
+  /// Check if we are at an application (origin) MPI process.
   ///
-  /// \return true if the current MPI process is the host (rank WorldSize-1),
-  /// false otherwise.
+  /// \return true if the current MPI process is the origin (rank
+  /// WorldSize-1), false on a proxy.
   int isHost() const;
 
   RemoteDeviceId mapDeviceId(int32_t DeviceId);
@@ -544,6 +775,7 @@ public:
   llvm::SmallVector<int> DevicesPerRemote{};
 
   friend struct ProxyDevice;
+  friend struct ProxyOmpFile;
 };
 
 template <class EventFuncTy, typename... ArgsTy>
@@ -553,7 +785,8 @@ EventTy EventSystemTy::NotificationEvent(EventFuncTy EventFunc,
                                          ArgsTy... Args) {
   // Create event MPI request manager.
   const int EventTag = createNewEventTag();
-  auto &EventComm = getNewEventComm(EventTag);
+  auto &EventComm = getNewEventComm(EventTag, LocalRank);
+  const int MPITag = getEventMPITag(EventTag, LocalRank);
 
   int32_t RemoteRank = DstDeviceID, RemoteDeviceId = -1;
 
@@ -566,15 +799,17 @@ EventTy EventSystemTy::NotificationEvent(EventFuncTy EventFunc,
   int EventNotificationInfo[] = {static_cast<int>(EventType), EventTag,
                                  RemoteDeviceId};
   MPI_Request NotificationRequest = MPI_REQUEST_NULL;
-  int MPIError = MPI_Isend(EventNotificationInfo, 3, MPI_INT, RemoteRank,
-                           static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                           GateThreadComm, &NotificationRequest);
+  int MPIError = ompfileWithMPICallLock([&]() {
+    return MPI_Isend(EventNotificationInfo, 3, MPI_INT, RemoteRank,
+                     static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                     GateThreadComm, &NotificationRequest);
+  });
 
   if (MPIError != MPI_SUCCESS)
     co_return createError("MPI failed during event notification with error %d",
                           MPIError);
 
-  MPIRequestManagerTy RequestManager(EventComm, EventTag, RemoteRank,
+  MPIRequestManagerTy RequestManager(EventComm, MPITag, RemoteRank,
                                      RemoteDeviceId, {NotificationRequest});
 
   RequestManager.EventType = EventNotificationInfo[0];

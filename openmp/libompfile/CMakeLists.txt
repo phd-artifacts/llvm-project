@@ -1,0 +1,91 @@
+cmake_minimum_required(VERSION 3.13)
+project(libompfile CXX)
+
+# enable debug logs as default for now
+# -DOMP_IO_DEBUG
+message(STATUS "OpenMP I/O debug logs enabled.")
+add_compile_definitions(OMP_IO_DEBUG)
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/OmpFileSources.cmake)
+add_library(ompfile SHARED
+    ${OMPFILE_FRONTEND_SOURCES_REL}
+    ${OMPFILE_MPP_BACKEND_SOURCES_REL}
+)
+
+find_package(MPI REQUIRED)
+
+target_link_libraries(ompfile PRIVATE MPI::MPI_CXX)
+
+target_link_libraries(ompfile PRIVATE dl)
+
+target_link_libraries(ompfile PUBLIC omp)
+
+# NVTX ranges (include/ompfile_trace.h), shared decision with the MPI plugin.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/OmpFileNvtx.cmake)
+ompfile_enable_nvtx(ompfile PRIVATE)
+
+# Let the library's include/ directory be available as a public include path
+target_include_directories(ompfile
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+set_target_properties(ompfile PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# Install the library itself. Only export targets for standalone OpenMP builds.
+if (OPENMP_STANDALONE_BUILD)
+    set(OMPFILE_EXPORT_ARG EXPORT ompfileTargets)
+endif()
+install(TARGETS ompfile
+    ${OMPFILE_EXPORT_ARG}
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
+# Install the public header
+install(FILES
+    include/file_interface.h
+    DESTINATION include
+)
+
+# Optionally export the CMake targets if you want a config file
+# for third-party projects to `find_package(ompfile)`.
+if (OPENMP_STANDALONE_BUILD)
+    install(EXPORT ompfileTargets
+        FILE ompfileConfig.cmake
+        NAMESPACE ompfile::
+        DESTINATION lib/cmake/ompfile
+    )
+endif()
+
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/include")
+
+# so that I can run from the build folder without having to install
+add_custom_command(
+    OUTPUT "${CMAKE_BINARY_DIR}/include/file_interface.h"
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/file_interface.h"
+            "${CMAKE_BINARY_DIR}/include/file_interface.h"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/file_interface.h"
+    COMMENT "Copying file_interface.h to build folder"
+)
+
+add_custom_target(copy_ompfile_headers ALL
+    DEPENDS "${CMAKE_BINARY_DIR}/include/file_interface.h"
+)
+
+# Unit tests of the pure units (wire codec, extent algebra, env readers, keys,
+# batcher, route resolution). A plain executable in the default target, so
+# every runtime build compiles it; the cluster build jobs run it after the
+# build.
+option(OMPFILE_BUILD_UNIT_TESTS "Build libompfile's unit tests (tests/)" ON)
+if (OMPFILE_BUILD_UNIT_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

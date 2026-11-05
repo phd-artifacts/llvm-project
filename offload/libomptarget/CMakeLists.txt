@@ -48,6 +48,12 @@ target_include_directories(omptarget PRIVATE
 
 if(LLVM_HAVE_LINK_VERSION_SCRIPT)
   target_link_libraries(omptarget PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports")
+  # The version script decides which ompfile_mpp_* bridge symbols of the
+  # statically linked MPI plugin the origin-side shim can dlsym; an edit to
+  # it must relink, or an incremental build ships a root whose exports are
+  # stale (Sep 21, 2026).
+  set_property(TARGET omptarget APPEND PROPERTY LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/exports")
 endif()
 
 # Define the TARGET_NAME and DEBUG_PREFIX.

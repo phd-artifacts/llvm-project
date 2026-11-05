@@ -11,21 +11,29 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <list>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <vector>
 
 #include "Shared/APITypes.h"
 #include "Shared/Debug.h"
 #include "Utils/ELF.h"
 
 #include "EventSystem.h"
+#include "OriginOmpFileBridge.h"
 #include "GlobalHandler.h"
 #include "OpenMP/OMPT/Callback.h"
 #include "PluginInterface.h"
@@ -57,6 +65,168 @@ struct MPIDeviceTy;
 struct MPIDeviceImageTy;
 struct MPIKernelTy;
 class MPIGlobalHandlerTy;
+
+// Two opt-in knobs for the origin (application) side of a mapped variable.
+// Every mapped variable of a target region costs the origin four synchronous
+// round trips to the proxy (ALLOC, DATA_NOTIFY_MAPPED, DATA_NOTIFY_UNMAPPED,
+// DELETE) on top of the queued SUBMIT/RETRIEVE, and on a slow interconnect
+// those round trips are the per-record floor of an I/O-bound region. Both
+// default off so every existing lane keeps its behaviour.
+//
+// OMPTARGET_MPI_SKIP_DATA_NOTIFY=1: answer notifyDataMapped/Unmapped locally
+// without a round trip. The proxy forwards them to its host plugin, for which
+// they are no-ops (they exist so GPU plugins can pin host memory), so nothing
+// observable changes on the proxy.
+//
+// OMPTARGET_MPI_ALLOC_POOL_BYTES=<n>: keep up to n bytes of freed device
+// buffers per origin instead of sending DELETE, and serve a later ALLOC of the
+// same (device, size, kind) from that pool without a round trip. Device memory
+// contents are unspecified after an allocation either way, so the reuse is
+// invisible to the program; pooled buffers are released when the plugin
+// deinitializes.
+static bool mpiSkipDataNotifyEnabled() {
+  static const bool Enabled = [] {
+    const char *Raw = std::getenv("OMPTARGET_MPI_SKIP_DATA_NOTIFY");
+    return Raw && Raw[0] == '1' && Raw[1] == '\0';
+  }();
+  return Enabled;
+}
+
+static int64_t mpiAllocPoolBytes() {
+  static const int64_t Bytes = [] {
+    const char *Raw = std::getenv("OMPTARGET_MPI_ALLOC_POOL_BYTES");
+    if (!Raw || !Raw[0])
+      return static_cast<int64_t>(0);
+    char *End = nullptr;
+    const long long Value = std::strtoll(Raw, &End, 10);
+    if (!End || *End != '\0' || Value <= 0)
+      return static_cast<int64_t>(0);
+    return static_cast<int64_t>(Value);
+  }();
+  return Bytes;
+}
+
+// OMPTARGET_MPI_EVENT_STATS=1: origin-side wall time per event type. The
+// synchronous waits (ALLOC, DELETE, DATA_NOTIFY_*) are timed one event at a
+// time; the queued types (SUBMIT, RETRIEVE, LAUNCH_KERNEL, SYNCHRONIZE) are
+// timed per same-type range as synchronize() progresses them together, so a
+// range's wall time is what one target region actually pays for that type.
+// Printed at plugin deinit as "[mpi-plugin] origin_event_stats ..." lines.
+static bool mpiEventStatsEnabled() {
+  static const bool Enabled = [] {
+    const char *Raw = std::getenv("OMPTARGET_MPI_EVENT_STATS");
+    return Raw && Raw[0] == '1' && Raw[1] == '\0';
+  }();
+  return Enabled;
+}
+
+static inline uint64_t mpiNowUs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+struct MPIOriginEventStatsTy {
+  static constexpr size_t kTypes = 96;
+  std::atomic<uint64_t> Count[kTypes];
+  std::atomic<uint64_t> Ranges[kTypes];
+  std::atomic<uint64_t> TotalUs[kTypes];
+  std::atomic<uint64_t> MaxUs[kTypes];
+
+  MPIOriginEventStatsTy() {
+    for (size_t I = 0; I < kTypes; ++I) {
+      Count[I] = 0;
+      Ranges[I] = 0;
+      TotalUs[I] = 0;
+      MaxUs[I] = 0;
+    }
+  }
+
+  void add(EventTypeTy Type, uint64_t Us, uint64_t Events) {
+    const size_t I = static_cast<size_t>(Type);
+    if (I >= kTypes)
+      return;
+    Count[I].fetch_add(Events, std::memory_order_relaxed);
+    Ranges[I].fetch_add(1, std::memory_order_relaxed);
+    TotalUs[I].fetch_add(Us, std::memory_order_relaxed);
+    uint64_t Prev = MaxUs[I].load(std::memory_order_relaxed);
+    while (Us > Prev &&
+           !MaxUs[I].compare_exchange_weak(Prev, Us, std::memory_order_relaxed))
+      ;
+  }
+
+  void print() const {
+    for (size_t I = 0; I < kTypes; ++I) {
+      const uint64_t N = Count[I].load(std::memory_order_relaxed);
+      if (N == 0)
+        continue;
+      const uint64_t R = Ranges[I].load(std::memory_order_relaxed);
+      const uint64_t T = TotalUs[I].load(std::memory_order_relaxed);
+      fprintf(stderr,
+              "[mpi-plugin] origin_event_stats type=%s events=%llu ranges=%llu "
+              "total_us=%llu max_range_us=%llu avg_range_us=%.1f\n",
+              EventTypeToString(static_cast<EventTypeTy>(I)).c_str(),
+              static_cast<unsigned long long>(N),
+              static_cast<unsigned long long>(R),
+              static_cast<unsigned long long>(T),
+              static_cast<unsigned long long>(
+                  MaxUs[I].load(std::memory_order_relaxed)),
+              R ? static_cast<double>(T) / static_cast<double>(R) : 0.0);
+    }
+  }
+};
+
+static MPIOriginEventStatsTy &originEventStats() {
+  static MPIOriginEventStatsTy *Stats = new MPIOriginEventStatsTy();
+  return *Stats;
+}
+
+// OMPTARGET_MPI_MERGE_SATISFIED_SYNC=1: let a SYNC event that is already
+// satisfied join the range synchronize() is progressing instead of ending
+// it. libomptarget records an event on every new mapping after its submit
+// and, at region end, waits on that event (wait_event -> a SYNC entry)
+// right before the variable's retrieve, so a region's queue reads
+// SYNC, RETRIEVE, SYNC, RETRIEVE, ... and each retrieve is progressed alone,
+// one proxy round trip at a time (AMD 404114: 804 retrieves in 804 ranges
+// at 5 ms each, the largest term of a legacy record). Ranges complete in
+// order, so by the time such a SYNC is reached its recorded event has
+// completed; a SYNC that is not satisfied after one step still ends the
+// range, which keeps the ordering it exists for.
+// Unused while OMPC keeps the synchronous origin (synchronize() no longer
+// walks the event queue); kept so restoring the queued origin is a revert.
+[[maybe_unused]] static bool mpiMergeSatisfiedSyncEnabled() {
+  static const bool Enabled = [] {
+    const char *Raw = std::getenv("OMPTARGET_MPI_MERGE_SATISFIED_SYNC");
+    return Raw && Raw[0] == '1' && Raw[1] == '\0';
+  }();
+  return Enabled;
+}
+
+static bool ompfileDiagEnabled() {
+  static const bool Enabled = []() {
+    const char *Raw = std::getenv("OMPFILE_MPP_DEVICE_DIAG");
+    return Raw && Raw[0] && std::strcmp(Raw, "0") != 0;
+  }();
+  return Enabled;
+}
+
+// Extra fields are phase-specific:
+// - plugin_init_count: extra_a=world_size, extra_b=device_slots_before_publish
+// - plugin_init_publish: extra_a=world_size, extra_b=computed_device_count
+// - is_device_compatible: extra_a=compat_result_or_rc, extra_b=diag_reason
+//   diag_reason: 0=normal, 1=event_empty, 2=event_error
+// - is_device_initialized: extra_a=initialized(0|1), extra_b=device_ptr_is_null
+// - init_device: extra_a=init_result_or_rc, extra_b=device_ptr_is_null
+void ompfileDiagLog(const char *Phase, int Rank, int DeviceCount,
+                    int DeviceId, int ExtraA, int ExtraB) {
+  if (!ompfileDiagEnabled())
+    return;
+  REPORT("[ompfile-mpi-diag] phase=%s rank=%d device_count=%d device_id=%d "
+         "extra_a=%d extra_b=%d\n",
+         Phase ? Phase : "unknown", Rank, DeviceCount, DeviceId, ExtraA,
+         ExtraB);
+}
 
 // TODO: Should this be defined inside the EventSystem?
 using MPIEventQueue = std::list<EventTy>;
@@ -414,23 +584,51 @@ Error MPIKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
 /// Class implementing the MPI plugin.
 struct MPIPluginTy : public GenericPluginTy {
   MPIPluginTy() : GenericPluginTy(getTripleArch()) {}
+  ~MPIPluginTy() override { ompfileRetractMPIPlugin(this); }
 
   /// This class should not be copied.
   MPIPluginTy(const MPIPluginTy &) = delete;
   MPIPluginTy(MPIPluginTy &&) = delete;
 
+  EventSystemTy &getEventSystemForOmpFile() { return EventSystem; }
+
+  bool ensureEventSystemInitializedForOmpFile() {
+    if (!EventSystem.is_initialized())
+      return EventSystem.initialize();
+    return true;
+  }
+
   /// Initialize the plugin and return the number of devices.
   Expected<int32_t> initImpl() override {
-    if (!EventSystem.is_initialized())
-      EventSystem.initialize();
+    ompfileDiagLog("plugin_init_enter", -1, -1, -1, 0, 0);
+    if (!EventSystem.is_initialized() && !EventSystem.initialize()) {
+      DP("Failed to initialize EventSystem during plugin init\n");
+      ompfileDiagLog("plugin_init_eventsystem_fail", -1, -1, -1,
+                     OFFLOAD_FAIL, 0);
+      return Plugin::error(ErrorCode::BACKEND_FAILURE,
+                           "Failed to initialize EventSystem during plugin "
+                           "init");
+    }
+    int32_t NumWorkers = EventSystem.getNumWorkers();
+    int32_t DeviceSlotsBeforePublish = static_cast<int32_t>(RemoteDevices.size());
     int32_t NumRemoteDevices = getNumRemoteDevices();
+    ompfileDiagLog("plugin_init_count", -1, NumRemoteDevices, -1, NumWorkers,
+                   DeviceSlotsBeforePublish);
     assert(RemoteDevices.size() == 0 && "MPI Plugin already initialized");
     RemoteDevices.resize(NumRemoteDevices, nullptr);
+    RemoteDevicesInitialized.resize(NumRemoteDevices, false);
+    ompfileDiagLog("plugin_init_publish", -1,
+                   static_cast<int>(RemoteDevices.size()), -1, NumWorkers,
+                   NumRemoteDevices);
+
     return NumRemoteDevices;
   }
 
   /// Deinitialize the plugin.
   Error deinitImpl() override {
+    allocPoolRelease();
+    if (mpiEventStatsEnabled())
+      originEventStats().print();
     EventSystem.deinitialize();
     return Plugin::success();
   }
@@ -589,8 +787,13 @@ struct MPIPluginTy : public GenericPluginTy {
   }
 
   int32_t is_plugin_compatible(__tgt_device_image *Image) override {
-    if (!EventSystem.is_initialized())
-      EventSystem.initialize();
+    if (!EventSystem.is_initialized() && !EventSystem.initialize()) {
+      DP("Failed to initialize EventSystem in is_plugin_compatible\n");
+      ompfileDiagLog("is_plugin_compatible_eventsystem_fail", -1,
+                     static_cast<int>(RemoteDevices.size()), -1, OFFLOAD_FAIL,
+                     0);
+      return false;
+    }
 
     int NumRanks = EventSystem.getNumWorkers();
     llvm::SmallVector<bool> QueryResults{};
@@ -603,6 +806,8 @@ struct MPIPluginTy : public GenericPluginTy {
       if (Event.empty()) {
         DP("Failed to create isPluginCompatible on Rank %d\n", RemoteRank);
         QueryResults[RemoteRank] = false;
+        QueryResult = false;
+        continue;
       }
 
       Event.wait();
@@ -620,6 +825,10 @@ struct MPIPluginTy : public GenericPluginTy {
   int32_t is_device_compatible(int32_t DeviceId,
                                __tgt_device_image *Image) override {
     bool QueryResult = true;
+    int CompatDiagA = static_cast<int>(QueryResult);
+    int CompatDiagB = 0;
+    ompfileDiagLog("is_device_compatible_enter", -1,
+                   static_cast<int>(RemoteDevices.size()), DeviceId, 0, 0);
 
     EventTy Event = EventSystem.createEvent(OriginEvents::isDeviceCompatible,
                                             EventTypeTy::IS_DEVICE_COMPATIBLE,
@@ -627,22 +836,48 @@ struct MPIPluginTy : public GenericPluginTy {
 
     if (Event.empty()) {
       DP("Failed to create isDeviceCompatible on Device %d\n", DeviceId);
+      CompatDiagA = OFFLOAD_FAIL;
+      CompatDiagB = 1;
+      ompfileDiagLog("is_device_compatible", -1,
+                     static_cast<int>(RemoteDevices.size()), DeviceId,
+                     CompatDiagA, CompatDiagB);
+      return false;
     }
 
     Event.wait();
     if (auto Err = Event.getError()) {
       DP("Error querying the binary compability on Device %d\n", DeviceId);
+      CompatDiagA = OFFLOAD_FAIL;
+      CompatDiagB = 2;
+      ompfileDiagLog("is_device_compatible", -1,
+                     static_cast<int>(RemoteDevices.size()), DeviceId,
+                     CompatDiagA, CompatDiagB);
+      return false;
     }
+
+    CompatDiagA = static_cast<int>(QueryResult);
+    ompfileDiagLog("is_device_compatible", -1,
+                   static_cast<int>(RemoteDevices.size()), DeviceId, CompatDiagA,
+                   CompatDiagB);
 
     return QueryResult;
   }
 
   int32_t is_device_initialized(int32_t DeviceId) const override {
-    return isValidDeviceId(DeviceId) && RemoteDevices[DeviceId] != nullptr;
+    bool IsValid = isValidDeviceId(DeviceId);
+    void *DevicePtr = IsValid ? RemoteDevices[DeviceId] : nullptr;
+    int32_t IsInitialized =
+        IsValid ? static_cast<int32_t>(RemoteDevicesInitialized[DeviceId]) : 0;
+    ompfileDiagLog("is_device_initialized", -1,
+                   static_cast<int>(RemoteDevices.size()), DeviceId,
+                   IsInitialized, DevicePtr == nullptr ? 1 : 0);
+    return IsInitialized;
   }
 
   int32_t init_device(int32_t DeviceId) override {
     void *DevicePtr = nullptr;
+    ompfileDiagLog("init_device_enter", -1, static_cast<int>(RemoteDevices.size()),
+                   DeviceId, 0, 0);
 
     EventTy Event =
         EventSystem.createEvent(OriginEvents::initDevice,
@@ -650,6 +885,10 @@ struct MPIPluginTy : public GenericPluginTy {
 
     if (Event.empty()) {
       REPORT("Error to create InitDevice Event for device %d\n", DeviceId);
+      if (isValidDeviceId(DeviceId))
+        RemoteDevicesInitialized[DeviceId] = false;
+      ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                     DeviceId, OFFLOAD_FAIL, 1);
       return OFFLOAD_FAIL;
     }
 
@@ -658,10 +897,33 @@ struct MPIPluginTy : public GenericPluginTy {
     if (auto Error = Event.getError()) {
       REPORT("Failure to initialize device %d: %s\n", DeviceId,
              toString(std::move(Error)).data());
-      return 0;
+      if (isValidDeviceId(DeviceId))
+        RemoteDevicesInitialized[DeviceId] = false;
+      int DevicePtrIsNull = DevicePtr == nullptr ? 1 : 0;
+      ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                     DeviceId, OFFLOAD_FAIL, DevicePtrIsNull);
+      return OFFLOAD_FAIL;
+    }
+
+    if (!isValidDeviceId(DeviceId)) {
+      int DevicePtrIsNull = DevicePtr == nullptr ? 1 : 0;
+      ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                     DeviceId, OFFLOAD_FAIL, DevicePtrIsNull);
+      return OFFLOAD_FAIL;
+    }
+
+    if (DevicePtr == nullptr) {
+      RemoteDevicesInitialized[DeviceId] = false;
+      ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                     DeviceId, OFFLOAD_FAIL, 1);
+      return OFFLOAD_FAIL;
     }
 
     RemoteDevices[DeviceId] = DevicePtr;
+    RemoteDevicesInitialized[DeviceId] = true;
+    int DevicePtrIsNull = DevicePtr == nullptr ? 1 : 0;
+    ompfileDiagLog("init_device", -1, static_cast<int>(RemoteDevices.size()),
+                   DeviceId, OFFLOAD_SUCCESS, DevicePtrIsNull);
 
     return OFFLOAD_SUCCESS;
   }
@@ -729,6 +991,9 @@ struct MPIPluginTy : public GenericPluginTy {
     case TARGET_ALLOC_DEFAULT:
     case TARGET_ALLOC_DEVICE:
     case TARGET_ALLOC_DEVICE_NON_BLOCKING:
+      if (void *Pooled = allocPoolTake(DeviceId, Size, Kind))
+        return Pooled;
+
       Event = EventSystem.createEvent(OriginEvents::allocateBuffer,
                                       EventTypeTy::ALLOC, DeviceId, Size, Kind,
                                       &TgtPtr);
@@ -739,7 +1004,12 @@ struct MPIPluginTy : public GenericPluginTy {
         break;
       }
 
-      Event.wait();
+      {
+        const uint64_t T0 = mpiEventStatsEnabled() ? mpiNowUs() : 0;
+        Event.wait();
+        if (T0)
+          originEventStats().add(EventTypeTy::ALLOC, mpiNowUs() - T0, 1);
+      }
       Err = Event.getError();
       break;
     case TARGET_ALLOC_HOST:
@@ -758,6 +1028,7 @@ struct MPIPluginTy : public GenericPluginTy {
       return nullptr;
     }
 
+    allocPoolRecord(DeviceId, TgtPtr, Size, Kind);
     return TgtPtr;
   }
 
@@ -772,6 +1043,9 @@ struct MPIPluginTy : public GenericPluginTy {
     case TARGET_ALLOC_DEFAULT:
     case TARGET_ALLOC_DEVICE:
     case TARGET_ALLOC_DEVICE_NON_BLOCKING:
+      if (allocPoolGive(DeviceId, TgtPtr, Kind))
+        return OFFLOAD_SUCCESS;
+
       Event =
           EventSystem.createEvent(OriginEvents::deleteBuffer,
                                   EventTypeTy::DELETE, DeviceId, TgtPtr, Kind);
@@ -783,7 +1057,12 @@ struct MPIPluginTy : public GenericPluginTy {
         break;
       }
 
-      Event.wait();
+      {
+        const uint64_t T0 = mpiEventStatsEnabled() ? mpiNowUs() : 0;
+        Event.wait();
+        if (T0)
+          originEventStats().add(EventTypeTy::DELETE, mpiNowUs() - T0, 1);
+      }
       Err = Event.getError();
       break;
     case TARGET_ALLOC_HOST:
@@ -854,6 +1133,9 @@ struct MPIPluginTy : public GenericPluginTy {
 
   int32_t data_notify_mapped(int32_t DeviceId, void *HstPtr,
                              int64_t Size) override {
+    if (mpiSkipDataNotifyEnabled())
+      return OFFLOAD_SUCCESS;
+
     EventTy Event = EventSystem.createEvent(OriginEvents::dataNotifyMapped,
                                             EventTypeTy::DATA_NOTIFY_MAPPED,
                                             DeviceId, HstPtr, Size);
@@ -864,7 +1146,13 @@ struct MPIPluginTy : public GenericPluginTy {
       return OFFLOAD_FAIL;
     }
 
-    Event.wait();
+    {
+      const uint64_t T0 = mpiEventStatsEnabled() ? mpiNowUs() : 0;
+      Event.wait();
+      if (T0)
+        originEventStats().add(EventTypeTy::DATA_NOTIFY_MAPPED,
+                               mpiNowUs() - T0, 1);
+    }
 
     if (auto Error = Event.getError()) {
       REPORT("Failure to notify data mapped %p: %s\n", HstPtr,
@@ -876,6 +1164,9 @@ struct MPIPluginTy : public GenericPluginTy {
   }
 
   int32_t data_notify_unmapped(int32_t DeviceId, void *HstPtr) override {
+    if (mpiSkipDataNotifyEnabled())
+      return OFFLOAD_SUCCESS;
+
     EventTy Event = EventSystem.createEvent(OriginEvents::dataNotifyUnmapped,
                                             EventTypeTy::DATA_NOTIFY_UNMAPPED,
                                             DeviceId, HstPtr);
@@ -886,7 +1177,13 @@ struct MPIPluginTy : public GenericPluginTy {
       return OFFLOAD_FAIL;
     }
 
-    Event.wait();
+    {
+      const uint64_t T0 = mpiEventStatsEnabled() ? mpiNowUs() : 0;
+      Event.wait();
+      if (T0)
+        originEventStats().add(EventTypeTy::DATA_NOTIFY_UNMAPPED,
+                               mpiNowUs() - T0, 1);
+    }
 
     if (auto Error = Event.getError()) {
       REPORT("Failure to notify data unmapped %p: %s\n", HstPtr,
@@ -1445,9 +1742,95 @@ struct MPIPluginTy : public GenericPluginTy {
   }
 
 private:
+  // Origin-side pool of device buffers (OMPTARGET_MPI_ALLOC_POOL_BYTES).
+  // Keyed by (device, size, kind); AllocSizes remembers the size of every
+  // buffer this origin allocated while the pool is enabled, because
+  // data_delete is not told it.
+  using AllocPoolKeyTy = std::tuple<int32_t, int64_t, int32_t>;
+  struct AllocPoolKeyHash {
+    size_t operator()(const AllocPoolKeyTy &Key) const {
+      return std::hash<int64_t>()(std::get<1>(Key)) ^
+             (std::hash<int32_t>()(std::get<0>(Key)) << 1) ^
+             (std::hash<int32_t>()(std::get<2>(Key)) << 2);
+    }
+  };
+
+  void *allocPoolTake(int32_t DeviceId, int64_t Size, int32_t Kind) {
+    if (mpiAllocPoolBytes() <= 0)
+      return nullptr;
+    const std::lock_guard<std::mutex> Lock(AllocPoolMutex);
+    auto It = AllocPool.find(AllocPoolKeyTy{DeviceId, Size, Kind});
+    if (It == AllocPool.end() || It->second.empty())
+      return nullptr;
+    void *TgtPtr = It->second.back();
+    It->second.pop_back();
+    AllocPoolBytesHeld -= Size;
+    return TgtPtr;
+  }
+
+  void allocPoolRecord(int32_t DeviceId, void *TgtPtr, int64_t Size,
+                       int32_t Kind) {
+    if (mpiAllocPoolBytes() <= 0 || !TgtPtr)
+      return;
+    const std::lock_guard<std::mutex> Lock(AllocPoolMutex);
+    AllocSizes[TgtPtr] = std::make_pair(Size, DeviceId);
+    (void)Kind;
+  }
+
+  // True when the buffer was kept for reuse and no DELETE is needed.
+  bool allocPoolGive(int32_t DeviceId, void *TgtPtr, int32_t Kind) {
+    const int64_t Cap = mpiAllocPoolBytes();
+    if (Cap <= 0)
+      return false;
+    const std::lock_guard<std::mutex> Lock(AllocPoolMutex);
+    auto SizeIt = AllocSizes.find(TgtPtr);
+    if (SizeIt == AllocSizes.end() || SizeIt->second.second != DeviceId)
+      return false;
+    const int64_t Size = SizeIt->second.first;
+    if (AllocPoolBytesHeld + Size > Cap) {
+      AllocSizes.erase(SizeIt);
+      return false;
+    }
+    AllocPool[AllocPoolKeyTy{DeviceId, Size, Kind}].push_back(TgtPtr);
+    AllocPoolBytesHeld += Size;
+    return true;
+  }
+
+  void allocPoolRelease() {
+    std::vector<std::tuple<int32_t, void *, int32_t>> Pending;
+    {
+      const std::lock_guard<std::mutex> Lock(AllocPoolMutex);
+      for (auto &Entry : AllocPool)
+        for (void *TgtPtr : Entry.second)
+          Pending.emplace_back(std::get<0>(Entry.first), TgtPtr,
+                               std::get<2>(Entry.first));
+      AllocPool.clear();
+      AllocSizes.clear();
+      AllocPoolBytesHeld = 0;
+    }
+    for (auto &[DeviceId, TgtPtr, Kind] : Pending) {
+      EventTy Event =
+          EventSystem.createEvent(OriginEvents::deleteBuffer,
+                                  EventTypeTy::DELETE, DeviceId, TgtPtr, Kind);
+      if (Event.empty())
+        continue;
+      Event.wait();
+      if (auto Error = Event.getError())
+        REPORT("Failed to release pooled buffer %p: %s\n", TgtPtr,
+               toString(std::move(Error)).c_str());
+    }
+  }
+
+  std::mutex AllocPoolMutex;
+  std::unordered_map<AllocPoolKeyTy, std::vector<void *>, AllocPoolKeyHash>
+      AllocPool;
+  std::unordered_map<void *, std::pair<int64_t, int32_t>> AllocSizes;
+  int64_t AllocPoolBytesHeld = 0;
+
   std::mutex MPIQueueMutex;
   llvm::DenseMap<uintptr_t, int32_t> DeviceImgPtrToDeviceId;
   llvm::SmallVector<void *> RemoteDevices;
+  llvm::SmallVector<bool> RemoteDevicesInitialized;
   EventSystemTy EventSystem;
 };
 
@@ -1462,10 +1845,21 @@ static Error Plugin::check(int32_t ErrorCode, const char *ErrFmt,
       std::to_string(ErrorCode).data());
 }
 
+// Accessors for OriginOmpFileBridge.cpp, which sees MPIPluginTy incomplete.
+llvm::Error ompfileInitMPIPlugin(MPIPluginTy &Plugin) { return Plugin.init(); }
+bool ompfileEnsureEventSystem(MPIPluginTy &Plugin) {
+  return Plugin.ensureEventSystemInitializedForOmpFile();
+}
+EventSystemTy &ompfileEventSystem(MPIPluginTy &Plugin) {
+  return Plugin.getEventSystemForOmpFile();
+}
+
 } // namespace llvm::omp::target::plugin
 
 extern "C" {
 llvm::omp::target::plugin::GenericPluginTy *createPlugin_mpi() {
-  return new llvm::omp::target::plugin::MPIPluginTy();
+  auto *Plugin = new llvm::omp::target::plugin::MPIPluginTy();
+  llvm::omp::target::plugin::ompfilePublishMPIPlugin(Plugin);
+  return Plugin;
 }
 }

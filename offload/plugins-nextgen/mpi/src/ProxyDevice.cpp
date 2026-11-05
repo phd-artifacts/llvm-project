@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -8,12 +9,16 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <tuple>
 
 #include "EventSystem.h"
+#include "ProxyEventStats.h"
+#include "ProxyOmpFile.h"
 #include "RemotePluginManager.h"
 #include "Shared/APITypes.h"
 #include "mpi.h"
+#include "ompfile_env.h"
 #include "omptarget.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -66,7 +71,12 @@ struct ProxyDevice {
   ProxyDevice()
       : NumExecEventHandlers("OMPTARGET_NUM_EXEC_EVENT_HANDLERS", 1),
         NumDataEventHandlers("OMPTARGET_NUM_DATA_EVENT_HANDLERS", 1),
-        EventPollingRate("OMPTARGET_EVENT_POLLING_RATE", 1) {
+        // More than one on purpose: an io handler can block in waitForEvent
+        // on a headnode coherence round trip under write-back staging (see the
+        // queue policy comment on EventSystemTy::IoEventQueue).
+        NumIoEventHandlers("OMPTARGET_NUM_IO_EVENT_HANDLERS", 4),
+        EventPollingRate("OMPTARGET_EVENT_POLLING_RATE", 0),
+        OmpFile(EventSystem) {
 #ifdef OMPT_SUPPORT
     // Initialize OMPT first
     llvm::omp::target::ompt::connectLibrary();
@@ -74,9 +84,11 @@ struct ProxyDevice {
 
     EventSystem.initialize();
     PluginManager.init();
+    OmpFile.initialize();
   }
 
   ~ProxyDevice() {
+    OmpFile.deinitialize();
     EventSystem.deinitialize();
     PluginManager.deinit();
   }
@@ -204,7 +216,11 @@ struct ProxyDevice {
     std::tie(PluginId, DeviceId) =
         EventSystem.mapDeviceId(RequestManager.DeviceId);
 
-    PluginManager.Plugins[PluginId]->init_device(DeviceId);
+    // Every origin initializes its devices, so with several origins this
+    // event arrives once per origin for the same local device; the device is
+    // initialized once and every origin gets the same device pointer.
+    if (!PluginManager.Plugins[PluginId]->is_device_initialized(DeviceId))
+      PluginManager.Plugins[PluginId]->init_device(DeviceId);
 
     auto *DevicePtr = &PluginManager.Plugins[PluginId]->getDevice(DeviceId);
 
@@ -355,14 +371,22 @@ struct ProxyDevice {
   }
 
   EventTy retrieve(MPIRequestManagerTy RequestManager) {
+    RetrieveTimingTy Timing(true);
     void *TgtPtr = nullptr, *HstAsyncInfoPtr = nullptr;
     int64_t Size = 0;
     bool DeviceOpStatus = true;
 
     RequestManager.receive(&HstAsyncInfoPtr, sizeof(void *), MPI_BYTE);
 
-    if (auto Error = co_await RequestManager; Error)
-      co_return Error;
+    // These fields are independent and sent in order on the same MPI tag.
+    // Posting them together removes one header-progress dependency without
+    // changing the wire format or the device-status/payload error protocol.
+    static const bool EarlyHeader = ompfile::env::boolOr(
+        "OMPTARGET_MPI_RETRIEVE_EARLY_HEADER", false);
+    if (!EarlyHeader) {
+      if (auto Error = co_await RequestManager; Error)
+        co_return Error;
+    }
 
     RequestManager.receive(&TgtPtr, sizeof(void *), MPI_BYTE);
     RequestManager.receive(&Size, 1, MPI_INT64_T);
@@ -370,6 +394,7 @@ struct ProxyDevice {
     if (auto Error = co_await RequestManager; Error)
       co_return Error;
 
+    Timing.mark(0);
     int32_t PluginId, DeviceId;
 
     std::tie(PluginId, DeviceId) =
@@ -397,12 +422,16 @@ struct ProxyDevice {
     if (!DeviceOpStatus)
       co_return (co_await RequestManager);
 
+    Timing.mark(1);
     RequestManager.sendInBatchs(DataHandler.HstPtr, Size);
 
     // Event completion notification
     RequestManager.send(nullptr, 0, MPI_BYTE);
 
-    co_return (co_await RequestManager);
+    auto Error = co_await RequestManager;
+    if (!Error)
+      Timing.mark(2);
+    co_return Error;
   }
 
   EventTy exchange(MPIRequestManagerTy RequestManager) {
@@ -1014,11 +1043,56 @@ struct ProxyDevice {
         continue;
       }
 
-      Event.resume();
+      const bool Stats = proxyEventStatsEnabled();
+      if (Stats) {
+        auto &Promise = Event.getHandle().promise();
+        if (Promise.StatFirstResumeUs == 0)
+          Promise.StatFirstResumeUs = proxyNowUs();
+        ++Promise.StatResumes;
+      }
+
+      {
+        // One rotation on this thread: thread-local, so push/pop. The gap
+        // between the event's lifetime range starting and its first resume
+        // range is its queue wait.
+        ompfile::trace::Scope Trace(
+            ompfile::trace::Domain::MPP,
+            ompfile::trace::Enabled ? eventTypeName(Event.getEventType())
+                                    : "resume",
+            ompfile::trace::Color::Other);
+
+        Event.resume();
+
+        // Bounded in-place retry (OMPTARGET_MPI_PROXY_EVENT_SPIN), so an event
+        // waiting on its counterpart does not pay a queue rotation per poll.
+        for (unsigned Spin = proxyEventSpin(); Spin > 0 && !Event.done();
+             --Spin)
+          Event.resume();
+      }
 
       if (!Event.done()) {
         Queue.push(std::move(Event));
         continue;
+      }
+
+      {
+        auto &Promise = Event.getHandle().promise();
+        ompfile::trace::rangeEnd(ompfile::trace::Domain::MPP,
+                                 Promise.TraceRangeId);
+        Promise.TraceRangeId = 0;
+      }
+
+      if (Stats) {
+        auto &Promise = Event.getHandle().promise();
+        if (Promise.StatCreatedUs != 0) {
+          const uint64_t Now = proxyNowUs();
+          const uint64_t First = Promise.StatFirstResumeUs
+                                     ? Promise.StatFirstResumeUs
+                                     : Promise.StatCreatedUs;
+          proxyEventStats().add(Event.getEventType(),
+                                First - Promise.StatCreatedUs, Now - First,
+                                Promise.StatResumes);
+        }
       }
 
       auto Error = Event.getError();
@@ -1038,18 +1112,31 @@ struct ProxyDevice {
 
     // Updates the event state and
     EventSystem.EventSystemState = EventSystemStateTy::RUNNING;
+    ompfile::trace::nameThisThread("mpp-gate");
 
-    // Spawns the event handlers.
+    // Spawns the event handlers: exec, then data, then io, positionally. Each
+    // pool is at least one thread, whatever the knob says, so no queue is ever
+    // left without a consumer.
+    const int NumExec = std::max(1, NumExecEventHandlers.get());
+    const int NumData = std::max(1, NumDataEventHandlers.get());
+    const int NumIo = std::max(1, NumIoEventHandlers.get());
     llvm::SmallVector<std::jthread> EventHandlers;
-    EventHandlers.resize(NumExecEventHandlers.get() +
-                         NumDataEventHandlers.get());
-    int EventHandlersSize = EventHandlers.size();
-    auto HandlerFunction = std::bind_front(&ProxyDevice::runEventHandler, this);
-    for (int Idx = 0; Idx < EventHandlersSize; Idx++) {
+    EventHandlers.resize(NumExec + NumData + NumIo);
+    for (int Idx = 0; Idx < NumExec + NumData + NumIo; Idx++) {
+      EventQueue *Queue = &EventSystem.IoEventQueue;
+      std::string Name = "mpp-io-" + std::to_string(Idx - NumExec - NumData);
+      if (Idx < NumExec) {
+        Queue = &EventSystem.ExecEventQueue;
+        Name = "mpp-exec-" + std::to_string(Idx);
+      } else if (Idx < NumExec + NumData) {
+        Queue = &EventSystem.DataEventQueue;
+        Name = "mpp-data-" + std::to_string(Idx - NumExec);
+      }
       EventHandlers[Idx] = std::jthread(
-          HandlerFunction, std::ref(Idx < NumExecEventHandlers.get()
-                                        ? EventSystem.ExecEventQueue
-                                        : EventSystem.DataEventQueue));
+          [this, Queue, Name = std::move(Name)](std::stop_token Stop) {
+            ompfile::trace::nameThisThread(Name.c_str());
+            runEventHandler(Stop, *Queue);
+          });
     }
 
     // Executes the gate thread logic
@@ -1058,10 +1145,12 @@ struct ProxyDevice {
       MPI_Message EventReqMsg;
       MPI_Status EventStatus;
       int HasReceived = false;
-      MPI_Improbe(MPI_ANY_SOURCE,
-                  static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                  EventSystem.GateThreadComm, &HasReceived, &EventReqMsg,
-                  MPI_STATUS_IGNORE);
+      ompfileWithMPICallLock([&]() {
+        return MPI_Improbe(MPI_ANY_SOURCE,
+                           static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                           EventSystem.GateThreadComm, &HasReceived,
+                           &EventReqMsg, MPI_STATUS_IGNORE);
+      });
 
       // If none was received, wait for `EVENT_POLLING_RATE`us for the next
       // check.
@@ -1077,10 +1166,15 @@ struct ProxyDevice {
       // - Target comm
       // - Event source rank
       int EventInfo[3];
-      MPI_Mrecv(EventInfo, 3, MPI_INT, &EventReqMsg, &EventStatus);
+      ompfileWithMPICallLock([&]() {
+        return MPI_Mrecv(EventInfo, 3, MPI_INT, &EventReqMsg, &EventStatus);
+      });
       const auto NewEventType = static_cast<EventTypeTy>(EventInfo[0]);
+      // Origin = the creator of the event = the notification's source rank;
+      // must match the (EventId, OriginRank) mapping the origin side used.
       MPIRequestManagerTy RequestManager(
-          EventSystem.getNewEventComm(EventInfo[1]), EventInfo[1],
+          EventSystem.getNewEventComm(EventInfo[1], EventStatus.MPI_SOURCE),
+          EventSystem.getEventMPITag(EventInfo[1], EventStatus.MPI_SOURCE),
           EventStatus.MPI_SOURCE, EventInfo[2]);
 
       // Creates a new receive event of 'event_type' type.
@@ -1148,6 +1242,25 @@ struct ProxyDevice {
       case SYNCHRONIZE:
         NewEvent = synchronize(std::move(RequestManager));
         break;
+      case OMPFILE_PING:
+      case OMPFILE_OPEN:
+      case OMPFILE_CLOSE:
+      case OMPFILE_PREAD:
+      case OMPFILE_PREAD_NO_STAGE:
+      case OMPFILE_DIRTY_OWNER_PREAD:
+      case OMPFILE_DIRTY_OWNER_PREAD_BATCH:
+      case OMPFILE_DIRTY_OWNER_QUERY:
+      case OMPFILE_PWRITE:
+      case OMPFILE_FRESHNESS_QUERY:
+      case OMPFILE_FRESHNESS_WRITE_COMMIT:
+      case OMPFILE_FLUSH_DIRTY_TILE:
+      case OMPFILE_SCHED_REQUEST:
+      case OMPFILE_SCHED_REQUEST_BATCH:
+        // File-I/O events (isFileIoEvent): the libompfile server
+        // (ProxyOmpFile.h).
+        NewEvent =
+            OmpFile.createFileIoEvent(NewEventType, std::move(RequestManager));
+        break;
       case INIT_ASYNC_INFO:
         NewEvent = initAsyncInfo(std::move(RequestManager));
         break;
@@ -1176,8 +1289,43 @@ struct ProxyDevice {
         assert(false && "Trying to create a local event on a remote node");
       }
 
-      if (NewEventType == LAUNCH_KERNEL) {
+      // Label the event with the type it was created from. The coroutine
+      // promise defaults every event to SYNC (that default is meant for the
+      // origin's locally created sync events), and the gate thread never
+      // overrode it, so on the proxy getEventType() always answered SYNC.
+      // Nothing depended on it before the per-type timing below.
+      if (!NewEvent.empty())
+        NewEvent.setEventType(NewEventType);
+
+      if (proxyEventStatsEnabled() && !NewEvent.empty())
+        NewEvent.getHandle().promise().StatCreatedUs = proxyNowUs();
+
+      // Route on the local NewEventType (the label written above is the same
+      // value, but this is the unambiguous source). Queue policy is documented
+      // on EventSystemTy's queue members.
+      const bool IsExec = NewEventType == LAUNCH_KERNEL;
+      const bool IsIo = isFileIoEvent(NewEventType);
+
+      // Event lifetime range: starts here, ends in whichever handler thread
+      // completes it. The payload is the correlation key the origin side also
+      // knows, (logical event id << 32) | origin rank, so origin and proxy
+      // reports can be lined up event by event.
+      if (!NewEvent.empty()) {
+        const uint64_t Key =
+            (static_cast<uint64_t>(static_cast<uint32_t>(EventInfo[1])) << 32) |
+            static_cast<uint32_t>(EventStatus.MPI_SOURCE);
+        NewEvent.getHandle().promise().TraceRangeId = ompfile::trace::rangeStart(
+            ompfile::trace::Domain::MPP, eventTypeName(NewEventType),
+            IsExec ? ompfile::trace::Color::Exec
+            : IsIo ? ompfile::trace::Color::Io
+                   : ompfile::trace::Color::Data,
+            Key);
+      }
+
+      if (IsExec) {
         EventSystem.ExecEventQueue.push(std::move(NewEvent));
+      } else if (IsIo) {
+        EventSystem.IoEventQueue.push(std::move(NewEvent));
       } else {
         EventSystem.DataEventQueue.push(std::move(NewEvent));
       }
@@ -1198,8 +1346,13 @@ private:
   IntEnvar NumExecEventHandlers;
   /// Number of data event handlers to spawn.
   IntEnvar NumDataEventHandlers;
+  /// Number of file-I/O event handlers to spawn (EventSystemTy::IoEventQueue).
+  IntEnvar NumIoEventHandlers;
   /// Polling rate period (us) used by event handlers.
   IntEnvar EventPollingRate;
+  /// The libompfile server: file events, staging, owner forwarding
+  /// (ProxyOmpFile.h).
+  ProxyOmpFile OmpFile;
   // Mutex for AsyncInfoTable
   std::mutex TableMutex;
 };

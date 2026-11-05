@@ -12,16 +12,22 @@
 //===----------------------------------------------------------------------===//
 
 #include "EventSystem.h"
+#include "EventSystemOmpFile.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include <mpi.h>
 #include <unistd.h>
@@ -43,66 +49,187 @@
   }
 
 std::string EventTypeToString(EventTypeTy eventType) {
+  return eventTypeName(eventType);
+}
+
+const char *eventTypeName(EventTypeTy eventType) {
   switch (eventType) {
-  case EventTypeTy::RETRIEVE_NUM_DEVICES:
-    return "RETRIEVE_NUM_DEVICES";
-  case EventTypeTy::INIT_DEVICE:
-    return "INIT_DEVICE";
-  case EventTypeTy::INIT_RECORD_REPLAY:
-    return "INIT_RECORD_REPLAY";
-  case EventTypeTy::IS_PLUGIN_COMPATIBLE:
-    return "IS_PLUGIN_COMPATIBLE";
-  case EventTypeTy::IS_DEVICE_COMPATIBLE:
-    return "IS_DEVICE_COMPATIBLE";
-  case EventTypeTy::IS_DATA_EXCHANGABLE:
-    return "IS_DATA_EXCHANGABLE";
-  case EventTypeTy::LOAD_BINARY:
-    return "LOAD_BINARY";
-  case EventTypeTy::GET_GLOBAL:
-    return "GET_GLOBAL";
-  case EventTypeTy::GET_FUNCTION:
-    return "GET_FUNCTION";
-  case EventTypeTy::SYNCHRONIZE:
-    return "SYNCHRONIZE";
-  case EventTypeTy::INIT_ASYNC_INFO:
-    return "INIT_ASYNC_INFO";
-  case EventTypeTy::INIT_DEVICE_INFO:
-    return "INIT_DEVICE_INFO";
-  case EventTypeTy::QUERY_ASYNC:
-    return "QUERY_ASYNC";
-  case EventTypeTy::PRINT_DEVICE_INFO:
-    return "PRINT_DEVICE_INFO";
-  case EventTypeTy::DATA_LOCK:
-    return "DATA_LOCK";
-  case EventTypeTy::DATA_UNLOCK:
-    return "DATA_UNLOCK";
-  case EventTypeTy::DATA_NOTIFY_MAPPED:
-    return "DATA_NOTIFY_MAPPED";
-  case EventTypeTy::DATA_NOTIFY_UNMAPPED:
-    return "DATA_NOTIFY_UNMAPPED";
-  case EventTypeTy::ALLOC:
-    return "ALLOC";
-  case EventTypeTy::DELETE:
-    return "DELETE";
-  case EventTypeTy::SUBMIT:
-    return "SUBMIT";
-  case EventTypeTy::RETRIEVE:
-    return "RETRIEVE";
-  case EventTypeTy::LOCAL_EXCHANGE:
-    return "LOCAL_EXCHANGE";
-  case EventTypeTy::EXCHANGE_SRC:
-    return "EXCHANGE_SRC";
-  case EventTypeTy::EXCHANGE_DST:
-    return "EXCHANGE_DST";
-  case EventTypeTy::LAUNCH_KERNEL:
-    return "LAUNCH_KERNEL";
-  case EventTypeTy::SYNC:
-    return "SYNC";
-  case EventTypeTy::EXIT:
-    return "EXIT";
-  default:
-    return "UNKNOWN_EVENT_TYPE";
+    case EventTypeTy::RETRIEVE_NUM_DEVICES: return "RETRIEVE_NUM_DEVICES";
+    case EventTypeTy::INIT_DEVICE: return "INIT_DEVICE";
+    case EventTypeTy::INIT_RECORD_REPLAY: return "INIT_RECORD_REPLAY";
+    case EventTypeTy::IS_PLUGIN_COMPATIBLE: return "IS_PLUGIN_COMPATIBLE";
+    case EventTypeTy::IS_DEVICE_COMPATIBLE: return "IS_DEVICE_COMPATIBLE";
+    case EventTypeTy::IS_DATA_EXCHANGABLE: return "IS_DATA_EXCHANGABLE";
+    case EventTypeTy::LOAD_BINARY: return "LOAD_BINARY";
+    case EventTypeTy::GET_GLOBAL: return "GET_GLOBAL";
+    case EventTypeTy::GET_FUNCTION: return "GET_FUNCTION";
+    case EventTypeTy::SYNCHRONIZE: return "SYNCHRONIZE";
+    case EventTypeTy::INIT_ASYNC_INFO: return "INIT_ASYNC_INFO";
+    case EventTypeTy::INIT_DEVICE_INFO: return "INIT_DEVICE_INFO";
+    case EventTypeTy::QUERY_ASYNC: return "QUERY_ASYNC";
+    case EventTypeTy::PRINT_DEVICE_INFO: return "PRINT_DEVICE_INFO";
+    case EventTypeTy::DATA_LOCK: return "DATA_LOCK";
+    case EventTypeTy::DATA_UNLOCK: return "DATA_UNLOCK";
+    case EventTypeTy::DATA_NOTIFY_MAPPED: return "DATA_NOTIFY_MAPPED";
+    case EventTypeTy::DATA_NOTIFY_UNMAPPED: return "DATA_NOTIFY_UNMAPPED";
+    case EventTypeTy::GET_DEVICE_TYPE: return "GET_DEVICE_TYPE";
+    case EventTypeTy::ALLOC: return "ALLOC";
+    case EventTypeTy::DELETE: return "DELETE";
+    case EventTypeTy::SUBMIT: return "SUBMIT";
+    case EventTypeTy::RETRIEVE: return "RETRIEVE";
+    case EventTypeTy::LOCAL_EXCHANGE: return "LOCAL_EXCHANGE";
+    case EventTypeTy::EXCHANGE_SRC: return "EXCHANGE_SRC";
+    case EventTypeTy::EXCHANGE_DST: return "EXCHANGE_DST";
+    case EventTypeTy::LAUNCH_KERNEL: return "LAUNCH_KERNEL";
+    case EventTypeTy::SYNC: return "SYNC";
+    case EventTypeTy::EXIT: return "EXIT";
+    default: return ompfileEventTypeName(eventType);
   }
+}
+
+namespace {
+
+uint64_t transferNowUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct RetrievePhaseStats {
+  std::atomic<uint64_t> Count[2] = {};
+  std::atomic<uint64_t> Time[2][3] = {};
+  ~RetrievePhaseStats() {
+    for (unsigned Side = 0; Side < 2; ++Side) {
+      const auto N = Count[Side].load(std::memory_order_relaxed);
+      if (!N)
+        continue;
+      fprintf(stderr, "[mpi-plugin] retrieve_phase_stats side=%s count=%llu "
+                      "%s=%llu %s=%llu %s=%llu\n",
+              Side ? "proxy" : "origin", (unsigned long long)N,
+              Side ? "header_wait_us" : "status_wait_us",
+              (unsigned long long)Time[Side][0].load(std::memory_order_relaxed),
+              Side ? "device_wait_us" : "payload_post_us",
+              (unsigned long long)Time[Side][1].load(std::memory_order_relaxed),
+              Side ? "send_wait_us" : "payload_wait_us",
+              (unsigned long long)Time[Side][2].load(std::memory_order_relaxed));
+    }
+  }
+};
+
+RetrievePhaseStats &retrievePhaseStats() {
+  static RetrievePhaseStats Stats;
+  return Stats;
+}
+
+bool ompfileTraceEnabled() {
+  static const bool Enabled = []() {
+    const char *Env = std::getenv("LIBOMPFILE_DEBUG_TRACE");
+    return Env && Env[0] == '1' && Env[1] == '\0';
+  }();
+  return Enabled;
+}
+
+bool ompfileMpiErrorsReturnEnabled() {
+  static const bool Enabled = []() {
+    const char *Env = std::getenv("LIBOMPFILE_DEBUG_MPI_ERRORS_RETURN");
+    return Env && Env[0] == '1' && Env[1] == '\0';
+  }();
+  return Enabled;
+}
+
+uint64_t nextTraceSeq() {
+  static std::atomic<uint64_t> Seq{1};
+  return Seq.fetch_add(1, std::memory_order_relaxed);
+}
+
+unsigned long threadIdHash() {
+  return static_cast<unsigned long>(
+      std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+void ompfileTrace(const char *Fmt, ...) {
+  if (!ompfileTraceEnabled())
+    return;
+
+  va_list Args;
+  va_start(Args, Fmt);
+  fprintf(stderr, "[ompfile-mpi][trace][seq=%llu][pid=%d][tid=%lu] ",
+          static_cast<unsigned long long>(nextTraceSeq()), getpid(),
+          threadIdHash());
+  vfprintf(stderr, Fmt, Args);
+  va_end(Args);
+}
+
+unsigned long long requestBits(const MPI_Request &Req) {
+  unsigned long long Bits = 0;
+  static_assert(sizeof(Bits) >= sizeof(MPI_Request),
+                "Cannot safely print MPI_Request payload.");
+  std::memcpy(&Bits, &Req, sizeof(MPI_Request));
+  return Bits;
+}
+
+void traceRequestSample(const llvm::SmallVector<MPI_Request> &Requests) {
+  if (!ompfileTraceEnabled())
+    return;
+
+  constexpr size_t MaxSample = 6;
+  char Buf[256];
+  size_t Offset = 0;
+  Offset += static_cast<size_t>(
+      std::snprintf(Buf + Offset, sizeof(Buf) - Offset, "["));
+  for (size_t I = 0; I < Requests.size() && I < MaxSample &&
+                   Offset + 32 < sizeof(Buf);
+       ++I) {
+    Offset += static_cast<size_t>(std::snprintf(
+        Buf + Offset, sizeof(Buf) - Offset, "%s0x%llx", I == 0 ? "" : ",",
+        requestBits(Requests[static_cast<int>(I)])));
+  }
+  if (Requests.size() > MaxSample && Offset + 8 < sizeof(Buf))
+    Offset += static_cast<size_t>(
+        std::snprintf(Buf + Offset, sizeof(Buf) - Offset, ",..."));
+  std::snprintf(Buf + Offset, sizeof(Buf) - Offset, "]");
+  ompfileTrace("MPI request sample count=%zu values=%s\n", Requests.size(), Buf);
+}
+
+void configureCommErrhandlerForDebug(MPI_Comm Comm, const char *Label) {
+  if (!ompfileMpiErrorsReturnEnabled() || Comm == MPI_COMM_NULL)
+    return;
+  const int Rc = MPI_Comm_set_errhandler(Comm, MPI_ERRORS_RETURN);
+  ompfileTrace("configure errhandler label=%s rc=%d\n",
+               Label ? Label : "(unknown)", Rc);
+}
+
+} // namespace
+
+RetrieveTimingTy::RetrieveTimingTy(bool IsProxy) : Proxy(IsProxy) {
+  static const bool StatsEnabled = [] {
+    const char *Value = std::getenv("OMPTARGET_MPI_TRANSFER_STATS");
+    return Value && std::strcmp(Value, "1") == 0;
+  }();
+  Enabled = StatsEnabled;
+  if (Enabled) {
+    (void)retrievePhaseStats();
+    PreviousUs = transferNowUs();
+  }
+}
+
+void RetrieveTimingTy::mark(unsigned Phase) {
+  assert(Phase < 3);
+  if (!Enabled)
+    return;
+  const uint64_t Now = transferNowUs();
+  Durations[Phase] = Now - PreviousUs;
+  PreviousUs = Now;
+  Phases |= 1u << Phase;
+}
+
+RetrieveTimingTy::~RetrieveTimingTy() {
+  if (!Enabled || Phases != 7)
+    return;
+  auto &Stats = retrievePhaseStats();
+  Stats.Count[Proxy].fetch_add(1, std::memory_order_relaxed);
+  for (unsigned Phase = 0; Phase < 3; ++Phase)
+    Stats.Time[Proxy][Phase].fetch_add(Durations[Phase],
+                                      std::memory_order_relaxed);
 }
 
 /// Resumes the most recent incomplete coroutine in the list.
@@ -123,6 +250,14 @@ void EventTy::resume() {
 
 /// Wait until event completes.
 void EventTy::wait() {
+  // The calling thread is consumed until the event completes: on the origin
+  // that is the thread that called omp_file_*, and on a proxy it is a handler
+  // thread forwarding to another rank. Thread-local, so a push/pop range; its
+  // width on the timeline is exactly the thread-occupancy cost.
+  ompfile::trace::Scope Trace(ompfile::trace::Domain::MPP,
+                              ompfile::trace::Enabled ? eventTypeName(EventType)
+                                                      : "event-wait",
+                              ompfile::trace::Color::Wait);
   // Advance the event progress until it is completed.
   while (!done()) {
     advance();
@@ -139,10 +274,13 @@ bool EventTy::done() const { return getHandle().done(); }
 bool EventTy::empty() const { return !getHandle(); }
 
 /// Get the coroutine error from the Handle.
-llvm::Error EventTy::getError() const {
+llvm::Error EventTy::getError() {
   auto &Error = getHandle().promise().CoroutineError;
-  if (Error)
-    return std::move(*Error);
+  if (Error) {
+    llvm::Error Result = std::move(*Error);
+    Error.reset();
+    return Result;
+  }
 
   return llvm::Error::success();
 }
@@ -150,69 +288,211 @@ llvm::Error EventTy::getError() const {
 ///  MPI Request Manager Destructor. The Manager cannot be destroyed until all
 ///  the requests it manages have been completed.
 MPIRequestManagerTy::~MPIRequestManagerTy() {
-  assert(Requests.empty() && "Requests must be fulfilled and emptied before "
-                             "destruction. Did you co_await on it?");
+  if (Requests.empty())
+    return;
+
+  ompfileTrace("MPIRequestManagerTy dtor draining pending requests this=%p "
+               "req_count=%zu other_rank=%d tag=%d event_type=%d\n",
+               static_cast<void *>(this), Requests.size(), OtherRank, Tag,
+               EventType);
+  traceRequestSample(Requests);
+
+  int MPIInitialized = 0;
+  int MPIFinalized = 0;
+  MPI_Initialized(&MPIInitialized);
+  if (MPIInitialized)
+    MPI_Finalized(&MPIFinalized);
+  ompfileTrace("MPIRequestManagerTy dtor dropping pending requests because "
+               "teardown reached with MPI %s this=%p req_count=%zu\n",
+               (!MPIInitialized ? "uninitialized"
+                                : (MPIFinalized ? "finalized" : "active")),
+               static_cast<void *>(this), Requests.size());
+
+  Requests.clear();
+  PendingMPIError = MPI_SUCCESS;
 }
 
 /// Send a message to \p OtherRank asynchronously.
 void MPIRequestManagerTy::send(const void *Buffer, int Size,
                                MPI_Datatype Datatype) {
-  MPI_Isend(Buffer, Size, Datatype, OtherRank, Tag, Comm,
-            &Requests.emplace_back(MPI_REQUEST_NULL));
+  sendTagged(Buffer, Size, Datatype, 0);
+}
+
+void MPIRequestManagerTy::sendTagged(const void *Buffer, int Size,
+                                     MPI_Datatype Datatype, int TagOffset) {
+  MPI_Request &Req = Requests.emplace_back(MPI_REQUEST_NULL);
+  int MPIError = ompfileWithMPICallLock([&]() {
+    return MPI_Isend(Buffer, Size, Datatype, OtherRank, Tag + TagOffset, Comm,
+                     &Req);
+  });
+  if (MPIError != MPI_SUCCESS) {
+    PendingMPIError = MPIError;
+    Req = MPI_REQUEST_NULL;
+  }
 }
 
 /// Divide the \p Buffer into fragments of size \p MPIFragmentSize and send them
 /// to \p OtherRank asynchronously.
 void MPIRequestManagerTy::sendInBatchs(void *Buffer, int64_t Size) {
+  sendInBatchsTagged(Buffer, Size, 0);
+}
+
+void MPIRequestManagerTy::sendInBatchsTagged(void *Buffer, int64_t Size,
+                                             int TagOffset) {
+  if (Size <= 0)
+    return;
+
+  const int64_t FragmentSize = MPIFragmentSize.get();
+  if (FragmentSize <= 0) {
+    PendingMPIError = MPI_ERR_COUNT;
+    return;
+  }
+
+  constexpr int64_t MaxMPIChunk =
+      static_cast<int64_t>(std::numeric_limits<int>::max());
+
   // Operates over many fragments of the original buffer of at most
   // MPI_FRAGMENT_SIZE bytes.
   char *BufferByteArray = reinterpret_cast<char *>(Buffer);
   int64_t RemainingBytes = Size;
+  int64_t Offset = 0;
   while (RemainingBytes > 0) {
-    send(&BufferByteArray[Size - RemainingBytes],
-         static_cast<int>(std::min(RemainingBytes, MPIFragmentSize.get())),
-         MPI_BYTE);
-    RemainingBytes -= MPIFragmentSize.get();
+    const int64_t Chunk = std::min({RemainingBytes, FragmentSize, MaxMPIChunk});
+    assert(Chunk > 0 && "MPI fragment chunk must be positive.");
+    sendTagged(&BufferByteArray[Offset], static_cast<int>(Chunk), MPI_BYTE,
+               TagOffset);
+    Offset += Chunk;
+    RemainingBytes -= Chunk;
   }
 }
 
 /// Receive a message from \p OtherRank asynchronously.
 void MPIRequestManagerTy::receive(void *Buffer, int Size,
                                   MPI_Datatype Datatype) {
-  MPI_Irecv(Buffer, Size, Datatype, OtherRank, Tag, Comm,
-            &Requests.emplace_back(MPI_REQUEST_NULL));
+  receiveTagged(Buffer, Size, Datatype, 0);
+}
+
+void MPIRequestManagerTy::receiveTagged(void *Buffer, int Size,
+                                        MPI_Datatype Datatype, int TagOffset) {
+  MPI_Request &Req = Requests.emplace_back(MPI_REQUEST_NULL);
+  int MPIError = ompfileWithMPICallLock([&]() {
+    return MPI_Irecv(Buffer, Size, Datatype, OtherRank, Tag + TagOffset, Comm,
+                     &Req);
+  });
+  if (MPIError != MPI_SUCCESS) {
+    PendingMPIError = MPIError;
+    Req = MPI_REQUEST_NULL;
+  }
 }
 
 /// Asynchronously receive message fragments from \p OtherRank and reconstruct
 /// them into \p Buffer.
 void MPIRequestManagerTy::receiveInBatchs(void *Buffer, int64_t Size) {
+  receiveInBatchsTagged(Buffer, Size, 0);
+}
+
+void MPIRequestManagerTy::receiveInBatchsTagged(void *Buffer, int64_t Size,
+                                                int TagOffset) {
+  if (Size <= 0)
+    return;
+
+  const int64_t FragmentSize = MPIFragmentSize.get();
+  if (FragmentSize <= 0) {
+    PendingMPIError = MPI_ERR_COUNT;
+    return;
+  }
+
+  constexpr int64_t MaxMPIChunk =
+      static_cast<int64_t>(std::numeric_limits<int>::max());
+
   // Operates over many fragments of the original buffer of at most
   // MPI_FRAGMENT_SIZE bytes.
   char *BufferByteArray = reinterpret_cast<char *>(Buffer);
   int64_t RemainingBytes = Size;
+  int64_t Offset = 0;
   while (RemainingBytes > 0) {
-    receive(&BufferByteArray[Size - RemainingBytes],
-            static_cast<int>(std::min(RemainingBytes, MPIFragmentSize.get())),
-            MPI_BYTE);
-    RemainingBytes -= MPIFragmentSize.get();
+    const int64_t Chunk = std::min({RemainingBytes, FragmentSize, MaxMPIChunk});
+    assert(Chunk > 0 && "MPI fragment chunk must be positive.");
+    receiveTagged(&BufferByteArray[Offset], static_cast<int>(Chunk), MPI_BYTE,
+                  TagOffset);
+    Offset += Chunk;
+    RemainingBytes -= Chunk;
   }
 }
 
 /// Coroutine that waits until all pending requests finish.
 EventTy MPIRequestManagerTy::wait() {
-  int RequestsCompleted = false;
+  if (PendingMPIError != MPI_SUCCESS) {
+    ompfileTrace("MPIRequestManagerTy::wait pending mpi error this=%p "
+                 "mpi_error=%d req_count=%zu\n",
+                 static_cast<void *>(this), PendingMPIError, Requests.size());
+    co_return createError("MPI request setup failed with code %d",
+                          PendingMPIError);
+  }
 
-  while (!RequestsCompleted) {
-    int MPIError = MPI_Testall(Requests.size(), Requests.data(),
-                               &RequestsCompleted, MPI_STATUSES_IGNORE);
+  if (Requests.empty())
+    co_return llvm::Error::success();
 
-    if (MPIError != MPI_SUCCESS)
+  size_t CompletedRequests = 0;
+  uint64_t PollIterations = 0;
+  ompfileTrace("MPIRequestManagerTy::wait enter this=%p req_count=%zu "
+               "other_rank=%d tag=%d event_type=%d\n",
+               static_cast<void *>(this), Requests.size(), OtherRank, Tag,
+               EventType);
+  traceRequestSample(Requests);
+
+  while (CompletedRequests < Requests.size()) {
+    ++PollIterations;
+    if (ompfileTraceEnabled() &&
+        (PollIterations <= 3 || (PollIterations % 1024) == 0)) {
+      ompfileTrace("MPIRequestManagerTy::wait poll this=%p iter=%llu "
+                   "req_count=%zu completed=%zu\n",
+                   static_cast<void *>(this),
+                   static_cast<unsigned long long>(PollIterations),
+                   Requests.size(), CompletedRequests);
+      traceRequestSample(Requests);
+    }
+
+    int CompletedIndex = MPI_UNDEFINED;
+    int RequestCompleted = false;
+    int MPIError = ompfileWithMPICallLock([&]() {
+      return MPI_Testany(static_cast<int>(Requests.size()), Requests.data(),
+                         &CompletedIndex, &RequestCompleted,
+                         MPI_STATUS_IGNORE);
+    });
+
+    if (MPIError != MPI_SUCCESS) {
+      char ErrBuf[MPI_MAX_ERROR_STRING] = {0};
+      int ErrLen = 0;
+      MPI_Error_string(MPIError, ErrBuf, &ErrLen);
+      ompfileTrace("MPIRequestManagerTy::wait MPI_Testany error this=%p "
+                   "iter=%llu mpi_error=%d msg=%.*s\n",
+                   static_cast<void *>(this),
+                   static_cast<unsigned long long>(PollIterations), MPIError,
+                   ErrLen, ErrBuf);
+      traceRequestSample(Requests);
       co_return createError("Waiting of MPI requests failed with code %d",
                             MPIError);
+    }
+
+    if (RequestCompleted) {
+      if (CompletedIndex == MPI_UNDEFINED) {
+        // MPI reports no active requests. This can happen if a lower layer
+        // completed all handles and replaced them with MPI_REQUEST_NULL; treat
+        // the manager as drained rather than entering a spin loop.
+        CompletedRequests = Requests.size();
+      } else {
+        ++CompletedRequests;
+      }
+      continue;
+    }
 
     co_await std::suspend_always{};
   }
 
+  ompfileTrace("MPIRequestManagerTy::wait success this=%p poll_iters=%llu\n",
+               static_cast<void *>(this),
+               static_cast<unsigned long long>(PollIterations));
   Requests.clear();
 
   co_return llvm::Error::success();
@@ -355,6 +635,7 @@ EventTy submit(MPIRequestManagerTy RequestManager, void *TgtPtr, void *HstPtr,
 
 EventTy retrieve(MPIRequestManagerTy RequestManager, int64_t Size, void *HstPtr,
                  void *TgtPtr, __tgt_async_info *AsyncInfoPtr) {
+  RetrieveTimingTy Timing(false);
   bool DeviceOpStatus = true;
 
   RequestManager.send(&AsyncInfoPtr, sizeof(void *), MPI_BYTE);
@@ -370,12 +651,17 @@ EventTy retrieve(MPIRequestManagerTy RequestManager, int64_t Size, void *HstPtr,
   if (!DeviceOpStatus)
     co_return createError("Failed to retrieve %p TgtPtr.", TgtPtr);
 
+  Timing.mark(0);
   RequestManager.receiveInBatchs(HstPtr, Size);
 
   // Event completion notification
   RequestManager.receive(nullptr, 0, MPI_BYTE);
 
-  co_return (co_await RequestManager);
+  Timing.mark(1);
+  auto Error = co_await RequestManager;
+  if (!Error)
+    Timing.mark(2);
+  co_return Error;
 }
 
 EventTy localExchange(MPIRequestManagerTy RequestManager, void *SrcPtr,
@@ -729,9 +1015,9 @@ bool EventSystemTy::deinitialize() {
     return false;
   }
 
-  // Only send exit events from the host side
+  // Only send exit events from the origin side.
   if (isHost() && WorldSize > 1) {
-    const int NumWorkers = WorldSize - 1;
+    const int NumWorkers = numWorkerRanks();
     llvm::SmallVector<EventTy> ExitEvents(NumWorkers);
     for (int WorkerRank = 0; WorkerRank < NumWorkers; WorkerRank++) {
       ExitEvents[WorkerRank] =
@@ -768,7 +1054,8 @@ EventTy EventSystemTy::createExchangeEvent(int SrcDevice, const void *SrcBuffer,
                                            int64_t Size,
                                            __tgt_async_info *AsyncInfo) {
   const int EventTag = createNewEventTag();
-  auto &EventComm = getNewEventComm(EventTag);
+  auto &EventComm = getNewEventComm(EventTag, LocalRank);
+  const int MPITag = getEventMPITag(EventTag, LocalRank);
 
   int32_t SrcRank, SrcDeviceId, DstRank, DstDeviceId;
 
@@ -784,20 +1071,22 @@ EventTy EventSystemTy::createExchangeEvent(int SrcDevice, const void *SrcBuffer,
   MPI_Request SrcRequest = MPI_REQUEST_NULL;
   MPI_Request DstRequest = MPI_REQUEST_NULL;
 
-  int MPIError = MPI_Isend(SrcEventNotificationInfo, 3, MPI_INT, SrcRank,
-                           static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                           GateThreadComm, &SrcRequest);
-
-  MPIError &= MPI_Isend(DstEventNotificationInfo, 3, MPI_INT, DstRank,
-                        static_cast<int>(ControlTagsTy::EVENT_REQUEST),
-                        GateThreadComm, &DstRequest);
+  int MPIError = ompfileWithMPICallLock([&]() {
+    int Rc = MPI_Isend(SrcEventNotificationInfo, 3, MPI_INT, SrcRank,
+                       static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                       GateThreadComm, &SrcRequest);
+    Rc &= MPI_Isend(DstEventNotificationInfo, 3, MPI_INT, DstRank,
+                    static_cast<int>(ControlTagsTy::EVENT_REQUEST),
+                    GateThreadComm, &DstRequest);
+    return Rc;
+  });
 
   if (MPIError != MPI_SUCCESS)
     co_return createError(
         "MPI failed during exchange event notification with error %d",
         MPIError);
 
-  MPIRequestManagerTy RequestManager(EventComm, EventTag, SrcRank, SrcDeviceId,
+  MPIRequestManagerTy RequestManager(EventComm, MPITag, SrcRank, SrcDeviceId,
                                      {SrcRequest, DstRequest});
 
   co_return (co_await OriginEvents::exchange(std::move(RequestManager), SrcRank,
@@ -809,18 +1098,59 @@ EventTy EventSystemTy::createExchangeEvent(int SrcDevice, const void *SrcBuffer,
 /// Tag values smaller than 'FIRST_EVENT' are reserved for control
 /// messages between the event systems of different MPI processes.
 int EventSystemTy::createNewEventTag() {
-  int tag = 0;
-
-  do {
-    tag = EventCounter.fetch_add(1) % MPITagMaxValue;
-  } while (tag < static_cast<int>(ControlTagsTy::FIRST_EVENT));
-
-  return tag;
+  return EventCounter.fetch_add(1);
 }
 
-MPI_Comm &EventSystemTy::getNewEventComm(int MPITag) {
-  // Retrieve a comm using a round-robin strategy around the event's mpi tag.
-  return EventCommPool[MPITag % EventCommPool.size()];
+// Disambiguate events created by different processes: every process draws
+// event ids from its own local counter, so the raw id sequences coincide.
+// Interleaving the origin rank spreads each origin onto a disjoint logical id
+// sequence, which keeps concurrent i->j and j->i events on different MPI tags.
+static uint64_t logicalEventId(int EventId, int OriginRank, int WorldSize) {
+  const uint64_t Span =
+      WorldSize > 0 ? static_cast<uint64_t>(WorldSize) : uint64_t{1};
+  const uint64_t Origin =
+      OriginRank >= 0 ? static_cast<uint64_t>(OriginRank) % Span : uint64_t{0};
+  return static_cast<uint64_t>(static_cast<unsigned int>(EventId)) * Span +
+         Origin;
+}
+
+int EventSystemTy::getEventMPITag(int EventId, int OriginRank) const {
+  constexpr int EventTagStride = 8;
+  const int FirstEventTag = static_cast<int>(ControlTagsTy::FIRST_EVENT);
+  if (MPITagMaxValue < FirstEventTag + EventTagStride) {
+    REPORT("Invalid MPI tag upper bound (%d); using fallback tag %d.\n",
+           MPITagMaxValue, FirstEventTag);
+    return FirstEventTag;
+  }
+
+  const int TagSpan = MPITagMaxValue - FirstEventTag + 1;
+  const int BaseSpan = std::max(1, TagSpan - EventTagStride + 1);
+  const int Offset = static_cast<int>(
+      (logicalEventId(EventId, OriginRank, WorldSize) * EventTagStride) %
+      static_cast<uint64_t>(BaseSpan));
+  return FirstEventTag + Offset;
+}
+
+MPI_Comm &EventSystemTy::getNewEventComm(int EventId, int OriginRank) {
+  if (EventCommPool.empty()) {
+    REPORT("Event communicator pool is empty; falling back to GateThreadComm.\n");
+    assert(GateThreadComm != MPI_COMM_NULL &&
+           "GateThreadComm must be valid when EventCommPool is empty");
+    return GateThreadComm;
+  }
+
+  constexpr int EventTagStride = 8;
+  const int FirstEventTag = static_cast<int>(ControlTagsTy::FIRST_EVENT);
+  const int TagSpan = MPITagMaxValue >= FirstEventTag + EventTagStride
+                          ? MPITagMaxValue - FirstEventTag + 1
+                          : 1;
+  const int BaseSpan = std::max(1, TagSpan - EventTagStride + 1);
+  const uint64_t LogicalTagOffset =
+      logicalEventId(EventId, OriginRank, WorldSize) * EventTagStride;
+  const size_t CommIndex =
+      (LogicalTagOffset / static_cast<uint64_t>(BaseSpan)) %
+      EventCommPool.size();
+  return EventCommPool[CommIndex];
 }
 
 static const char *threadLevelToString(int ThreadLevel) {
@@ -848,8 +1178,10 @@ bool EventSystemTy::createLocalMPIContext() {
 
   if (IsMPIInitialized)
     MPI_Query_thread(&ThreadLevel);
-  else
+  else {
     MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &ThreadLevel);
+    OwnsMPIInitialization = true;
+  }
 
   CHECK(ThreadLevel == MPI_THREAD_MULTIPLE,
         "MPI plugin requires a MPI implementation with %s thread level. "
@@ -857,23 +1189,26 @@ bool EventSystemTy::createLocalMPIContext() {
         threadLevelToString(MPI_THREAD_MULTIPLE),
         threadLevelToString(ThreadLevel));
 
-  if (IsMPIInitialized && ThreadLevel == MPI_THREAD_MULTIPLE) {
-    MPI_Comm_rank(MPI_COMM_WORLD, &LocalRank);
-    MPI_Comm_size(MPI_COMM_WORLD, &WorldSize);
-    return true;
-  }
-
   // Create gate thread comm.
   MPIError = MPI_Comm_dup(MPI_COMM_WORLD, &GateThreadComm);
   CHECK(MPIError == MPI_SUCCESS,
         "Failed to create gate thread MPI comm with error %d\n", MPIError);
+  configureCommErrhandlerForDebug(GateThreadComm, "GateThreadComm");
 
   // Create event comm pool.
-  EventCommPool.resize(NumMPIComms.get(), MPI_COMM_NULL);
+  int64_t NumComms = NumMPIComms.get();
+  if (NumComms <= 0) {
+    REPORT("Invalid OMPTARGET_NUM_MPI_COMMS=%lld; forcing 1.\n",
+           static_cast<long long>(NumComms));
+    NumComms = 1;
+  }
+  EventCommPool.resize(NumComms, MPI_COMM_NULL);
+  assert(!EventCommPool.empty() && "Event communicator pool must be non-empty");
   for (auto &Comm : EventCommPool) {
-    MPI_Comm_dup(MPI_COMM_WORLD, &Comm);
+    MPIError = MPI_Comm_dup(MPI_COMM_WORLD, &Comm);
     CHECK(MPIError == MPI_SUCCESS,
           "Failed to create MPI comm pool with error %d\n", MPIError);
+    configureCommErrhandlerForDebug(Comm, "EventCommPool");
   }
 
   // Get local MPI process description.
@@ -920,23 +1255,26 @@ bool EventSystemTy::destroyLocalMPIContext() {
   EventCommPool.resize(0);
 
   // Finalize the global MPI session.
-  int IsFinalized = false;
-  MPIError = MPI_Finalized(&IsFinalized);
+  if (OwnsMPIInitialization) {
+    int IsFinalized = false;
+    MPIError = MPI_Finalized(&IsFinalized);
 
-  if (IsFinalized) {
-    DP("MPI was already finalized externally.\n");
-  } else {
-    MPIError = MPI_Finalize();
-    CHECK(MPIError == MPI_SUCCESS, "Failed to finalize MPI with error: %d\n",
-          MPIError);
+    if (IsFinalized) {
+      DP("MPI was already finalized externally.\n");
+    } else {
+      MPIError = MPI_Finalize();
+      CHECK(MPIError == MPI_SUCCESS, "Failed to finalize MPI with error: %d\n",
+            MPIError);
+    }
   }
+  OwnsMPIInitialization = false;
 
   return true;
 }
 
 int EventSystemTy::getNumWorkers() const {
   if (isHost())
-    return WorldSize - 1;
+    return numWorkerRanks();
   return 0;
 }
 

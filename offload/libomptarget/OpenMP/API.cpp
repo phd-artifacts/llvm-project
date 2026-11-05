@@ -80,6 +80,16 @@ EXTERN int omp_get_num_devices(void) {
   return NumDevices;
 }
 
+EXTERN int __tgt_get_num_devices(void) {
+  TIMESCOPE();
+  OMPT_IF_BUILT(ReturnAddressSetterRAII RA(__builtin_return_address(0)));
+  size_t NumDevices = PM->getNumDevices();
+
+  DP("Call to __tgt_get_num_devices returning %zd\n", NumDevices);
+
+  return NumDevices;
+}
+
 EXTERN int omp_get_device_num(void) {
   TIMESCOPE();
   OMPT_IF_BUILT(ReturnAddressSetterRAII RA(__builtin_return_address(0)));
