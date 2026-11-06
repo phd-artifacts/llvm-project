@@ -1049,11 +1049,19 @@ void __kmp_add_task_time(kmp_int32 gtid, kmp_taskdata_t *taskdata) {
   // Resolve the device before locking the TDG to avoid lock inversion.
   kmp_int32 device_id = __kmpc_get_task_device(taskdata->td_task_id);
   __kmp_acquire_bootstrap_lock(&tdg->graph_lock);
-  kmp_int32 recorded_time =
+  // File I/O is not compute: it is left out here and modelled from the
+  // footprint, whose cost depends on the file's owner rather than the device.
+  kmp_int32 recorded_time = __kmp_task_io_complete(
+      tdg, taskdata->td_tdg_task_id, device_id,
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::high_resolution_clock::now() -
           tdg->record_map[taskdata->td_tdg_task_id].start_time)
-          .count();
+          .count());
+  // A task pinned to the head node has no device, so no profile entry to fill.
+  if (device_id < 0) {
+    __kmp_release_bootstrap_lock(&tdg->graph_lock);
+    return;
+  }
   if (!tdg->record_map[taskdata->td_tdg_task_id]
            .task_time[device_id]
            .iteration_number) {

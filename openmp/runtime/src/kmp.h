@@ -2673,6 +2673,23 @@ typedef struct kmp_recorded_task_time {
   kmp_int32 iteration_number;
 } kmp_recorded_task_time_t;
 
+/// One range of a target task's file I/O. Mirrors TaskIoEntryTy in the MPI
+/// plugin (TaskIoFootprint.h), which hands an array of them to
+/// __kmpc_target_task_record_io.
+typedef struct kmp_task_io_entry {
+  kmp_uint64 path_key;
+  kmp_int64 offset; // -1 for cursor-based calls
+  kmp_uint64 extent;
+  kmp_uint64 bytes;
+  double seconds;
+  kmp_uint32 ops;
+  kmp_int32 owner_rank;
+  kmp_uint32 is_write;
+  kmp_uint32 widened; // the range also covers bytes the task did not touch
+} kmp_task_io_entry_t;
+
+struct kmp_task_io_footprint;
+
 /// Represents a TDG node
 typedef struct kmp_node_info {
   kmp_task_t *task; // Pointer to the actual task
@@ -2693,6 +2710,9 @@ typedef struct kmp_node_info {
   kmp_target_dep_t *deps; // Dependencies array
   std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
   kmp_recorded_task_time_t *task_time;
+  // File I/O of the last completed run, created on first use. Zero-initialized
+  // and moved bitwise with the record map, like the fields above.
+  struct kmp_task_io_footprint *io_footprint;
 } kmp_node_info_t;
 
 /// Represent a TDG's current status
@@ -4790,6 +4810,20 @@ void __kmpc_remove_root_target_task(kmp_int32 task_id);
 //          valid OpenMP thread or if it is not executing an explicit task, the
 //          function will return -1.
 kmp_int32 __kmpc_target_task_current_task_id();
+// Adds a kernel's file I/O to the recorded task the calling thread is running;
+// does nothing outside a task graph. Resolved by the MPI plugin with dlsym.
+// seconds is all the time the kernel spent inside libompfile.
+KMP_EXPORT void __kmpc_target_task_record_io(const kmp_task_io_entry_t *entries,
+                                             kmp_int32 num_entries,
+                                             double seconds,
+                                             kmp_uint32 dropped_ops);
+// Called with tdg->graph_lock held when a recorded task completes: publishes the
+// footprint of this run and returns recorded_us without the I/O time.
+kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
+                                 kmp_int32 device, kmp_int32 recorded_us);
+// Last run's footprint of a node, for dumps. False when it did no file I/O.
+bool __kmp_task_io_summary(const kmp_node_info_t *node, kmp_uint64 *bytes,
+                           kmp_int32 *ranges, double *seconds);
 void __kmpc_record_target_data_device(kmp_int32 device_id);
 
 bool __kmpc_is_graph_builder_tasking();

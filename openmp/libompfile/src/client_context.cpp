@@ -336,6 +336,13 @@ int OmpFileClientContext::writeFileAtHint(int file_handle, const void *data,
                                    hint ? &internal_hint : nullptr);
 }
 
+void OmpFileClientContext::taskIoTarget(int file_handle, uint64_t &path_key_out,
+                                        int &owner_rank_out) {
+  // MppBackend is the only backend (see the constructor).
+  static_cast<MppBackend &>(*io_backend)
+      .taskIoTarget(file_handle, path_key_out, owner_rank_out);
+}
+
 int OmpFileClientContext::submitWrite(int file_handle, long offset,
                                       bool has_offset, const void *data,
                                       size_t size,

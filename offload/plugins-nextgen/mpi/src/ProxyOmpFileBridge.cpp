@@ -14,8 +14,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "ProxyOmpFile.h"
+#include "TaskIoFootprint.h"
 
+#include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <mutex>
 
 namespace {
@@ -94,6 +97,26 @@ int ompfile_mpp_close(int Handle) {
   if (!PD)
     return OFFLOAD_FAIL;
   return PD->mppClose(Handle);
+}
+
+// Called on the thread that made the libompfile call. No collector means a
+// thread the target region spawned, which is not attributed to its task.
+int ompfile_mpp_task_io_note(uint64_t PathKey, int OwnerRank, int Kind,
+                             int64_t Offset, uint64_t Size, double Seconds) {
+  if (TaskIoCollectorTy *Collector = TaskIoCollectorTy::current()) {
+    Collector->note(PathKey, OwnerRank, Kind, Offset, Size, Seconds);
+    return 0;
+  }
+  // Reported once, when the proxy exits.
+  static struct UnattributedTy {
+    std::atomic<uint64_t> Ops{0};
+    ~UnattributedTy() {
+      std::fprintf(stderr, "[task-io] proxy unattributed_ops=%llu\n",
+                   static_cast<unsigned long long>(Ops.load()));
+    }
+  } Unattributed;
+  Unattributed.Ops.fetch_add(1, std::memory_order_relaxed);
+  return 0;
 }
 
 int ompfile_mpp_handle_owner_rank(int Handle, int *RankOut) {

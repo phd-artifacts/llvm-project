@@ -1,7 +1,9 @@
 #include "client_context.h"
 #include "debug_log.h"
 #include "file_interface.h"
+#include "mpp_shim.h"
 #include "ompfile_trace.h"
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
@@ -12,6 +14,32 @@
   ompfile::trace::Scope OmpFileApiTrace(ompfile::trace::Domain::LibOmpFile,   \
                                         Name, ompfile::trace::Color::Io,       \
                                         static_cast<uint64_t>(Size))
+
+// Runs one public call and, on a proxy, notes it for the footprint of the task
+// whose target region made it. The time is what the region spent blocked here,
+// so an async write counts its enqueue, not the write behind it. A failed call
+// keeps its time but touches no range.
+template <typename OpFn>
+static int with_task_io(ompfile::mpp::TaskIoKind kind, int file_handle,
+                        long offset, size_t size, OpFn &&op) {
+  if (!ompfile::mpp::taskIoNoteAvailable())
+    return op();
+  const auto start = std::chrono::steady_clock::now();
+  const int rc = op();
+  const double seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
+  if (kind == ompfile::mpp::TaskIoMeta || rc < 0) {
+    ompfile::mpp::taskIoNote(0, -1, ompfile::mpp::TaskIoMeta, 0, 0, seconds);
+    return rc;
+  }
+  uint64_t path_key = 0;
+  int owner_rank = -1;
+  OmpFileClientContext::getInstance().taskIoTarget(file_handle, path_key,
+                                                   owner_rank);
+  ompfile::mpp::taskIoNote(path_key, owner_rank, kind, offset, size, seconds);
+  return rc;
+}
 
 extern "C" {
 
@@ -34,23 +62,29 @@ int omp_file_open(const char *filename) {
   io_trace("omp_file_open api enter filename=%s\n",
            filename ? filename : "(null)");
   auto &ctx = OmpFileClientContext::getInstance();
-  const int rc = ctx.openFile(filename);
+  const int rc = with_task_io(ompfile::mpp::TaskIoMeta, -1, 0, 0, [&] {
+    return ctx.openFile(filename);
+  });
   io_trace("omp_file_open api exit rc=%d\n", rc);
   return rc;
 }
 
 int omp_file_write(int file_handle, const void *data, size_t size, int async) {
   auto &ctx = OmpFileClientContext::getInstance();
-  return ctx.submitWrite(file_handle, /*offset=*/0, /*has_offset=*/false, data,
-                         size, /*hint=*/nullptr, async != 0);
+  return with_task_io(ompfile::mpp::TaskIoWrite, file_handle, -1, size, [&] {
+    return ctx.submitWrite(file_handle, /*offset=*/0, /*has_offset=*/false,
+                           data, size, /*hint=*/nullptr, async != 0);
+  });
 }
 
 int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size,
                     int async) {
   OMPFILE_API_TRACE("omp_file_pwrite", size);
   auto &ctx = OmpFileClientContext::getInstance();
-  return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
-                         /*hint=*/nullptr, async != 0);
+  return with_task_io(ompfile::mpp::TaskIoWrite, file_handle, offset, size, [&] {
+    return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
+                           /*hint=*/nullptr, async != 0);
+  });
 }
 
 int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
@@ -58,8 +92,10 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
                          const omp_file_io_hint_v1 *hint) {
   OMPFILE_API_TRACE("omp_file_pwrite_hint", size);
   auto &ctx = OmpFileClientContext::getInstance();
-  return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
-                         hint, async != 0);
+  return with_task_io(ompfile::mpp::TaskIoWrite, file_handle, offset, size, [&] {
+    return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
+                           hint, async != 0);
+  });
 }
 
 int omp_file_pwrite_owned(int file_handle, long offset, void *data,
@@ -69,9 +105,12 @@ int omp_file_pwrite_owned(int file_handle, long offset, void *data,
            "size=%zu\n",
            file_handle, offset, size);
   auto &ctx = OmpFileClientContext::getInstance();
-  const int rc = ctx.submitWriteOwned(file_handle, offset, data, size,
-                                      release ? release : &::free,
-                                      /*hint=*/nullptr);
+  const int rc =
+      with_task_io(ompfile::mpp::TaskIoWrite, file_handle, offset, size, [&] {
+        return ctx.submitWriteOwned(file_handle, offset, data, size,
+                                    release ? release : &::free,
+                                    /*hint=*/nullptr);
+      });
   io_trace("omp_file_pwrite_owned api exit rc=%d\n", rc);
   return rc;
 }
@@ -84,8 +123,11 @@ int omp_file_pwrite_owned_hint(int file_handle, long offset, void *data,
            "size=%zu\n",
            file_handle, offset, size);
   auto &ctx = OmpFileClientContext::getInstance();
-  const int rc = ctx.submitWriteOwned(file_handle, offset, data, size,
-                                      release ? release : &::free, hint);
+  const int rc =
+      with_task_io(ompfile::mpp::TaskIoWrite, file_handle, offset, size, [&] {
+        return ctx.submitWriteOwned(file_handle, offset, data, size,
+                                    release ? release : &::free, hint);
+      });
   io_trace("omp_file_pwrite_owned_hint api exit rc=%d\n", rc);
   return rc;
 }
@@ -94,7 +136,9 @@ int omp_file_flush(int file_handle) {
   OMPFILE_API_TRACE("omp_file_flush", 0);
   io_trace("omp_file_flush api enter file_handle=%d\n", file_handle);
   auto &ctx = OmpFileClientContext::getInstance();
-  const int rc = ctx.flushFile(file_handle);
+  const int rc = with_task_io(ompfile::mpp::TaskIoMeta, file_handle, 0, 0, [&] {
+    return ctx.flushFile(file_handle);
+  });
   io_trace("omp_file_flush api exit rc=%d\n", rc);
   return rc;
 }
@@ -104,7 +148,9 @@ int omp_file_flush_epoch(int file_handle, uint64_t epoch) {
   io_trace("omp_file_flush_epoch api enter file_handle=%d epoch=%llu\n",
            file_handle, static_cast<unsigned long long>(epoch));
   auto &ctx = OmpFileClientContext::getInstance();
-  const int rc = ctx.flushFileEpoch(file_handle, epoch);
+  const int rc = with_task_io(ompfile::mpp::TaskIoMeta, file_handle, 0, 0, [&] {
+    return ctx.flushFileEpoch(file_handle, epoch);
+  });
   io_trace("omp_file_flush_epoch api exit rc=%d\n", rc);
   return rc;
 }
@@ -113,7 +159,9 @@ int omp_file_commit(int file_handle) {
   OMPFILE_API_TRACE("omp_file_commit", 0);
   io_trace("omp_file_commit api enter file_handle=%d\n", file_handle);
   auto &ctx = OmpFileClientContext::getInstance();
-  const int rc = ctx.commitFile(file_handle);
+  const int rc = with_task_io(ompfile::mpp::TaskIoMeta, file_handle, 0, 0, [&] {
+    return ctx.commitFile(file_handle);
+  });
   io_trace("omp_file_commit api exit rc=%d\n", rc);
   return rc;
 }
@@ -125,7 +173,10 @@ int omp_file_pread(int file_handle, long offset, void *data, size_t size,
   io_trace("omp_file_pread api enter file_handle=%d offset=%ld size=%zu\n",
            file_handle, offset, size);
   auto &ctx = OmpFileClientContext::getInstance();
-  const int rc = ctx.readFileAt(file_handle, data, size, offset);
+  const int rc =
+      with_task_io(ompfile::mpp::TaskIoRead, file_handle, offset, size, [&] {
+        return ctx.readFileAt(file_handle, data, size, offset);
+      });
   io_trace("omp_file_pread api exit rc=%d\n", rc);
   return rc;
 }
@@ -135,20 +186,26 @@ int omp_file_pread_hint(int file_handle, long offset, void *data, size_t size,
   OMPFILE_API_TRACE("omp_file_pread_hint", size);
   note_async_read_synchronous(async);
   auto &ctx = OmpFileClientContext::getInstance();
-  return ctx.readFileAtHint(file_handle, data, size, offset, hint);
+  return with_task_io(ompfile::mpp::TaskIoRead, file_handle, offset, size, [&] {
+    return ctx.readFileAtHint(file_handle, data, size, offset, hint);
+  });
 }
 
 int omp_file_read(int file_handle, void *data, size_t size, int async) {
   note_async_read_synchronous(async);
   auto &ctx = OmpFileClientContext::getInstance();
-  return ctx.readFile(file_handle, data, size);
+  return with_task_io(ompfile::mpp::TaskIoRead, file_handle, -1, size, [&] {
+    return ctx.readFile(file_handle, data, size);
+  });
 }
 
 int omp_file_close(int file_handle) {
   OMPFILE_API_TRACE("omp_file_close", 0);
   io_trace("omp_file_close api enter file_handle=%d\n", file_handle);
   auto &ctx = OmpFileClientContext::getInstance();
-  const int rc = ctx.closeFile(file_handle);
+  const int rc = with_task_io(ompfile::mpp::TaskIoMeta, file_handle, 0, 0, [&] {
+    return ctx.closeFile(file_handle);
+  });
   io_trace("omp_file_close api exit rc=%d\n", rc);
   return rc;
 }

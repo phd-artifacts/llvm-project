@@ -227,6 +227,22 @@ bool openOnRank(const char *path, int flags, int mode, int rank, int &handle) {
   return true;
 }
 
+// Resolved once and without init(): this runs on every I/O call, and the proxy
+// exports the symbol from its executable, so it is there from the start.
+static decltype(&ompfile_mpp_task_io_note) taskIoNoteFn() {
+  static const auto fn = reinterpret_cast<decltype(&ompfile_mpp_task_io_note)>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_task_io_note"));
+  return fn;
+}
+
+bool taskIoNoteAvailable() { return taskIoNoteFn() != nullptr; }
+
+void taskIoNote(uint64_t path_key, int owner_rank, int kind, int64_t offset,
+                uint64_t size, double seconds) {
+  if (const auto fn = taskIoNoteFn())
+    fn(path_key, owner_rank, kind, offset, size, seconds);
+}
+
 bool handleOwnerRank(int handle, int &rank_out) {
   rank_out = -1;
   if (!init())

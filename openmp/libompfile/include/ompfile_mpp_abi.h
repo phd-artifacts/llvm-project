@@ -18,10 +18,11 @@
 // Adding an entrypoint: one row here, then the definition in
 // src/OriginOmpFileBridge.cpp (origin side) and/or src/ProxyOmpFileBridge.cpp
 // (proxy side). A side that does not define a row yields a null pointer to
-// the shim there. Five rows are proxy-only: handle_owner_rank,
-// pread_no_stage_ex, dirty_owner_pread_ex, dirty_owner_pread_batch_ex and
-// dirty_owner_query_ex. The shim treats each as optional: preadNoStageEx
-// falls back to preadEx, the others fail with ENOSYS. The origin's
+// the shim there. Six rows are proxy-only: handle_owner_rank,
+// pread_no_stage_ex, dirty_owner_pread_ex, dirty_owner_pread_batch_ex,
+// dirty_owner_query_ex and task_io_note. The shim treats each as optional:
+// preadNoStageEx falls back to preadEx, task_io_note is skipped, the others
+// fail with ENOSYS. The origin's
 // offload/src/exports must list exactly the rows src/OriginOmpFileBridge.cpp
 // defines.
 
@@ -55,6 +56,9 @@ static_assert(std::is_trivially_copyable_v<OmpFileDirtyOwnerPreadBatchSegment>);
   X(open_on_rank, int,                                                        \
     (const char *Path, int Flags, int Mode, int Rank, int *Handle))           \
   X(handle_owner_rank, int, (int Handle, int *RankOut))                       \
+  X(task_io_note, int,                                                        \
+    (uint64_t PathKey, int OwnerRank, int Kind, int64_t Offset, uint64_t Size,\
+     double Seconds))                                                         \
   X(close, int, (int Handle))                                                 \
   X(pread_ex, int,                                                            \
     (int Handle, int64_t Offset, void *Buffer, uint64_t Size,                 \

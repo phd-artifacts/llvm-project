@@ -703,7 +703,9 @@ EventTy exchange(MPIRequestManagerTy RequestManager, int SrcRank,
 EventTy launchKernel(MPIRequestManagerTy RequestManager, void *TgtEntryPtr,
                      EventDataHandleTy TgtArgs, EventDataHandleTy TgtOffsets,
                      EventDataHandleTy KernelArgsHandle,
-                     __tgt_async_info *AsyncInfoPtr) {
+                     __tgt_async_info *AsyncInfoPtr,
+                     TaskIoHeaderTy *TaskIoHeader,
+                     std::vector<TaskIoEntryTy> *TaskIoEntries) {
   KernelArgsTy *KernelArgs =
       static_cast<KernelArgsTy *>(KernelArgsHandle.get());
 
@@ -736,7 +738,19 @@ EventTy launchKernel(MPIRequestManagerTy RequestManager, void *TgtEntryPtr,
 
   AsyncInfoPtr->KernelExecutionTime = KernelTime;*/
 
-  // Launch acknowledgement only.
+  // The region's I/O footprint, then the launch acknowledgement. The proxy runs
+  // the kernel before sending either.
+  RequestManager.receive(TaskIoHeader, sizeof(TaskIoHeaderTy), MPI_BYTE);
+
+  if (auto Err = co_await RequestManager; Err)
+    co_return Err;
+
+  if (TaskIoHeader->NumEntries > 0) {
+    TaskIoEntries->resize(TaskIoHeader->NumEntries);
+    RequestManager.receive(TaskIoEntries->data(),
+                           TaskIoHeader->NumEntries * sizeof(TaskIoEntryTy),
+                           MPI_BYTE);
+  }
   RequestManager.receive(nullptr, 0, MPI_BYTE);
 
   if (auto Err = co_await RequestManager; Err)

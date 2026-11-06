@@ -11,14 +11,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "kmp.h"
+#include "kmp_dmdas.h"
 
 #include <cassert>
 #include <cstdint>
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 #include <unordered_map>
+#include <vector>
 #include <list>
 #include <functional>
 
@@ -576,6 +581,111 @@ void __kmpc_record_target_data_device(kmp_int32 device_id) {
     return;
 
   task->td_target_info->recording_device_id = device_id;
+}
+
+struct kmp_task_io_footprint {
+  // Filled by the kernels of the run in progress.
+  std::vector<kmp_task_io_entry_t> pending;
+  double pending_seconds = 0.0;
+  kmp_uint32 pending_dropped = 0;
+  // The last completed run. A replay replaces it.
+  std::vector<kmp_task_io_entry_t> latest;
+  double latest_seconds = 0.0;
+};
+static_assert(sizeof(kmp_task_io_entry_t) == 56,
+              "mirrors TaskIoEntryTy in the MPI plugin");
+
+void __kmpc_target_task_record_io(const kmp_task_io_entry_t *entries,
+                                  kmp_int32 num_entries, double seconds,
+                                  kmp_uint32 dropped_ops) {
+#if OMPX_TASKGRAPH
+  // Under DMDAS no recorded task reaches __kmp_task_io_complete, which is what
+  // drains the pending list.
+  if (__kmp_use_dmdas_runtime())
+    return;
+  const kmp_info_t *thread = get_omp_thread();
+  if (thread == nullptr)
+    return;
+  // A blocking target inside a recorded task can run in an unrecorded child.
+  kmp_taskdata_t *task = thread->th.th_current_task;
+  while (task != nullptr && task->td_flags.tasktype == TASK_EXPLICIT &&
+         !(task->is_taskgraph && task->tdg != nullptr))
+    task = task->td_parent;
+  if (task == nullptr || task->td_flags.tasktype != TASK_EXPLICIT)
+    return;
+
+  kmp_tdg_info_t *tdg = task->tdg;
+  __kmp_acquire_bootstrap_lock(&tdg->graph_lock);
+  kmp_node_info_t &node = tdg->record_map[task->td_tdg_task_id];
+  if (node.io_footprint == nullptr)
+    node.io_footprint = new kmp_task_io_footprint();
+  node.io_footprint->pending.insert(node.io_footprint->pending.end(), entries,
+                                    entries + num_entries);
+  node.io_footprint->pending_seconds += seconds;
+  node.io_footprint->pending_dropped += dropped_ops;
+  __kmp_release_bootstrap_lock(&tdg->graph_lock);
+#endif
+}
+
+kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
+                                 kmp_int32 device, kmp_int32 recorded_us) {
+  static const bool log_enabled = [] {
+    const char *value = std::getenv("OMPCLUSTER_TASK_IO_LOG");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  kmp_task_io_footprint *footprint = tdg->record_map[node].io_footprint;
+  kmp_int32 io_us = 0;
+  kmp_uint32 dropped = 0;
+  if (footprint != nullptr) {
+    io_us = static_cast<kmp_int32>(footprint->pending_seconds * 1e6);
+    dropped = footprint->pending_dropped;
+    footprint->latest.swap(footprint->pending);
+    footprint->latest_seconds = footprint->pending_seconds;
+    footprint->pending.clear();
+    footprint->pending_seconds = 0.0;
+    footprint->pending_dropped = 0;
+  }
+  const kmp_int32 charged_us = std::max(recorded_us - io_us, 0);
+  if (log_enabled) {
+    const size_t entries = footprint != nullptr ? footprint->latest.size() : 0;
+    std::string lines;
+    char line[256];
+    snprintf(line, sizeof(line),
+             "[task-io] tdg=%d node=%d device=%d recorded_us=%d io_us=%d "
+             "charged_us=%d dropped=%u entries=%zu\n",
+             tdg->tdg_id, node, device, recorded_us, io_us, charged_us, dropped,
+             entries);
+    lines += line;
+    for (size_t i = 0; i < entries; ++i) {
+      const kmp_task_io_entry_t &e = footprint->latest[i];
+      snprintf(line, sizeof(line),
+               "[task-io]   node=%d key=%016llx rw=%c owner=%d offset=%lld "
+               "extent=%llu bytes=%llu ops=%u seconds=%.6f widened=%u\n",
+               node, static_cast<unsigned long long>(e.path_key),
+               e.is_write ? 'w' : 'r', e.owner_rank,
+               static_cast<long long>(e.offset),
+               static_cast<unsigned long long>(e.extent),
+               static_cast<unsigned long long>(e.bytes), e.ops, e.seconds,
+               e.widened);
+      lines += line;
+    }
+    fputs(lines.c_str(), stderr);
+    fflush(stderr);
+  }
+  return charged_us;
+}
+
+bool __kmp_task_io_summary(const kmp_node_info_t *node, kmp_uint64 *bytes,
+                           kmp_int32 *ranges, double *seconds) {
+  const kmp_task_io_footprint *footprint = node->io_footprint;
+  if (footprint == nullptr || footprint->latest_seconds <= 0.0)
+    return false;
+  *bytes = 0;
+  for (const kmp_task_io_entry_t &entry : footprint->latest)
+    *bytes += entry.bytes;
+  *ranges = static_cast<kmp_int32>(footprint->latest.size());
+  *seconds = footprint->latest_seconds;
+  return true;
 }
 
 kmp_int32 __kmpc_target_task_current_task_id() {

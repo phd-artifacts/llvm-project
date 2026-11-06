@@ -35,6 +35,7 @@
 #define MPICH_SKIP_MPICXX
 #include <mpi.h>
 
+#include "TaskIoFootprint.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include "ompfile_trace.h"
@@ -552,7 +553,9 @@ EventTy getDeviceType(MPIRequestManagerTy RequestManager,
 EventTy launchKernel(MPIRequestManagerTy RequestManager, void *TgtEntryPtr,
                      EventDataHandleTy TgtArgs, EventDataHandleTy TgtOffsets,
                      EventDataHandleTy KernelArgsHandle,
-                     __tgt_async_info *AsyncInfoPtr);
+                     __tgt_async_info *AsyncInfoPtr,
+                     TaskIoHeaderTy *TaskIoHeader,
+                     std::vector<TaskIoEntryTy> *TaskIoEntries);
 EventTy initAsyncInfo(MPIRequestManagerTy RequestManager,
                       __tgt_async_info **AsyncInfoPtr);
 EventTy initDeviceInfo(MPIRequestManagerTy RequestManager,

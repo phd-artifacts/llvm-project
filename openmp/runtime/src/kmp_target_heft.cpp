@@ -1201,6 +1201,14 @@ void HEFTScheduler::dumpTaskGraph() {
       dot << "<BR />" << tinfo;
     }
 
+    kmp_uint64 io_bytes = 0;
+    kmp_int32 io_ranges = 0;
+    double io_seconds = 0.0;
+    if (__kmp_task_io_summary(task, &io_bytes, &io_ranges, &io_seconds)) {
+      dot << "<BR />I/O: " << io_bytes << " B in " << io_ranges << " ranges, "
+          << io_seconds << " s";
+    }
+
     dot << "</FONT>>";
 
     if (isTargetDataTask(task))

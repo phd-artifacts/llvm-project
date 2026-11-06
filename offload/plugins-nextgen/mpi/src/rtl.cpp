@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <dlfcn.h>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -1333,9 +1334,14 @@ struct MPIPluginTy : public GenericPluginTy {
     std::memcpy(KernelArgsPtr, KernelArgs, sizeof(KernelArgsTy));
     EventDataHandleTy KernelArgsHandle(KernelArgsPtr, &memFreeHost);
 
+    // Filled by the event, which this function waits for below.
+    TaskIoHeaderTy TaskIoHeader;
+    std::vector<TaskIoEntryTy> TaskIoEntries;
+
     EventTy Event = EventSystem.createEvent(
         OriginEvents::launchKernel, EventTypeTy::LAUNCH_KERNEL, DeviceId,
-        TgtEntryPtr, ArgsHandle, OffsetsHandle, KernelArgsHandle, AsyncInfoPtr);
+        TgtEntryPtr, ArgsHandle, OffsetsHandle, KernelArgsHandle, AsyncInfoPtr,
+        &TaskIoHeader, &TaskIoEntries);
 
     if (Event.empty()) {
       REPORT("Failed to create launchKernel event on device %d\n", DeviceId);
@@ -1351,9 +1357,22 @@ struct MPIPluginTy : public GenericPluginTy {
       return OFFLOAD_FAIL;
     }
 
-    // Queue->push_back(Event);
+    if (TaskIoHeader.Seconds > 0.0 || TaskIoHeader.DroppedOps > 0)
+      recordTaskIoFootprint(TaskIoHeader, TaskIoEntries);
 
     return OFFLOAD_SUCCESS;
+  }
+
+  /// Hands a kernel's footprint to libomp, on the thread running its task. A
+  /// libomp without the entry point just does not keep footprints.
+  static void recordTaskIoFootprint(const TaskIoHeaderTy &Header,
+                                    const std::vector<TaskIoEntryTy> &Entries) {
+    using RecordFnTy = void (*)(const void *, int32_t, double, uint32_t);
+    static const RecordFnTy RecordFn = reinterpret_cast<RecordFnTy>(
+        dlsym(RTLD_DEFAULT, "__kmpc_target_task_record_io"));
+    if (RecordFn)
+      RecordFn(Entries.data(), static_cast<int32_t>(Entries.size()),
+               Header.Seconds, Header.DroppedOps);
   }
 
   int32_t synchronize(int32_t DeviceId,

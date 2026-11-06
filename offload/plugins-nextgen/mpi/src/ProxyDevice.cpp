@@ -612,6 +612,8 @@ struct ProxyDevice {
     auto *AsyncHandle = MapAsyncInfo(HostAsyncInfoPtr, PluginId, DeviceId);
     auto *TgtAsyncInfo = AsyncHandle->AsyncInfoPtr.get();
 
+    TaskIoCollectorTy TaskIo;
+
     {
       std::lock_guard<std::mutex> Lock(AsyncHandle->AsyncInfoMutex);
 
@@ -625,10 +627,19 @@ struct ProxyDevice {
           AsyncHandle->KernelLaunchTimes.size());
       fflush(stdout);*/
 
+      TaskIoCollectorTy::ScopeTy TaskIoScope(TaskIo);
       PluginManager.Plugins[PluginId]->launch_kernel(
           DeviceId, TgtEntryPtr, TgtArgs.data(), TgtOffsets.data(), &KernelArgs,
           TgtAsyncInfo);
     }
+
+    // The region's file I/O, for the task graph on the origin.
+    const TaskIoHeaderTy TaskIoHeader = TaskIo.header();
+    RequestManager.send(&TaskIoHeader, sizeof(TaskIoHeaderTy), MPI_BYTE);
+    if (TaskIoHeader.NumEntries > 0)
+      RequestManager.send(TaskIo.entries(),
+                          TaskIoHeader.NumEntries * sizeof(TaskIoEntryTy),
+                          MPI_BYTE);
 
     // Event completion notification.
     RequestManager.send(nullptr, 0, MPI_BYTE);

@@ -240,6 +240,11 @@ kmp_int32 BaseScheduler::scheduleTask(kmp_int32 task_id) {
       assert(task_schedule.rank != -1);
       assert(task_schedule.state == TaskState::SCHEDULED);
 
+      // A classical task is pinned to the head node (rank 0), which is not a
+      // device, so a target region inside it has no decision either.
+      if (task_schedule.rank == 0)
+        return -1;
+
       scheduled_id = task_schedule.rank - 1;
       KG_TRACE(50, ("[SCHEDULER] scheduleTask : task_id: %d, using scheduler : "
                     "rank = %d\n",
@@ -272,6 +277,12 @@ void BaseScheduler::pinTask(kmp_int32 task_id, kmp_int32 DeviceId) {
   }
 }
 
+// HEFT also puts classical tasks in the schedule map, pinned to the head node;
+// remaining_target_tasks only counts the target tasks acquireNewGraph counted.
+static bool countsAsTargetTask(const TaskScheduleData &task_schedule) {
+  return task_schedule.task != nullptr && task_schedule.task->is_target_task;
+}
+
 void BaseScheduler::setTaskState(kmp_int32 task_id, TaskState new_state) {
   // A task may execute before the TDG has been acquired.
   if (tdg == nullptr)
@@ -300,7 +311,7 @@ void BaseScheduler::setTaskState(kmp_int32 task_id, TaskState new_state) {
 
   task_schedule.state = new_state;
   if ((*get_schedule_map(tdg->tdg_id)).count(task_id) == 1 &&
-      new_state == TaskState::EXECUTED) {
+      new_state == TaskState::EXECUTED && countsAsTargetTask(task_schedule)) {
     remaining_target_tasks--;
     KMP_DEBUG_ASSERT(remaining_target_tasks >= 0)
   }
@@ -518,7 +529,8 @@ void BaseScheduler::resetTasksState() {
   for (auto task : (*get_schedule_map(tdg->tdg_id))) {
     KG_TRACE(10, ("resetTasksState task %d\n", task.first));
     setTaskState(task.first, TaskState::SCHEDULED);
-    remaining_target_tasks++;
+    if (countsAsTargetTask(task.second))
+      remaining_target_tasks++;
   }
   KG_TRACE(10, ("resetTasksState end\n"));
 }

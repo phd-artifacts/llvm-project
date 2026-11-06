@@ -88,6 +88,10 @@ public:
 
   static OmpFileClientContext &getInstance();
 
+  // Path key and owner rank for a task's I/O footprint (0 / -1 when unknown).
+  void taskIoTarget(int file_handle, uint64_t &path_key_out,
+                    int &owner_rank_out);
+
   int openFile(const char *filename);
 
   int writeFile(int file_handle, const void *data, size_t size);

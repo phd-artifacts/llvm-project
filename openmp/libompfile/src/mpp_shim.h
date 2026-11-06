@@ -18,6 +18,12 @@ bool ping();
 bool open(const char *path, int flags, int mode, int &handle);
 bool openOnRank(const char *path, int flags, int mode, int rank, int &handle);
 bool handleOwnerRank(int handle, int &rank_out);
+// Per-task I/O footprint, proxy only (see TaskIoFootprint.h in the MPI plugin).
+// taskIoNoteAvailable() is false on the origin, so callers skip the bookkeeping.
+enum TaskIoKind : int { TaskIoRead = 0, TaskIoWrite = 1, TaskIoMeta = 2 };
+bool taskIoNoteAvailable();
+void taskIoNote(uint64_t path_key, int owner_rank, int kind, int64_t offset,
+                uint64_t size, double seconds);
 bool close(int handle);
 bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
              size_t &bytes_read);

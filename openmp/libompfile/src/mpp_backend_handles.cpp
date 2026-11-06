@@ -18,6 +18,19 @@ bool MppBackend::getFilePathKey(int file_id, uint64_t &path_key_out) {
   return true;
 }
 
+void MppBackend::taskIoTarget(int file_id, uint64_t &path_key_out,
+                              int &owner_rank_out) {
+  path_key_out = 0;
+  owner_rank_out = -1;
+  const auto lock = instrumentedHandleLock();
+  const auto key = handles.file_path_key_map.find(file_id);
+  if (key != handles.file_path_key_map.end())
+    path_key_out = key->second;
+  const auto owner = remote.remote_file_owner_rank_map.find(file_id);
+  if (owner != remote.remote_file_owner_rank_map.end())
+    owner_rank_out = owner->second;
+}
+
 int MppBackend::lookupRemoteHandle(int file_id) const {
   const auto lock = instrumentedHandleLock();
   auto it = remote.remote_file_handle_map.find(file_id);

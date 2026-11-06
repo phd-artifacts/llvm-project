@@ -392,6 +392,8 @@ public:
   MppBackend();
   explicit MppBackend(const ompfile::config::ClientConfig &config);
   ~MppBackend();
+  // Where a task's footprint says this file lives; 0 / -1 when unknown.
+  void taskIoTarget(int file_id, uint64_t &path_key_out, int &owner_rank_out);
 
 #if defined(OMPFILE_ENABLE_TEST_ACCESS)
   // Direct-linked regression seam. Production libompfile builds do not define
