@@ -2,7 +2,9 @@
 #include "debug_log.h"
 #include "file_interface.h"
 #include "mpp_shim.h"
+#include "ompfile_keys.h"
 #include "ompfile_trace.h"
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -55,6 +57,17 @@ static void note_async_read_synchronous(int async) {
     io_log("Async read requested; served synchronously (no async-read "
            "completion handle in the ABI).\n");
   });
+}
+
+int omp_file_declare_next_task_io(const char *path, long offset, size_t size,
+                                  int is_write) {
+  if (path == nullptr || path[0] == '\0' || offset < -1 ||
+      (offset >= 0 && size == 0)) {
+    errno = EINVAL;
+    return -1;
+  }
+  return ompfile::mpp::declareNextTaskIo(ompfile::keys::pathKey(path), offset,
+                                         offset < 0 ? 0 : size, is_write != 0);
 }
 
 int omp_file_open(const char *filename) {

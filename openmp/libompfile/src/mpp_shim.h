@@ -24,6 +24,10 @@ enum TaskIoKind : int { TaskIoRead = 0, TaskIoWrite = 1, TaskIoMeta = 2 };
 bool taskIoNoteAvailable();
 void taskIoNote(uint64_t path_key, int owner_rank, int kind, int64_t offset,
                 uint64_t size, double seconds);
+// Hands a declared range to libomp; see omp_file_declare_next_task_io. Returns 1
+// when libomp kept it, 0 when it did not (or has no such entry point).
+int declareNextTaskIo(uint64_t path_key, int64_t offset, uint64_t extent,
+                      int is_write);
 bool close(int handle);
 bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
              size_t &bytes_read);

@@ -37,6 +37,19 @@ typedef struct omp_file_io_hint_v1 {
 
 int omp_file_open(const char *filename);
 
+// Declares a range the next task created on this thread will read or write,
+// for a task graph that is recording; call it once per range, right before the
+// task construct. A plain promise for planning: it opens nothing and changes no
+// I/O, and a task may still touch other ranges.
+//
+// path is the string the task passes to omp_file_open: paths are compared as
+// strings. offset -1 means anywhere in the file (size is then ignored).
+// Returns 1 when kept, 0 when ignored (no graph is recording on this rank, so
+// it is safe to call unconditionally), and -1 with errno EINVAL on a null or
+// empty path, an offset below -1, or size 0 with an offset.
+int omp_file_declare_next_task_io(const char *path, long offset, size_t size,
+                                  int is_write);
+
 int omp_file_write(int file_handle, const void *data, size_t size, int async);
 
 int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size,

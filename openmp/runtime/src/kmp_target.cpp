@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <vector>
 #include <list>
+#include <map>
 #include <functional>
 
 #define assertm(exp, msg) assert(((void)msg, exp));
@@ -627,12 +628,170 @@ void __kmpc_target_task_record_io(const kmp_task_io_entry_t *entries,
 #endif
 }
 
-kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
-                                 kmp_int32 device, kmp_int32 recorded_us) {
-  static const bool log_enabled = [] {
+// What the application said tasks will touch, before they run. Kept apart from
+// the record map because a task is numbered at allocation, before the map grows
+// to hold it, and a task with an undeferred start never reaches the code that
+// fills it. Leaked: tasks can finish during shutdown.
+struct DeclaredTaskIo {
+  std::mutex lock;
+  // Declarations waiting for the next task the declaring task creates. The
+  // creator matters because the thread can run another task, whose children
+  // are not the task the application meant, before it creates one.
+  struct Pending {
+    kmp_int32 tdg_id = -1;
+    const kmp_taskdata_t *creator = nullptr;
+    std::vector<kmp_task_io_entry_t> entries;
+  };
+  std::map<kmp_int32, Pending> pending; // by gtid
+  // (graph, node) -> sorted, merged declarations.
+  std::map<std::pair<kmp_int32, kmp_int32>, std::vector<kmp_task_io_entry_t>>
+      nodes;
+};
+static DeclaredTaskIo &declaredTaskIo() {
+  static DeclaredTaskIo *const declared = new DeclaredTaskIo();
+  return *declared;
+}
+
+static bool taskIoLogEnabled() {
+  static const bool enabled = [] {
     const char *value = std::getenv("OMPCLUSTER_TASK_IO_LOG");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
   }();
+  return enabled;
+}
+
+kmp_int32 __kmpc_next_task_declare_io(kmp_uint64 path_key, kmp_int64 offset,
+                                      kmp_uint64 extent, kmp_int32 is_write) {
+#if OMPX_TASKGRAPH
+  if (__kmp_use_dmdas_runtime() || __kmp_global_tdgs == nullptr)
+    return 0;
+  const kmp_tdg_info_t *tdg = __kmp_global_tdgs[__kmp_curr_tdg_idx];
+  const kmp_int32 gtid = __kmp_get_gtid();
+  if (tdg == nullptr || !__kmp_tdg_is_recording(tdg->tdg_status) || gtid < 0)
+    return 0;
+  const kmp_taskdata_t *creator = __kmp_threads[gtid]->th.th_current_task;
+  kmp_task_io_entry_t entry = {};
+  entry.path_key = path_key;
+  entry.offset = offset;
+  entry.extent = extent;
+  entry.bytes = extent;
+  entry.owner_rank = -1;
+  entry.is_write = is_write != 0;
+  DeclaredTaskIo &declared = declaredTaskIo();
+  std::lock_guard<std::mutex> guard(declared.lock);
+  DeclaredTaskIo::Pending &pending = declared.pending[gtid];
+  // Anything else here was declared for a task that was never created.
+  if (pending.tdg_id != tdg->tdg_id || pending.creator != creator)
+    pending.entries.clear();
+  pending.tdg_id = tdg->tdg_id;
+  pending.creator = creator;
+  pending.entries.push_back(entry);
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+// Sorts by file and direction and merges touching ranges. Offset -1, the whole
+// file, sorts first and absorbs the rest of its file and direction.
+static void mergeDeclaredIo(std::vector<kmp_task_io_entry_t> &entries) {
+  std::sort(entries.begin(), entries.end(),
+            [](const kmp_task_io_entry_t &a, const kmp_task_io_entry_t &b) {
+              if (a.path_key != b.path_key)
+                return a.path_key < b.path_key;
+              if (a.is_write != b.is_write)
+                return a.is_write < b.is_write;
+              return a.offset < b.offset;
+            });
+  std::vector<kmp_task_io_entry_t> merged;
+  for (const kmp_task_io_entry_t &entry : entries) {
+    if (!merged.empty()) {
+      kmp_task_io_entry_t &last = merged.back();
+      if (last.path_key == entry.path_key && last.is_write == entry.is_write) {
+        if (last.offset < 0)
+          continue;
+        const kmp_uint64 last_end = last.offset + last.extent;
+        if (static_cast<kmp_uint64>(entry.offset) <= last_end) {
+          const kmp_uint64 end =
+              std::max(last_end, static_cast<kmp_uint64>(entry.offset) +
+                                     entry.extent);
+          last.extent = end - last.offset;
+          last.bytes = last.extent;
+          continue;
+        }
+      }
+    }
+    merged.push_back(entry);
+  }
+  entries.swap(merged);
+}
+
+void __kmp_task_io_bind_declared(kmp_int32 gtid, kmp_tdg_info_t *tdg,
+                                 kmp_int32 node, const kmp_taskdata_t *parent) {
+  DeclaredTaskIo &declared = declaredTaskIo();
+  std::lock_guard<std::mutex> guard(declared.lock);
+  auto it = declared.pending.find(gtid);
+  if (it == declared.pending.end() || it->second.creator != parent)
+    return;
+  if (it->second.tdg_id == tdg->tdg_id) {
+    std::vector<kmp_task_io_entry_t> &entries =
+        declared.nodes[{tdg->tdg_id, node}];
+    entries = std::move(it->second.entries);
+    mergeDeclaredIo(entries);
+    if (taskIoLogEnabled()) {
+      for (const kmp_task_io_entry_t &e : entries)
+        fprintf(stderr,
+                "[task-io] declared tdg=%d node=%d key=%016llx rw=%c "
+                "offset=%lld extent=%llu\n",
+                tdg->tdg_id, node, static_cast<unsigned long long>(e.path_key),
+                e.is_write ? 'w' : 'r', static_cast<long long>(e.offset),
+                static_cast<unsigned long long>(e.extent));
+      fflush(stderr);
+    }
+  }
+  declared.pending.erase(it);
+}
+
+// Compares a run with its declarations: observed ranges no declaration covers,
+// and declarations the run did not touch.
+static void compareDeclaredIo(const std::vector<kmp_task_io_entry_t> &declared,
+                              const std::vector<kmp_task_io_entry_t> &observed,
+                              kmp_uint32 *undeclared, kmp_uint32 *unused) {
+  const auto same_data = [](const kmp_task_io_entry_t &d,
+                            const kmp_task_io_entry_t &o) {
+    return d.path_key == o.path_key && d.is_write == o.is_write;
+  };
+  *undeclared = 0;
+  for (const kmp_task_io_entry_t &o : observed) {
+    const bool covered =
+        std::any_of(declared.begin(), declared.end(),
+                    [&](const kmp_task_io_entry_t &d) {
+                      if (!same_data(d, o))
+                        return false;
+                      return d.offset < 0 ||
+                             (o.offset >= d.offset &&
+                              o.offset + static_cast<kmp_int64>(o.extent) <=
+                                  d.offset + static_cast<kmp_int64>(d.extent));
+                    });
+    *undeclared += !covered;
+  }
+  *unused = 0;
+  for (const kmp_task_io_entry_t &d : declared) {
+    const bool touched =
+        std::any_of(observed.begin(), observed.end(),
+                    [&](const kmp_task_io_entry_t &o) {
+                      if (!same_data(d, o))
+                        return false;
+                      return d.offset < 0 || o.offset < 0 ||
+                             (o.offset < d.offset + static_cast<kmp_int64>(d.extent) &&
+                              d.offset < o.offset + static_cast<kmp_int64>(o.extent));
+                    });
+    *unused += !touched;
+  }
+}
+
+kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
+                                 kmp_int32 device, kmp_int32 recorded_us) {
   kmp_task_io_footprint *footprint = tdg->record_map[node].io_footprint;
   kmp_int32 io_us = 0;
   kmp_uint32 dropped = 0;
@@ -646,7 +805,7 @@ kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
     footprint->pending_dropped = 0;
   }
   const kmp_int32 charged_us = std::max(recorded_us - io_us, 0);
-  if (log_enabled) {
+  if (taskIoLogEnabled()) {
     const size_t entries = footprint != nullptr ? footprint->latest.size() : 0;
     std::string lines;
     char line[256];
@@ -668,6 +827,23 @@ kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
                static_cast<unsigned long long>(e.bytes), e.ops, e.seconds,
                e.widened);
       lines += line;
+    }
+    {
+      DeclaredTaskIo &declared = declaredTaskIo();
+      std::lock_guard<std::mutex> guard(declared.lock);
+      const auto it = declared.nodes.find({tdg->tdg_id, node});
+      if (it != declared.nodes.end()) {
+        kmp_uint32 undeclared = 0, unused = 0;
+        compareDeclaredIo(it->second,
+                          footprint != nullptr
+                              ? footprint->latest
+                              : std::vector<kmp_task_io_entry_t>(),
+                          &undeclared, &unused);
+        snprintf(line, sizeof(line),
+                 "[task-io]   node=%d declared=%zu undeclared=%u unused=%u\n",
+                 node, it->second.size(), undeclared, unused);
+        lines += line;
+      }
     }
     fputs(lines.c_str(), stderr);
     fflush(stderr);

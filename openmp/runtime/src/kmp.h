@@ -4824,6 +4824,18 @@ kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
 // Last run's footprint of a node, for dumps. False when it did no file I/O.
 bool __kmp_task_io_summary(const kmp_node_info_t *node, kmp_uint64 *bytes,
                            kmp_int32 *ranges, double *seconds);
+// Declares a file range the next task this thread creates will touch, while its
+// graph records. offset -1 means anywhere in the file. Returns 1 when kept, 0
+// when there is no recording graph to keep it for. Resolved by libompfile with
+// dlsym (omp_file_declare_next_task_io).
+KMP_EXPORT kmp_int32 __kmpc_next_task_declare_io(kmp_uint64 path_key,
+                                                 kmp_int64 offset,
+                                                 kmp_uint64 extent,
+                                                 kmp_int32 is_write);
+// Called when a task is allocated into a recording graph: if parent made the
+// thread's pending declarations, they become this node's.
+void __kmp_task_io_bind_declared(kmp_int32 gtid, kmp_tdg_info_t *tdg,
+                                 kmp_int32 node, const kmp_taskdata_t *parent);
 void __kmpc_record_target_data_device(kmp_int32 device_id);
 
 bool __kmpc_is_graph_builder_tasking();

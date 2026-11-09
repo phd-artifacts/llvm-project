@@ -1797,6 +1797,8 @@ kmp_task_t *__kmp_task_alloc(ident_t *loc_ref, kmp_int32 gtid,
     taskdata->td_tdg_task_id = KMP_ATOMIC_INC(&__kmp_tdg_task_id);
     KG_TRACE(10, ("alloc: taskdata: %p ; task tdg id: %d\n", taskdata,
                   taskdata->td_tdg_task_id));
+    __kmp_task_io_bind_declared(gtid, taskdata->tdg, taskdata->td_tdg_task_id,
+                                taskdata->td_parent);
     if (taskdata->tdg->initial_task_id == 0 ||
         taskdata->tdg->initial_task_id > taskdata->td_task_id)
       tdg->initial_task_id = taskdata->td_task_id;

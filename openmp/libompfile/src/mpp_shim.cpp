@@ -243,6 +243,14 @@ void taskIoNote(uint64_t path_key, int owner_rank, int kind, int64_t offset,
     fn(path_key, owner_rank, kind, offset, size, seconds);
 }
 
+int declareNextTaskIo(uint64_t path_key, int64_t offset, uint64_t extent,
+                      int is_write) {
+  using DeclareFn = int32_t (*)(uint64_t, int64_t, uint64_t, int32_t);
+  static const DeclareFn fn = reinterpret_cast<DeclareFn>(
+      dlsym(RTLD_DEFAULT, "__kmpc_next_task_declare_io"));
+  return fn ? fn(path_key, offset, extent, is_write) : 0;
+}
+
 bool handleOwnerRank(int handle, int &rank_out) {
   rank_out = -1;
   if (!init())
