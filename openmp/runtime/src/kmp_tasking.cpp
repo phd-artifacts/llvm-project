@@ -1702,6 +1702,13 @@ kmp_task_t *__kmp_task_alloc(ident_t *loc_ref, kmp_int32 gtid,
   task->part_id = 0; // AC: Always start with 0 part id
 
   taskdata->td_task_id = KMP_GEN_TASK_ID();
+#if OMPX_TASKGRAPH
+  // __kmp_task_finish clears this for a reused block, but a new block is heap
+  // memory that is not zeroed (often memory the application freed). Only
+  // __kmpc_omp_target_task_alloc sets it, and recording a graph reads a task
+  // as a target task whenever it is non-NULL.
+  taskdata->td_target_info = NULL;
+#endif
   taskdata->td_team = thread->th.th_team;
   taskdata->td_alloc_thread = thread;
   taskdata->td_parent = parent_task;
