@@ -194,6 +194,17 @@ void MppBackend::reportPhase0Stats() const {
           : static_cast<double>(coalesced_write_bytes) /
                 static_cast<double>(coalesced_writes);
 
+  if (shouldReportStats())
+    io_report("Graph plan stats: active=%d placed_writes=%llu "
+              "placed_ignored=%llu\n",
+              static_cast<int>(config_.graphPlanActive()),
+              static_cast<unsigned long long>(
+                  counters.graph_placed_write_count.load(
+                      std::memory_order_relaxed)),
+              static_cast<unsigned long long>(
+                  counters.graph_placed_ignored_count.load(
+                      std::memory_order_relaxed)));
+
   io_report("Two-phase stats: pread_requests=%llu remote_pread_events=%llu "
          "remote_pread_bytes_total=%llu remote_pread_avg_bytes=%.2f "
          "pwrite_requests=%llu remote_pwrite_events=%llu "

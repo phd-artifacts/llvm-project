@@ -149,6 +149,22 @@ struct ClientConfig {
   bool IoTokensSet = false;
   std::string IoTokensRaw;
   size_t AsyncQueueDepth = 2; // positiveLongPrefixOr(.., 2)
+  // LIBOMPFILE_GRAPH_PLAN: the origin sends a recorded graph's write ranges
+  // to the headnode and proxies write them on their own rank. Honoured only
+  // with graphPlanCoherent(): a write placed off its file's owner is found by
+  // readers only through the freshness oracle and dirty-owner reads, and a
+  // two-phase read asks neither.
+  BoolKnob GraphPlan;
+
+  bool graphPlanCoherent() const {
+    return Shared.stageReadthrough() && Shared.stageWriteBack() &&
+           Shared.StageFreshnessGuard && DirtyOwnerForwarding.Value &&
+           !TileFreshnessWriteThrough &&
+           TwoPhase.Policy == BatchPolicy::Disabled;
+  }
+  bool graphPlanActive() const {
+    return GraphPlan.Value && graphPlanCoherent();
+  }
 
   static ClientConfig fromEnvironment() {
     ClientConfig C;
@@ -213,6 +229,7 @@ struct ClientConfig {
     C.IoTokensSet = env::raw("LIBOMPFILE_IO_TOKENS", &C.IoTokensRaw);
     C.AsyncQueueDepth = static_cast<size_t>(
         env::positiveLongPrefixOr("LIBOMPFILE_ASYNC_QUEUE_DEPTH", 2));
+    C.GraphPlan = BoolKnob::read("LIBOMPFILE_GRAPH_PLAN", false);
     return C;
   }
 };

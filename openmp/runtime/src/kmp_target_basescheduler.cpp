@@ -168,6 +168,8 @@ void BaseScheduler::acquireAndScheduleGraph(kmp_tdg_info_t *tdg) {
   }
 
   if (!has_target_tasks) {
+    // Its classical tasks can still write files a plan places.
+    __kmp_task_io_plan_graph(tdg);
     isScheduleDone = 1;
     return;
   }
@@ -181,6 +183,8 @@ void BaseScheduler::acquireAndScheduleGraph(kmp_tdg_info_t *tdg) {
     KG_TRACE(10, ("acquireAndScheduleGraph: Main Scheduler selected\n"));
     scheduleGraph();
   }
+  // Placement is known: libompfile can plan the graph's file writes.
+  __kmp_task_io_plan_graph(tdg);
   isScheduleDone = 1;
   KG_TRACE(10, ("acquireAndScheduleGraph Exit\n"));
 }

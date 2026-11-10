@@ -135,6 +135,11 @@ private:
     std::atomic<uint64_t> pwrite_request_count{0};
     std::atomic<uint64_t> remote_pwrite_event_count{0};
     std::atomic<uint64_t> remote_pwrite_bytes_total{0};
+    // LIBOMPFILE_GRAPH_PLAN: PWRITEs whose plan placed them on this rank,
+    // written there; and placed plans this backend could not honour (no tile
+    // hint, or the coherent stage posture is off), written on the owner.
+    std::atomic<uint64_t> graph_placed_write_count{0};
+    std::atomic<uint64_t> graph_placed_ignored_count{0};
     std::atomic<uint64_t> short_read_count{0};
     std::atomic<uint64_t> short_read_bytes_total{0};
     std::atomic<uint64_t> short_write_count{0};

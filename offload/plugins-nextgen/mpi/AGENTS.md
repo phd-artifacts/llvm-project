@@ -73,7 +73,11 @@ ompfile code sits in files of its own beside each (Oct 2026 layout):
 - Bridge ABI shared with libompfile:
   `openmp/libompfile/include/ompfile_mpp_abi.h` (the entrypoint X-macro;
   both bridges define its prototypes); the scheduler wire structs are
-  libompfile's `ompfile_sched.h`, aliased in `EventSystemOmpFile.h`
+  libompfile's `ompfile_sched.h`, aliased in `EventSystemOmpFile.h` (a new flag
+  or struct there needs its `using` line too). A batch request flagged
+  `OMPFILE_BATCH_REQ_PLACE_WRITES` carries a task graph's write ranges, not reads:
+  `OmpFileHeadnodeManager` keeps them in `PlannedWrites` and marks a PWRITE plan
+  inside one `OMPFILE_BATCH_PLAN_PLACED_WRITE`
 - Shared configuration: `openmp/libompfile/include/ompfile_config.h`, parsed
   by the rules in `ompfile_env.h`. The proxy's snapshot is `ProxyConfig` (the
   `ProxyOmpFile` member `OmpFileConfig`); a knob libompfile reads too sits in

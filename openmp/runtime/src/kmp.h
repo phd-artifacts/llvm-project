@@ -4836,6 +4836,11 @@ KMP_EXPORT kmp_int32 __kmpc_next_task_declare_io(kmp_uint64 path_key,
 // thread's pending declarations, they become this node's.
 void __kmp_task_io_bind_declared(kmp_int32 gtid, kmp_tdg_info_t *tdg,
                                  kmp_int32 node, const kmp_taskdata_t *parent);
+// After the graph's scheduler places tdg: hands the file ranges its tasks
+// write, with the device each target task was placed on (-1 for a task on the
+// head node), to libompfile (ompfile_graph_plan_writes, resolved with dlsym;
+// nothing when libompfile is not loaded).
+void __kmp_task_io_plan_graph(kmp_tdg_info_t *tdg);
 void __kmpc_record_target_data_device(kmp_int32 device_id);
 
 bool __kmpc_is_graph_builder_tasking();

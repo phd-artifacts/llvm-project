@@ -14,6 +14,8 @@
 //   carrying that rank in OmpFileIORequest::AggregatorRank removes it); no
 //   pick weighs them.
 // - Aggregator selection policy.
+// - Planned write ranges (LIBOMPFILE_GRAPH_PLAN): a PWRITE inside one is
+//   placed on its writer's rank.
 //
 //===----------------------------------------------------------------------===//
 
@@ -22,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -154,6 +157,15 @@ private:
   void addOpenHandleUnlocked(int Rank);
   void releaseOpenHandleUnlocked(int Rank);
   void registerPathAffinityUnlocked(uint64_t PathKey, int Rank);
+  // Planned write ranges, merged per path key: [start, end) by start.
+  void addPlannedWriteUnlocked(uint64_t PathKey, int64_t Offset,
+                               uint64_t Size);
+  bool insidePlannedWriteUnlocked(uint64_t PathKey, int64_t Offset,
+                                  uint64_t Size) const;
+  void placeWritesUnlocked(const OmpFileIOBatchRequest &Request,
+                           const OmpFileIOBatchSegment *Segments,
+                           OmpFileIOBatchPlan &Plan,
+                           std::vector<OmpFileIOBatchPlanEntry> &Entries);
   bool commitTileFreshnessWriteUnlocked(uint64_t PathKey, int WriterRank,
                                         bool WriteThroughMode,
                                         uint64_t &CommittedVersionOut);
@@ -188,6 +200,8 @@ private:
   std::unordered_map<uint64_t, int> PathAffinityTable;
   std::unordered_map<uint64_t, std::vector<WriteVersionEntry>> PathWriteVersions;
   std::unordered_map<uint64_t, TileFreshnessEntry> TileFreshnessTable;
+  // Kept for the run: a later plan of the same graph adds the same ranges.
+  std::unordered_map<uint64_t, std::map<int64_t, int64_t>> PlannedWrites;
   std::vector<HandlerInfo> Handlers;
   BatchPlanStats Stats;
   uint64_t NextGlobalFileId = 1;

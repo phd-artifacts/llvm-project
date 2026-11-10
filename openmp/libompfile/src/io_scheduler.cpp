@@ -164,9 +164,17 @@ public:
       return -1;
     if (!ensureSchedulerReady("writeAtHint", /*log_once=*/true))
       return -1;
+    ompfile::OmpFileIOPlan plan{};
     if (!per_op_scheduling_skipped &&
-        !scheduleWrite(file_handle, offset, size, hint))
+        !scheduleWrite(file_handle, offset, size, hint, &plan))
       return failStrict("writeAtHint");
+    // A planned range (LIBOMPFILE_GRAPH_PLAN); the backend decides whether
+    // the write can honour it.
+    if ((plan.PlanFlags & ompfile::OMPFILE_BATCH_PLAN_PLACED_WRITE) != 0 &&
+        plan.AggregatorRank >= 0) {
+      context.ContextFlags |= ompfile::OMPFILE_WRITE_CTX_PLACED;
+      context.PlacedRank = plan.AggregatorRank;
+    }
     return backend.writeAtWithContext(context, data, size);
   }
 
@@ -439,7 +447,8 @@ private:
   }
 
   bool scheduleWrite(int file_handle, long offset, size_t size,
-                     const ompfile::OmpFileIOHint *hint) {
+                     const ompfile::OmpFileIOHint *hint,
+                     ompfile::OmpFileIOPlan *plan_out = nullptr) {
     ompfile::OmpFileIORequest req{};
     req.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
     req.Op = ompfile::OmpFileIOOp::PWRITE;
@@ -461,7 +470,7 @@ private:
       req.PathSize = static_cast<uint32_t>(tracked_path.size() + 1);
 
     return schedRequest(req, has_path ? tracked_path.c_str() : nullptr,
-                        nullptr);
+                        plan_out);
   }
 
   bool buildWriteContext(int file_handle, long offset, size_t size,

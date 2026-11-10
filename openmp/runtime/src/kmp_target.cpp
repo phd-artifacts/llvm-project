@@ -14,12 +14,16 @@
 #include "kmp_dmdas.h"
 
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#if KMP_OS_UNIX
+#include <dlfcn.h>
+#endif
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -849,6 +853,82 @@ kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
     fflush(stderr);
   }
   return charged_us;
+}
+
+// Mirrors ompfile_graph_write (libompfile's ompfile_graph_plan.h).
+struct kmp_task_io_plan_write_t {
+  kmp_uint64 path_key;
+  kmp_int64 offset;
+  kmp_uint64 extent;
+  kmp_int32 device;
+  kmp_uint32 reserved;
+};
+static_assert(sizeof(kmp_task_io_plan_write_t) == 32,
+              "mirrors ompfile_graph_write in libompfile");
+
+void __kmp_task_io_plan_graph(kmp_tdg_info_t *tdg) {
+#if OMPX_TASKGRAPH && KMP_OS_UNIX
+  using PlanFn = int (*)(const kmp_task_io_plan_write_t *, int);
+  static const PlanFn plan = reinterpret_cast<PlanFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_graph_plan_writes"));
+  if (plan == nullptr || tdg == nullptr)
+    return;
+  const ScheduleMap *schedule = get_schedule_map(tdg->tdg_id);
+  if (schedule == nullptr)
+    return;
+  std::vector<kmp_task_io_plan_write_t> writes;
+  size_t observed_nodes = 0, declared_nodes = 0;
+  __kmp_acquire_bootstrap_lock(&tdg->graph_lock);
+  {
+    DeclaredTaskIo &declared = declaredTaskIo();
+    std::lock_guard<std::mutex> guard(declared.lock);
+    const kmp_int32 num_tasks = KMP_ATOMIC_LD_RLX(&tdg->num_tasks);
+    for (kmp_int32 i = 0; i < num_tasks; ++i) {
+      const kmp_node_info_t &node = tdg->record_map[i];
+      if (node.task == nullptr)
+        continue;
+      // The device the scheduler chose, or -1 for a task on the head node (a
+      // classical task, whose blocking targets pick their own device). A
+      // placed write lands on the rank that issues it either way.
+      kmp_int32 device = -1;
+      if (node.is_target_task) {
+        const auto placed =
+            schedule->find(KMP_TASK_TO_TASKDATA(node.task)->td_task_id);
+        if (placed != schedule->end() && placed->second.rank >= 1)
+          device = placed->second.rank - 1;
+      }
+      // A replay plans from what the task did last time, the first run from
+      // what it declared.
+      const std::vector<kmp_task_io_entry_t> *ranges = nullptr;
+      if (node.io_footprint != nullptr && !node.io_footprint->latest.empty()) {
+        ranges = &node.io_footprint->latest;
+        ++observed_nodes;
+      } else {
+        const auto it = declared.nodes.find({tdg->tdg_id, i});
+        if (it == declared.nodes.end())
+          continue;
+        ranges = &it->second;
+        ++declared_nodes;
+      }
+      for (const kmp_task_io_entry_t &e : *ranges)
+        if (e.is_write && e.offset >= 0 && e.extent > 0)
+          writes.push_back({e.path_key, e.offset, e.extent, device, 0});
+    }
+  }
+  __kmp_release_bootstrap_lock(&tdg->graph_lock);
+  errno = 0;
+  const int sent =
+      writes.empty() ? 0 : plan(writes.data(), static_cast<int>(writes.size()));
+  const int plan_errno = sent < 0 ? errno : 0;
+  if (taskIoLogEnabled()) {
+    fprintf(stderr,
+            "[task-io] plan tdg=%d writes=%zu observed_nodes=%zu "
+            "declared_nodes=%zu sent=%d errno=%d\n",
+            tdg->tdg_id, writes.size(), observed_nodes, declared_nodes, sent,
+            plan_errno);
+    fflush(stderr);
+  }
+#endif
 }
 
 bool __kmp_task_io_summary(const kmp_node_info_t *node, kmp_uint64 *bytes,

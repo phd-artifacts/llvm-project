@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstdio>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -195,6 +196,7 @@ void OmpFileHeadnodeManager::resetForTesting() {
   PathAffinityTable.clear();
   PathWriteVersions.clear();
   TileFreshnessTable.clear();
+  PlannedWrites.clear();
   Handlers.clear();
   Stats = {};
   NextGlobalFileId = 1;
@@ -615,6 +617,70 @@ void OmpFileHeadnodeManager::registerPathAffinityUnlocked(uint64_t PathKey,
   PathAffinityTable[PathKey] = Rank;
 }
 
+void OmpFileHeadnodeManager::addPlannedWriteUnlocked(uint64_t PathKey,
+                                                     int64_t Offset,
+                                                     uint64_t Size) {
+  std::map<int64_t, int64_t> &Ranges = PlannedWrites[PathKey];
+  int64_t Start = Offset;
+  int64_t End = Offset + static_cast<int64_t>(Size);
+  // Absorb every range that touches [Start, End).
+  auto It = Ranges.upper_bound(Start);
+  if (It != Ranges.begin() && std::prev(It)->second >= Start)
+    --It;
+  while (It != Ranges.end() && It->first <= End) {
+    Start = std::min(Start, It->first);
+    End = std::max(End, It->second);
+    It = Ranges.erase(It);
+  }
+  Ranges.emplace(Start, End);
+}
+
+bool OmpFileHeadnodeManager::insidePlannedWriteUnlocked(uint64_t PathKey,
+                                                        int64_t Offset,
+                                                        uint64_t Size) const {
+  const auto File = PlannedWrites.find(PathKey);
+  if (File == PlannedWrites.end() || Offset < 0)
+    return false;
+  auto It = File->second.upper_bound(Offset);
+  if (It == File->second.begin())
+    return false;
+  --It;
+  return Offset + static_cast<int64_t>(Size) <= It->second;
+}
+
+void OmpFileHeadnodeManager::placeWritesUnlocked(
+    const OmpFileIOBatchRequest &Request, const OmpFileIOBatchSegment *Segments,
+    OmpFileIOBatchPlan &Plan, std::vector<OmpFileIOBatchPlanEntry> &Entries) {
+  uint32_t Rejected = 0;
+  for (uint32_t I = 0; I < Request.SegmentCount; ++I) {
+    const OmpFileIOBatchSegment &Segment = Segments[I];
+    OmpFileIOBatchPlanEntry &Entry = Entries[I];
+    Entry.SegmentId = Segment.SegmentId;
+    Entry.Offset = Segment.Offset;
+    Entry.Size = Segment.Size;
+    Entry.PlanFlags = OMPFILE_BATCH_PLAN_BATCH_API;
+    if (Segment.PathKey == 0 || Segment.Offset < 0 || Segment.Size == 0) {
+      Entry.Status = -1;
+      Entry.Errno = EINVAL;
+      ++Rejected;
+      continue;
+    }
+    addPlannedWriteUnlocked(Segment.PathKey, Segment.Offset, Segment.Size);
+  }
+  size_t Ranges = 0;
+  for (const auto &File : PlannedWrites)
+    Ranges += File.second.size();
+  fprintf(stderr,
+          "[ompfile-mpp][plan] place-writes batch=%llu segments=%u "
+          "rejected=%u files=%zu ranges=%zu\n",
+          static_cast<unsigned long long>(Request.BatchId),
+          Request.SegmentCount, Rejected, PlannedWrites.size(), Ranges);
+  if (Rejected != 0) {
+    Plan.Status = -1;
+    Plan.Errno = EINVAL;
+  }
+}
+
 int OmpFileHeadnodeManager::pickLeastLoadedRankUnlocked(int ClientRank) {
   ensureHandlersUnlocked();
 
@@ -815,6 +881,14 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
       }
     }
 
+    // A write inside a planned range stays on its writer: the rank the
+    // graph's scheduler chose for the writing task. The origin never is one.
+    if (HasPathKey && isWorkerRankUnlocked(Request.ClientRank) &&
+        insidePlannedWriteUnlocked(PathKey, Request.Offset, Request.Size)) {
+      HandlerRank = Request.ClientRank;
+      Plan.PlanFlags |= OMPFILE_BATCH_PLAN_PLACED_WRITE;
+    }
+
     if (HasPathKey) {
       recordWriteVersionUnlocked(PathKey, Request);
       fprintf(stderr,
@@ -913,6 +987,10 @@ bool OmpFileHeadnodeManager::planBatchRequest(
   Entries.resize(Request.SegmentCount);
   assert(Entries.size() == Request.SegmentCount &&
          "Batch entry vector must match segment count.");
+  if ((Request.RequestFlags & OMPFILE_BATCH_REQ_PLACE_WRITES) != 0) {
+    placeWritesUnlocked(Request, Segments, Plan, Entries);
+    return true;
+  }
   const bool FailOnAnyError =
       (Request.RequestFlags & OMPFILE_BATCH_REQ_FAIL_ON_ANY_ERROR) != 0;
 

@@ -120,6 +120,25 @@ int MppBackend::writeAtWithContext(
   io_log("Writing %zu bytes to file %d at offset %lld\n", size, file_id,
          static_cast<long long>(offset));
 
+  // A graph plan placed this range on the writer's rank. Readers find it
+  // only through its tile's freshness commit, so the write needs a tile hint
+  // and the coherent stage posture; otherwise it goes to the owner as usual.
+  if ((context.ContextFlags & ompfile::OMPFILE_WRITE_CTX_PLACED) != 0) {
+    if (config_.graphPlanActive() &&
+        (context.Hint.HintFlags & ompfile::OMPFILE_IO_HINT_HAS_TILE) != 0 &&
+        context.PlacedRank >= 0) {
+      counters.graph_placed_write_count.fetch_add(1,
+                                                  std::memory_order_relaxed);
+      ompfile::route::WriteDecision placed{};
+      placed.Route = ompfile::route::WriteRoute::PlacedRank;
+      placed.TargetRank = context.PlacedRank;
+      io_log("Writing %zu bytes to file %d at offset %lld on planned rank %d\n",
+             size, file_id, static_cast<long long>(offset), context.PlacedRank);
+      return executeWrite(context, placed, group_key, data, size);
+    }
+    counters.graph_placed_ignored_count.fetch_add(1, std::memory_order_relaxed);
+  }
+
   ompfile::route::WriteRouteConfig route_config{};
   route_config.WriteBatchActive = isWriteBatchActive();
   const ompfile::route::WriteDecision decision =
@@ -167,9 +186,9 @@ int MppBackend::executeWrite(
   }
 
   if (decision.Route == ompfile::route::WriteRoute::PlacedRank) {
-    // Only the test placement hook builds this route (ompfile_test_hooks.h);
-    // it fails closed, so a test that asked for rank N never silently lands
-    // on the owner instead.
+    // The test placement hook (ompfile_test_hooks.h) and a graph plan's
+    // placed write build this route; it fails closed, so a write placed on
+    // rank N never silently lands on the owner instead.
     size_t placed_bytes_written = 0;
     if (!writeAtRemoteRankWithBytes(file_id, decision.TargetRank, offset,
                                     data, size, placed_bytes_written)) {

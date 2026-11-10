@@ -101,6 +101,11 @@ struct OmpFileIOPlan {
 enum OmpFileBatchRequestFlags : uint32_t {
   OMPFILE_BATCH_REQ_FAIL_ON_ANY_ERROR = 1u << 0,
   OMPFILE_BATCH_REQ_DISABLE_SCALAR_FALLBACK = 1u << 1,
+  // The segments are no reads to plan but the file ranges a task graph's
+  // plan writes (LIBOMPFILE_GRAPH_PLAN): the headnode records them, and a
+  // PWRITE inside one is placed on its writer's rank. One entry per segment
+  // comes back, with AggregatorRank -1.
+  OMPFILE_BATCH_REQ_PLACE_WRITES = 1u << 2,
 };
 
 enum OmpFileBatchPlanFlags : uint32_t {
@@ -108,6 +113,10 @@ enum OmpFileBatchPlanFlags : uint32_t {
   OMPFILE_BATCH_PLAN_SCALAR_FALLBACK = 1u << 1,
   OMPFILE_BATCH_PLAN_FILE_AFFINITY = 1u << 2,
   OMPFILE_BATCH_PLAN_REBALANCED = 1u << 3,
+  // Scalar PWRITE plan: the range is inside a planned write range, so the
+  // write goes to AggregatorRank, the writer's own rank, instead of the
+  // handle's owner.
+  OMPFILE_BATCH_PLAN_PLACED_WRITE = 1u << 4,
 };
 
 struct OmpFileIOBatchSegment {
@@ -262,6 +271,8 @@ enum OmpFileReadContextFlags : uint32_t {
 
 enum OmpFileWriteContextFlags : uint32_t {
   OMPFILE_WRITE_CTX_HAS_PATH_KEY = 1u << 0,
+  // PlacedRank holds the rank of a placed PWRITE plan.
+  OMPFILE_WRITE_CTX_PLACED = 1u << 1,
 };
 
 struct OmpFileReadRequestContext {
@@ -285,7 +296,7 @@ struct OmpFileWriteRequestContext {
   uint64_t Size = 0;
   uint64_t PathKey = 0;
   uint32_t ContextFlags = 0;
-  uint32_t Reserved = 0;
+  int32_t PlacedRank = -1; // OMPFILE_WRITE_CTX_PLACED only
   OmpFileIOHint Hint{};
 };
 

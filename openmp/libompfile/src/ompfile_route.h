@@ -120,9 +120,9 @@ enum class WriteRoute : uint8_t {
   Batched,     // writeAtBatched
   OwnerHandle, // the opened owner handle
   // writeAtRemoteRankWithBytes on TargetRank, fail-closed (no owner
-  // fallback). resolveWriteRoute never returns it: only the test placement
-  // hook (ompfile_test_hooks.h) builds it, so multi-owner coherence keeps a
-  // way to put dirty data on a chosen proxy until Phase E plans placement.
+  // fallback). resolveWriteRoute never returns it: the test placement hook
+  // (ompfile_test_hooks.h) builds it, and so does a PWRITE inside a range a
+  // graph plan placed (LIBOMPFILE_GRAPH_PLAN, writeAtWithContext).
   PlacedRank,
 };
 

@@ -77,6 +77,12 @@ libompfile backend behavior and MPP shim usage.
 - MPP shim: `src/mpp_shim.cpp`, `src/mpp_shim.h`
 - Scheduler structs: `include/ompfile_sched.h` (the plugin aliases them; it
   is not installed, the plugin reaches it through its include path)
+- Task graph plan ABI: `include/ompfile_graph_plan.h`
+  (`ompfile_graph_plan_writes`, which libomp resolves with dlsym after the
+  scheduler places a graph; libomp mirrors its struct in `kmp_target.cpp`). It
+  runs on the origin and reaches the headnode through `sched_request_batch`
+  with `OMPFILE_BATCH_REQ_PLACE_WRITES`; see `LIBOMPFILE_GRAPH_PLAN` in
+  `docs/runtime-configuration.md`.
 - Bridge ABI: `include/ompfile_mpp_abi.h` (the `OMPFILE_MPP_ENTRYPOINTS`
   X-macro; a new `ompfile_mpp_*` call is one row here plus its definition in
   `offload/plugins-nextgen/mpi/src/OriginOmpFileBridge.cpp` (origin) and/or
@@ -169,8 +175,10 @@ libompfile backend behavior and MPP shim usage.
   them from the task graph.
 - Multi-owner coherence stays (freshness `COPY_FROM_RANK`, dirty-owner
   forwarding, `WritebackLocalDirty`, the per-(file, rank)
-  `remote_read_handle_cache`, `writeAtRemoteRankWithBytes`). Its only way to
-  get dirty data onto a chosen proxy is the test placement hook:
+  `remote_read_handle_cache`, `writeAtRemoteRankWithBytes`). Two things put
+  dirty data off a file's owner: a graph plan's placed PWRITE
+  (`OMPFILE_WRITE_CTX_PLACED`, honoured in `writeAtWithContext` only with a
+  tile hint and `ClientConfig::graphPlanActive()`), and the test placement hook:
   `include/ompfile_test_hooks.h` (`ompfile_test_pwrite_on_rank`, defined in
   `src/test_hooks.cpp`, a friend of `OmpFileClientContext` and `MppBackend`)
   drives the private `MppBackend::writeAtPlacedRank`, i.e. the

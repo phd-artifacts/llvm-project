@@ -3,12 +3,17 @@
 #include "file_interface.h"
 #include "mpp_shim.h"
 #include "ompfile_keys.h"
+#include "ompfile_config.h"
+#include "ompfile_graph_plan.h"
 #include "ompfile_trace.h"
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <vector>
 
 // One range per public call, on the calling thread (thread-local, so
 // push/pop). Payload = the request size where there is one.
@@ -68,6 +73,79 @@ int omp_file_declare_next_task_io(const char *path, long offset, size_t size,
   }
   return ompfile::mpp::declareNextTaskIo(ompfile::keys::pathKey(path), offset,
                                          offset < 0 ? 0 : size, is_write != 0);
+}
+
+int ompfile_graph_plan_writes(const ompfile_graph_write *writes, int count) {
+  if (count < 0 || (count > 0 && writes == nullptr)) {
+    errno = EINVAL;
+    return -1;
+  }
+  static const ompfile::config::ClientConfig config =
+      ompfile::config::ClientConfig::fromEnvironment();
+  if (!config.GraphPlan.Value || count == 0)
+    return 0;
+  if (!config.graphPlanCoherent()) {
+    static std::once_flag once;
+    std::call_once(once, [] {
+      io_report("graph plan ignored: LIBOMPFILE_GRAPH_PLAN=1 needs "
+                "LIBOMPFILE_STAGE_MODE=readthrough, write-back stage and tile "
+                "freshness, LIBOMPFILE_STAGE_FRESHNESS_GUARD=1, "
+                "LIBOMPFILE_OPT_DIRTY_OWNER_FORWARDING=1 and "
+                "LIBOMPFILE_OPT_TWO_PHASE=0\n");
+    });
+    return 0;
+  }
+
+  // One range per run of touching writes to a file.
+  std::vector<ompfile_graph_write> sorted(writes, writes + count);
+  std::sort(sorted.begin(), sorted.end(),
+            [](const ompfile_graph_write &a, const ompfile_graph_write &b) {
+              return a.path_key != b.path_key ? a.path_key < b.path_key
+                                              : a.offset < b.offset;
+            });
+  std::vector<ompfile::OmpFileIOBatchSegment> segments;
+  for (const ompfile_graph_write &w : sorted) {
+    if (w.path_key == 0 || w.offset < 0 || w.extent == 0)
+      continue;
+    const int64_t end = w.offset + static_cast<int64_t>(w.extent);
+    if (!segments.empty() && segments.back().PathKey == w.path_key &&
+        segments.back().Offset + static_cast<int64_t>(segments.back().Size) >=
+            w.offset) {
+      ompfile::OmpFileIOBatchSegment &last = segments.back();
+      last.Size = static_cast<uint64_t>(
+          std::max(end, last.Offset + static_cast<int64_t>(last.Size)) -
+          last.Offset);
+      continue;
+    }
+    ompfile::OmpFileIOBatchSegment segment{};
+    segment.SegmentId = segments.size();
+    segment.PathKey = w.path_key;
+    segment.Offset = w.offset;
+    segment.Size = w.extent;
+    segments.push_back(segment);
+  }
+  if (segments.empty())
+    return 0;
+  if (!ompfile::mpp::init()) {
+    errno = EHOSTDOWN;
+    return -1;
+  }
+
+  static std::atomic<uint64_t> batch_id{1};
+  ompfile::OmpFileIOBatchRequest request{};
+  request.AbiVersion = ompfile::OMPFILE_SCHED_BATCH_ABI_VERSION;
+  request.SegmentCount = static_cast<uint32_t>(segments.size());
+  request.RequestFlags = ompfile::OMPFILE_BATCH_REQ_PLACE_WRITES;
+  request.BatchId = batch_id.fetch_add(1, std::memory_order_relaxed);
+  ompfile::OmpFileIOBatchPlan plan{};
+  std::vector<ompfile::OmpFileIOBatchPlanEntry> entries;
+  if (!ompfile::mpp::schedBatchRequest(request, segments, plan, entries))
+    return -1;
+  if (plan.Status != 0) {
+    errno = plan.Errno != 0 ? plan.Errno : EIO;
+    return -1;
+  }
+  return static_cast<int>(segments.size());
 }
 
 int omp_file_open(const char *filename) {
