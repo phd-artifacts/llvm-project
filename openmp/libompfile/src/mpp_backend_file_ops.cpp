@@ -82,6 +82,58 @@ int MppBackend::openWithPlan(const char *filename,
   return file_id;
 }
 
+int MppBackend::rebindRemoteOwner(int file_id, const char *filename,
+                                  int new_rank) {
+  if (settings.strict_mpp_init_failed)
+    return failStrictMpp("rebind");
+  int new_handle = -1;
+  bool open_ok = false;
+  {
+    const auto lock = instrumentedMppCallLock();
+    open_ok = ompfile::mpp::openOnRank(filename, settings.open_flags, 0666,
+                                       new_rank, new_handle);
+  }
+  if (!open_ok) {
+    io_log("Writer bind: open of %s on rank %d failed errno=%d\n",
+           filename ? filename : "(null)", new_rank, errno);
+    if (errno == 0)
+      errno = EIO;
+    return -1;
+  }
+  int old_handle = -1;
+  {
+    const auto lock = instrumentedHandleLock();
+    auto it = remote.remote_file_handle_map.find(file_id);
+    if (it != remote.remote_file_handle_map.end()) {
+      old_handle = it->second;
+      it->second = new_handle;
+      remote.remote_file_owner_rank_map[file_id] = new_rank;
+      traceHandleStateLocked("rebind.writer", file_id, new_handle);
+    }
+  }
+  if (old_handle < 0) {
+    const auto lock = instrumentedMppCallLock();
+    (void)ompfile::mpp::close(new_handle);
+    errno = EBADF;
+    return -1;
+  }
+  bool close_ok = false;
+  {
+    const auto lock = instrumentedMppCallLock();
+    close_ok = ompfile::mpp::close(old_handle);
+  }
+  // The handle is bound to new_rank either way; a failed close only leaks the
+  // old remote handle.
+  if (!close_ok)
+    io_log("Writer bind: close of the old handle %d for file %d failed "
+           "errno=%d\n",
+           old_handle, file_id, errno);
+  counters.owner_writer_bind_count.fetch_add(1, std::memory_order_relaxed);
+  io_log("Writer bind: file %d (%s) now owned by rank %d\n", file_id,
+         filename ? filename : "(null)", new_rank);
+  return 0;
+}
+
 int MppBackend::write(int file_id, const void *data, size_t size) {
   if (settings.strict_mpp_init_failed)
     return failStrictMpp("write");

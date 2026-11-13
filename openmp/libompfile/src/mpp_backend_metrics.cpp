@@ -205,6 +205,12 @@ void MppBackend::reportPhase0Stats() const {
                   counters.graph_placed_ignored_count.load(
                       std::memory_order_relaxed)));
 
+  if (shouldReportStats())
+    io_report("Owner bind stats: writer_binds=%llu\n",
+              static_cast<unsigned long long>(
+                  counters.owner_writer_bind_count.load(
+                      std::memory_order_relaxed)));
+
   io_report("Two-phase stats: pread_requests=%llu remote_pread_events=%llu "
          "remote_pread_bytes_total=%llu remote_pread_avg_bytes=%.2f "
          "pwrite_requests=%llu remote_pwrite_events=%llu "

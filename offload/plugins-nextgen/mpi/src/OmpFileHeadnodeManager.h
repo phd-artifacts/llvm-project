@@ -59,6 +59,8 @@ public:
     int PreferredAggregatorRank = -1;
     uint64_t PathKey = 0;
     bool HasPathKey = false;
+    // The test placement hook chose this owner; a writer bind never moves it.
+    bool OwnerFixed = false;
   };
 
   struct WriteVersionEntry {
@@ -181,6 +183,8 @@ private:
                                  int ClientRank, bool &AffinityHit,
                                  bool &Rebalanced);
   int pickLeastLoadedRankUnlocked(int ClientRank);
+  void planWriterBindUnlocked(const OmpFileIORequest &Request,
+                              std::string_view PathView, OmpFileIOPlan &Plan);
   void ensureHandlersUnlocked();
   void maybeReportBatchStatsUnlocked();
 

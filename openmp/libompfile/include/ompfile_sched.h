@@ -62,6 +62,14 @@ enum OmpFileIORequestFlags : int32_t {
   OMPFILE_IO_REQUEST_PLACEMENT_ONLY = 1 << 0,
   // Test hook only: OPEN's AggregatorRank is an exact requested owner.
   OMPFILE_IO_REQUEST_TEST_OPEN_OWNER = 1 << 1,
+  // OPEN only: move the path's owner from AggregatorRank (its owner now) to
+  // ClientRank (the proxy about to write it), sent before a handle's first
+  // I/O. The headnode moves it only while the path has been opened exactly
+  // once and the owner was not fixed by the test hook; the plan names the
+  // owner either way, with OMPFILE_BATCH_PLAN_WRITER_BOUND when it moved. A
+  // moved owner counts a live handle on ClientRank; the client releases the
+  // old one with a release-only CLOSE.
+  OMPFILE_IO_REQUEST_BIND_WRITER = 1 << 2,
 };
 
 struct OmpFileIORequest {
@@ -117,6 +125,9 @@ enum OmpFileBatchPlanFlags : uint32_t {
   // write goes to AggregatorRank, the writer's own rank, instead of the
   // handle's owner.
   OMPFILE_BATCH_PLAN_PLACED_WRITE = 1u << 4,
+  // Scalar OPEN with OMPFILE_IO_REQUEST_BIND_WRITER: the owner moved to
+  // AggregatorRank.
+  OMPFILE_BATCH_PLAN_WRITER_BOUND = 1u << 5,
 };
 
 struct OmpFileIOBatchSegment {

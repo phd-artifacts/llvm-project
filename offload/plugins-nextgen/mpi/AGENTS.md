@@ -250,6 +250,17 @@ ompfile code sits in files of its own beside each (Oct 2026 layout):
   headnode places and counts it like any OPEN but adds no live handle. Any new
   OPEN-plan requester must do one or the other, or the live-handle counts only
   grow.
+- A new path's owner is the OPEN pick, then bound to its first writer: before
+  a handle's first I/O, libompfile on a proxy sends an OPEN with
+  `OMPFILE_IO_REQUEST_BIND_WRITER` (`AggregatorRank` = owner now, `ClientRank`
+  = the writer), handled by `planWriterBindUnlocked` before the tie-breaker
+  pick, so it never steps the tie-breaker. The owner moves only while the path
+  has been opened exactly once (`GlobalFileEntry::OpenRequests == 1`), was not
+  fixed by the test hook (`OwnerFixed`) and is the owner the client names; the
+  move adds a live handle on the writer, and the client gives the old one back
+  with a release-only CLOSE after reopening there (and moves it back if the
+  reopen fails). Origin clients never ask, so `sequential-open-spread` is
+  untouched.
 - `LIBOMPFILE_DEBUG_TRACE=1` on the headnode prints one
   `[ompfile-mpp][sched] open-handles op=open|close rank=<r> open_handles=<n>`
   line per live-handle change.

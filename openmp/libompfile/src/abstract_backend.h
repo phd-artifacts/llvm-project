@@ -2,6 +2,7 @@
 #define OMPFILE_ABSTRACT_BACKEND_H
 
 #include "ompfile_sched.h"
+#include <cerrno>
 #include <stddef.h>
 
 class IOBackend {
@@ -28,6 +29,17 @@ public:
   }
   virtual int writeAt(int file_id, long offset, const void *data,
                       size_t size) = 0;
+
+  // Move file_id's remote handle to a handle opened on new_rank and close the
+  // old one. Only for a handle that has done no I/O (the writer bind).
+  virtual int rebindRemoteOwner(int file_id, const char *filename,
+                                int new_rank) {
+    (void)file_id;
+    (void)filename;
+    (void)new_rank;
+    errno = ENOTSUP;
+    return -1;
+  }
 
   // Make this handle's already-written bytes visible to another reader and
   // durable on the source filesystem, without closing it. Distinct from the

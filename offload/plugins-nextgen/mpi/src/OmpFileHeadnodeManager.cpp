@@ -754,6 +754,49 @@ int OmpFileHeadnodeManager::pickRankForPathKeyUnlocked(uint64_t PathKey,
   return PreferredRank;
 }
 
+// A new file's owner is picked at OPEN without knowing who will write it. The
+// first write binds it to the writer: the client asks before its handle's first
+// I/O, and the owner moves when nothing can already depend on it - the path
+// has been opened exactly once (so this is the only handle, and it has done no
+// I/O), the test hook did not fix it, and the client names the owner its handle
+// is on. Otherwise the plan names the owner unchanged.
+void OmpFileHeadnodeManager::planWriterBindUnlocked(
+    const OmpFileIORequest &Request, std::string_view PathView,
+    OmpFileIOPlan &Plan) {
+  ensureHandlersUnlocked();
+  Plan.AggregatorRank = Request.AggregatorRank;
+  auto It = GlobalFileTable.find(std::string(PathView));
+  if (It == GlobalFileTable.end()) {
+    Plan.Status = -1;
+    Plan.Errno = ENOENT;
+    return;
+  }
+  GlobalFileEntry &Entry = It->second;
+  Plan.RemoteHandle = static_cast<int32_t>(Entry.GlobalFileId & 0x7fffffffU);
+  const int From = Entry.PreferredAggregatorRank;
+  const bool Moves = Entry.OpenRequests == 1 && !Entry.OwnerFixed &&
+                     From == Request.AggregatorRank &&
+                     isWorkerRankUnlocked(Request.ClientRank) &&
+                     Request.ClientRank != From;
+  if (Moves) {
+    Entry.PreferredAggregatorRank = Request.ClientRank;
+    registerPathAffinityUnlocked(Entry.PathKey, Request.ClientRank);
+    addOpenHandleUnlocked(Request.ClientRank);
+    Plan.AggregatorRank = Request.ClientRank;
+    Plan.PlanFlags |= OMPFILE_BATCH_PLAN_WRITER_BOUND;
+  } else {
+    Plan.AggregatorRank = From;
+  }
+  if (SchedTraceEnabled)
+    fprintf(stderr,
+            "[ompfile-mpp][sched] writer-bind path_key=%llu from=%d to=%d "
+            "moved=%d open_requests=%llu owner_fixed=%d\n",
+            static_cast<unsigned long long>(Entry.PathKey), From,
+            Request.ClientRank, static_cast<int>(Moves),
+            static_cast<unsigned long long>(Entry.OpenRequests),
+            static_cast<int>(Entry.OwnerFixed));
+}
+
 OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Request,
                                                   const char *Path,
                                                   int LocalRank) {
@@ -785,6 +828,20 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
     // handle back and plan nothing: no PlansIssued or PlannedTotal count, no
     // tie-breaker step. The reply is Status 0 with AggregatorRank -1.
     releaseOpenHandleUnlocked(Request.AggregatorRank);
+    return Plan;
+  }
+
+  // A writer bind is not an open: it plans no I/O, takes no pick and so
+  // leaves the tie-breaker sequence alone.
+  if (Request.Op == OmpFileIOOp::OPEN &&
+      (Request.Flags & ompfile::OMPFILE_IO_REQUEST_BIND_WRITER) != 0) {
+    if (Request.PathSize == 0 || !Path) {
+      Plan.Status = -1;
+      Plan.Errno = EINVAL;
+      return Plan;
+    }
+    planWriterBindUnlocked(
+        Request, std::string_view(Path, Request.PathSize - 1), Plan);
     return Plan;
   }
 
@@ -832,6 +889,7 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
     if (TestOwner) {
       HandlerRank = Request.AggregatorRank;
       Entry.PreferredAggregatorRank = HandlerRank;
+      Entry.OwnerFixed = true;
       registerPathAffinityUnlocked(PathKey, HandlerRank);
     } else if (Inserted) {
       HandlerRank = pickRankForPathKeyUnlocked(PathKey, /*HasPathKey=*/true,

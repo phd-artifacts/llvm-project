@@ -131,7 +131,7 @@ struct OmpFileDirtyOwnerPreadBatchReplySegment {
 };
 
 // The scheduler wire types are libompfile's (ompfile_sched.h). The plugin
-// used to carry its own copies of these thirteen, and they had already
+// used to carry its own copies of these, and they had already
 // drifted (OmpFileIOHint gained Role on the client side only). They are
 // aliased into the global namespace so every existing unqualified use in the
 // plugin keeps compiling against the one definition.
@@ -145,6 +145,7 @@ using ompfile::OMPFILE_IO_HINT_HAS_ROLE;
 using ompfile::OmpFileIOHint;
 using ompfile::OmpFileIORequestFlags;
 using ompfile::OMPFILE_IO_REQUEST_PLACEMENT_ONLY;
+using ompfile::OMPFILE_IO_REQUEST_BIND_WRITER;
 using ompfile::OmpFileIORequest;
 using ompfile::OmpFileIOPlan;
 using ompfile::OMPFILE_SCHED_BATCH_ABI_VERSION;
@@ -158,6 +159,7 @@ using ompfile::OMPFILE_BATCH_PLAN_SCALAR_FALLBACK;
 using ompfile::OMPFILE_BATCH_PLAN_FILE_AFFINITY;
 using ompfile::OMPFILE_BATCH_PLAN_REBALANCED;
 using ompfile::OMPFILE_BATCH_PLAN_PLACED_WRITE;
+using ompfile::OMPFILE_BATCH_PLAN_WRITER_BOUND;
 using ompfile::OmpFileIOBatchSegment;
 using ompfile::OmpFileIOBatchRequest;
 using ompfile::OmpFileIOBatchPlanEntry;

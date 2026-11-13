@@ -140,6 +140,8 @@ private:
     // hint, or the coherent stage posture is off), written on the owner.
     std::atomic<uint64_t> graph_placed_write_count{0};
     std::atomic<uint64_t> graph_placed_ignored_count{0};
+    // Handles whose owner moved to their first writer before any I/O.
+    std::atomic<uint64_t> owner_writer_bind_count{0};
     std::atomic<uint64_t> short_read_count{0};
     std::atomic<uint64_t> short_read_bytes_total{0};
     std::atomic<uint64_t> short_write_count{0};
@@ -593,6 +595,8 @@ public:
   int writeAtWithContext(const ompfile::OmpFileWriteRequestContext &context,
                          const void *data, size_t size) override;
   int writeAt(int file_id, long offset, const void *data, size_t size) override;
+  int rebindRemoteOwner(int file_id, const char *filename,
+                        int new_rank) override;
 
 private:
   int writeAtRemoteHandle(int remote_handle, long offset, const void *data,
