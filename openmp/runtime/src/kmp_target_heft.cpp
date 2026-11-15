@@ -30,6 +30,11 @@
 #include <string>
 #include <unordered_map>
 
+namespace {
+unsigned ioTaskKinds();
+constexpr kmp_int32 IoTaskPrefetchKind = 1; // IoTaskPrefetch below
+} // namespace
+
 namespace detail {
 
 // Implementation of HEFTContext
@@ -64,6 +69,8 @@ HEFTContext::HEFTContext(kmp_tdg_info *tdg)
     IoRemoteUsPerByteEnv = std::stod(EnvStr) / (1 << 20);
   if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_IO_REMOTE_MIN_RATIO"))
     IoRemoteMinRatio = std::stod(EnvStr);
+  if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_IO_PREFETCH_PRICING"))
+    IoPrefetchPricing = std::atoi(EnvStr) != 0;
 
   buildDeviceTypeMap();
 }
@@ -161,6 +168,7 @@ double HEFTContext::computeEFT(TaskPtr Task, DeviceId Device) {
 void HEFTContext::loadIoModel() {
   IoRanges.clear();
   IoOwner.clear();
+  IoPrefetched.clear();
   IoTasks = IoBytes = IoRemoteBytes = 0;
   IoCostUs = 0.0;
   if (!IoEnabled && !IoLog)
@@ -193,6 +201,45 @@ void HEFTContext::loadIoModel() {
   }
   IoLocalUsPerByte = Local;
   IoRemoteUsPerByte = Remote;
+
+  // With prefetch tasks, a remote read of a file one predecessor writes is
+  // read into the reader's proxy right after the writer (addIoTasks), so the
+  // reader pays the local rate wherever it runs and the file gives no reason
+  // to prefer a device. Mirrors addIoTasks' condition, by file rather than
+  // by range.
+  // The recording run inserts no I/O tasks (addIoTasks), so it keeps the
+  // remote price.
+  if (!IoEnabled || !IoPrefetchPricing ||
+      (ioTaskKinds() & (1u << IoTaskPrefetchKind)) == 0 ||
+      __kmp_tdg_is_recording(tdg->tdg_status))
+    return;
+  const kmp_int32 Normal = KMP_ATOMIC_LD_RLX(&tdg->num_normal_tasks);
+  auto writesKey = [&](kmp_int32 N, kmp_uint64 Key) {
+    if (N < 0 || static_cast<size_t>(N) >= IoRanges.size())
+      return false;
+    for (const kmp_task_io_entry_t &E : IoRanges[N])
+      if (E.is_write && E.path_key == Key)
+        return true;
+    return false;
+  };
+  for (kmp_int32 N = 0; N < Normal && static_cast<size_t>(N) < IoRanges.size();
+       ++N) {
+    const kmp_node_info &Node = tdg->record_map[N];
+    if (Node.task == nullptr)
+      continue;
+    for (const kmp_task_io_entry_t &E : IoRanges[N]) {
+      if (E.is_write || E.bytes == 0 || writesKey(N, E.path_key))
+        continue;
+      kmp_int32 Writers = 0;
+      for (kmp_int32 I = 0; I < Node.npredecessors; ++I) {
+        const kmp_int32 P = Node.predecessors[I];
+        const kmp_int32 W = P < Normal ? P : tdg->record_map[P].predecessors[0];
+        Writers += writesKey(W, E.path_key) ? 1 : 0;
+      }
+      if (Writers == 1)
+        IoPrefetched[N].insert(E.path_key);
+    }
+  }
 }
 
 namespace {
@@ -224,6 +271,7 @@ double HEFTContext::computeIoCost(TaskPtr Task, DeviceId Device,
     return 0.0;
   const auto &Ranges = IoRanges[Node];
   const kmp_int32 Dev = Device.Rank - 1;
+  const auto Prefetched = IoPrefetched.find(Node);
   double Cost = 0.0;
   for (const kmp_task_io_entry_t &E : Ranges) {
     if (E.bytes == 0)
@@ -237,8 +285,12 @@ double HEFTContext::computeIoCost(TaskPtr Task, DeviceId Device,
     // An unknown owner (a declared range of a file not yet open) is priced
     // as local: it gives no reason to prefer a device.
     const bool Remote = Owner >= 0 && Owner != Dev;
+    // A prefetched read is still counted as remote bytes, but costs the
+    // reader the local rate.
+    const bool Prefetch = Remote && Prefetched != IoPrefetched.end() &&
+                          Prefetched->second.count(E.path_key) != 0;
     Cost += static_cast<double>(E.bytes) *
-            (Remote ? IoRemoteUsPerByte : IoLocalUsPerByte);
+            (Remote && !Prefetch ? IoRemoteUsPerByte : IoLocalUsPerByte);
     if (Remote && RemoteBytes != nullptr)
       *RemoteBytes += E.bytes;
   }

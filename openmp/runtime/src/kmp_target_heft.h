@@ -19,6 +19,7 @@
 
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Forward declaration
@@ -334,12 +335,21 @@ private:
   /// Lowest remote/local ratio a measured remote rate may take
   /// (OMPCLUSTER_HEFT_IO_REMOTE_MIN_RATIO, 0 disables the floor). The rate
   /// measured on the requester misses the owner proxy's service time and the
-  /// interference with the owner's own tasks.
-  double IoRemoteMinRatio = 3.0;
+  /// interference with the owner's own tasks; at the measured 1.3x the term
+  /// traded locality for balance and lost on RTM and Cholesky, and 24 was the
+  /// lowest floor that gained on both on AMD.
+  double IoRemoteMinRatio = 24.0;
   /// File ranges of every node, indexed by the node's TDG task id.
   std::vector<std::vector<kmp_task_io_entry_t>> IoRanges;
   /// Owner predicted for each file (path key) by the tasks scheduled so far.
   std::unordered_map<kmp_uint64, kmp_int32> IoOwner;
+  /// Price reads a prefetch task will serve at the local rate
+  /// (OMPCLUSTER_HEFT_IO_PREFETCH_PRICING, on by default; it applies only
+  /// when OMPCLUSTER_HEFT_IO_TASKS includes prefetch).
+  bool IoPrefetchPricing = true;
+  /// Per node, the files it reads that exactly one predecessor writes and it
+  /// does not write itself: the reads addIoTasks prefetches when remote.
+  std::unordered_map<kmp_int32, std::unordered_set<kmp_uint64>> IoPrefetched;
   /// Totals of the chosen placement, for the summary line.
   kmp_uint64 IoTasks = 0;
   kmp_uint64 IoBytes = 0;
