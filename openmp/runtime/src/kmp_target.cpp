@@ -794,6 +794,78 @@ static void compareDeclaredIo(const std::vector<kmp_task_io_entry_t> &declared,
   }
 }
 
+// Running sums behind __kmp_task_io_rates: time and bytes of every observed
+// range, split by whether the device that ran the task owned the file.
+namespace {
+struct TaskIoRates {
+  std::mutex lock;
+  double local_us = 0.0, remote_us = 0.0;
+  double local_bytes = 0.0, remote_bytes = 0.0;
+};
+TaskIoRates &taskIoRates() {
+  static TaskIoRates *const rates = new TaskIoRates();
+  return *rates;
+}
+} // namespace
+
+static void noteTaskIoRates(const std::vector<kmp_task_io_entry_t> &entries,
+                            kmp_int32 device) {
+  if (device < 0)
+    return;
+  TaskIoRates &rates = taskIoRates();
+  std::lock_guard<std::mutex> guard(rates.lock);
+  for (const kmp_task_io_entry_t &e : entries) {
+    if (e.bytes == 0 || e.owner_rank < 0)
+      continue;
+    if (e.owner_rank == device) {
+      rates.local_us += e.seconds * 1e6;
+      rates.local_bytes += static_cast<double>(e.bytes);
+    } else {
+      rates.remote_us += e.seconds * 1e6;
+      rates.remote_bytes += static_cast<double>(e.bytes);
+    }
+  }
+}
+
+void __kmp_task_io_rates(double *local_us_per_byte,
+                         double *remote_us_per_byte) {
+  // One MiB of samples before a rate is trusted.
+  constexpr double MinBytes = 1 << 20;
+  TaskIoRates &rates = taskIoRates();
+  std::lock_guard<std::mutex> guard(rates.lock);
+  *local_us_per_byte = rates.local_bytes >= MinBytes
+                           ? rates.local_us / rates.local_bytes
+                           : -1.0;
+  *remote_us_per_byte = rates.remote_bytes >= MinBytes
+                            ? rates.remote_us / rates.remote_bytes
+                            : -1.0;
+}
+
+void __kmp_task_io_graph_ranges(
+    kmp_tdg_info_t *tdg, std::vector<std::vector<kmp_task_io_entry_t>> *out) {
+  out->clear();
+  if (tdg == nullptr)
+    return;
+  __kmp_acquire_bootstrap_lock(&tdg->graph_lock);
+  {
+    DeclaredTaskIo &declared = declaredTaskIo();
+    std::lock_guard<std::mutex> guard(declared.lock);
+    const kmp_int32 num_tasks = KMP_ATOMIC_LD_RLX(&tdg->num_tasks);
+    out->resize(num_tasks > 0 ? num_tasks : 0);
+    for (kmp_int32 i = 0; i < num_tasks; ++i) {
+      const kmp_node_info_t &node = tdg->record_map[i];
+      if (node.io_footprint != nullptr && !node.io_footprint->latest.empty()) {
+        (*out)[i] = node.io_footprint->latest;
+        continue;
+      }
+      const auto it = declared.nodes.find({tdg->tdg_id, i});
+      if (it != declared.nodes.end())
+        (*out)[i] = it->second;
+    }
+  }
+  __kmp_release_bootstrap_lock(&tdg->graph_lock);
+}
+
 kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
                                  kmp_int32 device, kmp_int32 recorded_us) {
   kmp_task_io_footprint *footprint = tdg->record_map[node].io_footprint;
@@ -804,6 +876,7 @@ kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
     dropped = footprint->pending_dropped;
     footprint->latest.swap(footprint->pending);
     footprint->latest_seconds = footprint->pending_seconds;
+    noteTaskIoRates(footprint->latest, device);
     footprint->pending.clear();
     footprint->pending_seconds = 0.0;
     footprint->pending_dropped = 0;
@@ -815,9 +888,16 @@ kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
     char line[256];
     snprintf(line, sizeof(line),
              "[task-io] tdg=%d node=%d device=%d recorded_us=%d io_us=%d "
-             "charged_us=%d dropped=%u entries=%zu\n",
+             "charged_us=%d dropped=%u entries=%zu end_us=%lld\n",
              tdg->tdg_id, node, device, recorded_us, io_us, charged_us, dropped,
-             entries);
+             entries,
+             // Completion time on the recording clock, so start = end -
+             // recorded shows whether tasks overlapped.
+             static_cast<long long>(
+                 std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::high_resolution_clock::now()
+                         .time_since_epoch())
+                     .count()));
     lines += line;
     for (size_t i = 0; i < entries; ++i) {
       const kmp_task_io_entry_t &e = footprint->latest[i];

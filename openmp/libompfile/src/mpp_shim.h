@@ -28,6 +28,10 @@ void taskIoNote(uint64_t path_key, int owner_rank, int kind, int64_t offset,
 // when libomp kept it, 0 when it did not (or has no such entry point).
 int declareNextTaskIo(uint64_t path_key, int64_t offset, uint64_t extent,
                       int is_write);
+// Asks `device`'s proxy to run one scheduler I/O task (OMPFILE_IO_TASK_*);
+// see io_tasks.cpp. False when the event could not be sent.
+bool ioTask(int device, int kind, const char *path, int64_t offset,
+            uint64_t extent, int &remote_rc, int &remote_errno);
 bool close(int handle);
 bool preadEx(int handle, int64_t offset, void *buffer, size_t size,
              size_t &bytes_read);

@@ -131,6 +131,14 @@ ompfile code sits in files of its own beside each (Oct 2026 layout):
   `OMPFILE_PREAD_NO_STAGE`, `OMPFILE_PWRITE`, `OMPFILE_PING`
 - Scheduler events: `OMPFILE_SCHED_REQUEST`, `OMPFILE_SCHED_REQUEST_BATCH`
   (wire value 33, the former `OMPFILE_SCHED_PLAN`, is reserved)
+- Graph I/O task event: `OMPFILE_IO_TASK` (46), sent by libompfile for a
+  prefetch, stage or flush task HEFT inserted (`OMPCLUSTER_HEFT_IO_TASKS`); the
+  proxy runs the task on a detached thread (`ompfileIoTask`,
+  `ProxyOmpFileServer.cpp`) and the coroutine yields until it finishes. With
+  `LIBOMPFILE_IO_TASK_ASYNC_FLUSH=1` a flush returns before its `fdatasync`,
+  and `drainOmpFileOpenCache` waits for those threads. Origin entry point
+  `ompfile_mpp_io_task`, which must stay in `offload/libomptarget/exports`
+  for libompfile's `dlsym` to find it.
 - Coherence events (write-back staging): `OMPFILE_FRESHNESS_QUERY`,
   `OMPFILE_FRESHNESS_WRITE_COMMIT`, `OMPFILE_FLUSH_DIRTY_TILE`,
   `OMPFILE_DIRTY_OWNER_PREAD`, `OMPFILE_DIRTY_OWNER_PREAD_BATCH`,

@@ -4824,6 +4824,21 @@ kmp_int32 __kmp_task_io_complete(kmp_tdg_info_t *tdg, kmp_int32 node,
 // Last run's footprint of a node, for dumps. False when it did no file I/O.
 bool __kmp_task_io_summary(const kmp_node_info_t *node, kmp_uint64 *bytes,
                            kmp_int32 *ranges, double *seconds);
+#ifdef __cplusplus
+} // extern "C"
+#include <vector>
+// The file ranges every node of a graph will touch: the last run's footprint,
+// or what the node declared while recording when it has not run yet. Indexed
+// by node; empty for a node without file I/O. Takes tdg->graph_lock.
+void __kmp_task_io_graph_ranges(
+    kmp_tdg_info_t *tdg, std::vector<std::vector<kmp_task_io_entry_t>> *out);
+// Measured file I/O time per byte, split by whether the issuing device owned
+// the file, over every completed recorded task so far. A rate is -1 until
+// enough bytes back it.
+void __kmp_task_io_rates(double *local_us_per_byte,
+                         double *remote_us_per_byte);
+extern "C" {
+#endif
 // Declares a file range the next task this thread creates will touch, while its
 // graph records. offset -1 means anywhere in the file. Returns 1 when kept, 0
 // when there is no recording graph to keep it for. Resolved by libompfile with
@@ -4934,6 +4949,13 @@ kmp_task_t *__kmp_create_memory_task(kmp_int32 gtid, kmp_task_t *source,
                                      kmp_task_t *target, int source_device,
                                      int target_device, void *dep_addr,
                                      size_t size_addr, bool is_taskgraph);
+// A file I/O task (prefetch, stage, flush) on the source -> target edge of a
+// recorded graph; it runs ompfile_sched_io_task(kind, device, path_key,
+// offset, extent) on a hidden helper thread. kind uses OMPFILE_IO_TASK_*.
+kmp_task_t *__kmp_create_io_task(kmp_int32 gtid, kmp_task_t *source,
+                                 kmp_task_t *target, kmp_int32 kind,
+                                 kmp_int32 device, kmp_uint64 path_key,
+                                 kmp_int64 offset, kmp_uint64 extent);
 #endif
 
 // 1: it is initializing hidden helper team

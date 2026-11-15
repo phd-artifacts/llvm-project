@@ -24,6 +24,11 @@
 #include <array>
 #include <utility>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <string>
+#include <unordered_map>
 
 namespace detail {
 
@@ -48,6 +53,17 @@ HEFTContext::HEFTContext(kmp_tdg_info *tdg)
     NumThreads = std::stoi(EnvStr);
   if (char *EnvStr = std::getenv("OMPCLUSTER_INTERPOLATION_TYPE"))
     heterogeneousInterpolation = std::stoi(EnvStr);
+  if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_IO"))
+    IoEnabled = std::atoi(EnvStr) != 0;
+  if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_IO_LOG"))
+    IoLog = EnvStr[0] != '\0' && EnvStr[0] != '0';
+  // Rates are given per MiB in the environment, kept per byte here.
+  if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_IO_LOCAL_US_PER_MB"))
+    IoLocalUsPerByteEnv = std::stod(EnvStr) / (1 << 20);
+  if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_IO_REMOTE_US_PER_MB"))
+    IoRemoteUsPerByteEnv = std::stod(EnvStr) / (1 << 20);
+  if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_IO_REMOTE_MIN_RATIO"))
+    IoRemoteMinRatio = std::stod(EnvStr);
 
   buildDeviceTypeMap();
 }
@@ -76,8 +92,25 @@ void HEFTContext::computeUpwardRanks() {
           std::max(MaxSuccUrankComm,
                    UpwardRank[Succ] + computeAvgCommCost(*Task, *Succ));
     }
-    UpwardRank[Task] = computeAvgCompCost(*Task) + MaxSuccUrankComm;
+    // The recorded compute time leaves file I/O out; the rank puts it back
+    // at the local rate (the cost of the placement the term aims for), so a
+    // producer outranks its consumer by its own I/O as well and HEFT places
+    // producers before measurement noise lets a consumer jump ahead.
+    UpwardRank[Task] =
+        computeAvgCompCost(*Task) + localIoCost(Task) + MaxSuccUrankComm;
   }
+}
+
+double HEFTContext::localIoCost(TaskPtr Task) const {
+  if (!IoEnabled)
+    return 0.0;
+  const kmp_int32 Node = KMP_TASKPTR_TO_TDG_TASKID(Task);
+  if (Node < 0 || static_cast<size_t>(Node) >= IoRanges.size())
+    return 0.0;
+  double Bytes = 0.0;
+  for (const kmp_task_io_entry_t &E : IoRanges[Node])
+    Bytes += static_cast<double>(E.bytes);
+  return Bytes * IoLocalUsPerByte;
 }
 
 double HEFTContext::computeEST(TaskPtr Task, DeviceId Device) {
@@ -118,8 +151,142 @@ double HEFTContext::computeEFT(TaskPtr Task, DeviceId Device) {
   if (EST.count(Task) == 0 || EST[Task].count(Device) == 0)
     computeEST(Task, Device);
 
-  EFT[Task][Device] = computeCompCost(*Task, Device) + EST[Task][Device];
+  // The recorded compute time leaves file I/O out (__kmp_task_io_complete);
+  // its cost depends on where the files are owned, so it is added here.
+  EFT[Task][Device] = computeCompCost(*Task, Device) +
+                      computeIoCost(Task, Device) + EST[Task][Device];
   return EFT[Task][Device];
+}
+
+void HEFTContext::loadIoModel() {
+  IoRanges.clear();
+  IoOwner.clear();
+  IoTasks = IoBytes = IoRemoteBytes = 0;
+  IoCostUs = 0.0;
+  if (!IoEnabled && !IoLog)
+    return;
+  __kmp_task_io_graph_ranges(tdg, &IoRanges);
+
+  // Defaults before any measurement: 1 GB/s on the owner, a third of that
+  // away from it. A measured rate replaces its default; a single measured
+  // rate sets the other one through the same ratio.
+  constexpr double DefaultLocal = 1e-3, DefaultRatio = 3.0;
+  double Local = -1.0, Remote = -1.0;
+  __kmp_task_io_rates(&Local, &Remote);
+  IoLocalSource = Local >= 0.0 ? "measured" : "default";
+  IoRemoteSource = Remote >= 0.0 ? "measured" : "default";
+  if (Local < 0.0)
+    Local = Remote >= 0.0 ? Remote / DefaultRatio : DefaultLocal;
+  if (Remote < 0.0)
+    Remote = Local * DefaultRatio;
+  if (IoRemoteMinRatio > 0.0 && Remote < Local * IoRemoteMinRatio) {
+    Remote = Local * IoRemoteMinRatio;
+    IoRemoteSource = "floor";
+  }
+  if (IoLocalUsPerByteEnv >= 0.0) {
+    Local = IoLocalUsPerByteEnv;
+    IoLocalSource = "env";
+  }
+  if (IoRemoteUsPerByteEnv >= 0.0) {
+    Remote = IoRemoteUsPerByteEnv;
+    IoRemoteSource = "env";
+  }
+  IoLocalUsPerByte = Local;
+  IoRemoteUsPerByte = Remote;
+}
+
+namespace {
+/// True when the task writes the file and never reads it, so its first
+/// access is a write and libompfile binds the file's owner to its device.
+bool writesBeforeReading(const std::vector<kmp_task_io_entry_t> &Ranges,
+                         kmp_uint64 PathKey) {
+  bool Writes = false;
+  for (const kmp_task_io_entry_t &E : Ranges) {
+    if (E.path_key != PathKey)
+      continue;
+    if (!E.is_write)
+      return false;
+    Writes = true;
+  }
+  return Writes;
+}
+} // namespace
+
+double HEFTContext::computeIoCost(TaskPtr Task, DeviceId Device,
+                                  kmp_uint64 *RemoteBytes) const {
+  if (RemoteBytes != nullptr)
+    *RemoteBytes = 0;
+  // Tasks on the head node do not run on a proxy and own nothing.
+  if ((!IoEnabled && RemoteBytes == nullptr) || Device.Rank < 1)
+    return 0.0;
+  const kmp_int32 Node = KMP_TASKPTR_TO_TDG_TASKID(Task);
+  if (Node < 0 || static_cast<size_t>(Node) >= IoRanges.size())
+    return 0.0;
+  const auto &Ranges = IoRanges[Node];
+  const kmp_int32 Dev = Device.Rank - 1;
+  double Cost = 0.0;
+  for (const kmp_task_io_entry_t &E : Ranges) {
+    if (E.bytes == 0)
+      continue;
+    kmp_int32 Owner = E.owner_rank;
+    const auto It = IoOwner.find(E.path_key);
+    if (It != IoOwner.end())
+      Owner = It->second;
+    else if (writesBeforeReading(Ranges, E.path_key))
+      Owner = Dev;
+    // An unknown owner (a declared range of a file not yet open) is priced
+    // as local: it gives no reason to prefer a device.
+    const bool Remote = Owner >= 0 && Owner != Dev;
+    Cost += static_cast<double>(E.bytes) *
+            (Remote ? IoRemoteUsPerByte : IoLocalUsPerByte);
+    if (Remote && RemoteBytes != nullptr)
+      *RemoteBytes += E.bytes;
+  }
+  return IoEnabled ? Cost : 0.0;
+}
+
+void HEFTContext::noteIoPlacement(TaskPtr Task, DeviceId Device) {
+  if (Device.Rank < 1)
+    return;
+  const kmp_int32 Node = KMP_TASKPTR_TO_TDG_TASKID(Task);
+  if (Node < 0 || static_cast<size_t>(Node) >= IoRanges.size() ||
+      IoRanges[Node].empty())
+    return;
+  const auto &Ranges = IoRanges[Node];
+  kmp_uint64 Remote = 0;
+  const double Cost = computeIoCost(Task, Device, &Remote);
+  ++IoTasks;
+  IoRemoteBytes += Remote;
+  IoCostUs += Cost;
+  const kmp_int32 Dev = Device.Rank - 1;
+  for (const kmp_task_io_entry_t &E : Ranges) {
+    IoBytes += E.bytes;
+    if (IoOwner.count(E.path_key) != 0)
+      continue;
+    if (writesBeforeReading(Ranges, E.path_key))
+      IoOwner[E.path_key] = Dev;
+    else if (E.owner_rank >= 0)
+      IoOwner[E.path_key] = E.owner_rank;
+  }
+  if (IoLog)
+    fprintf(stderr,
+            "[heft-io] task=%d device=%d io_us=%.1f remote_bytes=%llu\n", Node,
+            Dev, Cost, static_cast<unsigned long long>(Remote));
+}
+
+void HEFTContext::reportIoModel(kmp_int32 TdgId) const {
+  if (!IoLog)
+    return;
+  fprintf(stderr,
+          "[heft-io] summary tdg=%d enabled=%d io_tasks=%llu bytes=%llu "
+          "remote_bytes=%llu io_cost_us=%.0f local_us_per_mb=%.1f local_src=%s "
+          "remote_us_per_mb=%.1f remote_src=%s\n",
+          TdgId, IoEnabled ? 1 : 0, static_cast<unsigned long long>(IoTasks),
+          static_cast<unsigned long long>(IoBytes),
+          static_cast<unsigned long long>(IoRemoteBytes), IoCostUs,
+          IoLocalUsPerByte * (1 << 20), IoLocalSource,
+          IoRemoteUsPerByte * (1 << 20), IoRemoteSource);
+  fflush(stderr);
 }
 
 double HEFTContext::scheduleTask(TaskPtr Task, DeviceId Device) {
@@ -136,6 +303,7 @@ double HEFTContext::scheduleTask(TaskPtr Task, DeviceId Device) {
          TaskState::SCHEDULED);
   AST[Task] = EST[Task][Device];
   AFT[Task] = EFT[Task][Device];
+  noteIoPlacement(Task, Device);
   return AFT[Task];
 }
 
@@ -1142,9 +1310,246 @@ void HEFTScheduler::scheduleGraph() {
          "Some tasks were not properly scheduled.\n");
 
   KG_TRACE(10, ("[HEFT]: HEFT (adding memory tasks)\n"));
+  Ctx.reportIoModel(tdg->tdg_id);
   Ctx.dump(NumDevices);
   addMemoryTasks();
+  addIoTasks();
   KG_TRACE(10, ("[HEFT] End HEFT schedule.\n"));
+}
+
+namespace {
+// Mirrors OMPFILE_IO_TASK_* in libompfile's ompfile_graph_plan.h.
+enum : kmp_int32 {
+  IoTaskPrefetch = 1,
+  IoTaskStage = 2,
+  IoTaskFlush = 3,
+  IoTaskReset = 4,
+};
+
+/// OMPCLUSTER_HEFT_IO_TASKS: a comma list of prefetch, stage, flush, or all.
+unsigned ioTaskKinds() {
+  static const unsigned Kinds = [] {
+    const char *Env = std::getenv("OMPCLUSTER_HEFT_IO_TASKS");
+    if (Env == nullptr)
+      return 0u;
+    std::string List(Env);
+    unsigned K = 0;
+    size_t Start = 0;
+    while (Start <= List.size()) {
+      size_t End = List.find(',', Start);
+      if (End == std::string::npos)
+        End = List.size();
+      const std::string Item = List.substr(Start, End - Start);
+      if (Item == "prefetch" || Item == "all")
+        K |= 1u << IoTaskPrefetch;
+      if (Item == "stage" || Item == "all")
+        K |= 1u << IoTaskStage;
+      if (Item == "flush" || Item == "all")
+        K |= 1u << IoTaskFlush;
+      Start = End + 1;
+    }
+    return K;
+  }();
+  return Kinds;
+}
+
+using IoTaskFn = int (*)(int, int, kmp_uint64, kmp_int64, kmp_uint64);
+IoTaskFn ioTaskFn() {
+  static const IoTaskFn Fn =
+      reinterpret_cast<IoTaskFn>(KMP_DLSYM("ompfile_sched_io_task"));
+  return Fn;
+}
+
+bool rangesOverlap(kmp_int64 A, kmp_uint64 AExt, kmp_int64 B,
+                   kmp_uint64 BExt) {
+  if (A < 0 || B < 0)
+    return true; // a cursor call can touch anything
+  return A < B + static_cast<kmp_int64>(BExt) &&
+         B < A + static_cast<kmp_int64>(AExt);
+}
+} // namespace
+
+/// Inserts file I/O tasks on the scheduled graph's edges. Each one runs on an
+/// origin helper thread and asks a proxy to do the work (libompfile's
+/// ompfile_sched_io_task):
+///  - prefetch: a task reads a range its single writing predecessor wrote, on
+///    a device that does not own the file. The range is read into the reading
+///    proxy's prefetch cache right after the writer, so the reader's own read
+///    is local; the reader's device can run something else meanwhile.
+///  - stage: a task reads a file no task of the graph writes. The range is
+///    read on the file's owner into its prefetch cache (and page cache) ahead
+///    of the reader, off whatever predecessor edge the reader has.
+///  - flush: after the last writer of a file, commit it on its owner. With
+///    LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=deferred the writer's close skips
+///    the sync, so the durability point leaves the writer and only that edge's
+///    successor waits for it.
+/// The proxies' prefetch caches are reset before the tasks are planned, so a
+/// range left over from an earlier run is never served.
+void HEFTScheduler::addIoTasks() {
+  const unsigned Kinds = ioTaskKinds();
+  const IoTaskFn Run = ioTaskFn();
+  if (Kinds == 0 || Run == nullptr)
+    return;
+  // The recording run schedules the graph while its tasks execute; finished
+  // tasks have already released their successor lists, so an edge task
+  // cannot be spliced in. I/O tasks start with the first replay.
+  if (__kmp_tdg_is_recording(tdg->tdg_status))
+    return;
+  (void)Run(IoTaskReset, -1, 0, 0, 0);
+
+  const kmp_int32 Normal = KMP_ATOMIC_LD_RLX(&tdg->num_normal_tasks);
+  const auto &Ranges = Ctx.IoRanges;
+  auto rangesOf = [&](kmp_int32 Node) -> const std::vector<kmp_task_io_entry_t> * {
+    if (Node < 0 || static_cast<size_t>(Node) >= Ranges.size())
+      return nullptr;
+    return &Ranges[Node];
+  };
+  auto writes = [&](kmp_int32 Node, kmp_uint64 Key, kmp_int64 Lo,
+                    kmp_uint64 Ext) {
+    const auto *R = rangesOf(Node);
+    if (R == nullptr)
+      return false;
+    for (const kmp_task_io_entry_t &E : *R)
+      if (E.is_write && E.path_key == Key &&
+          rangesOverlap(E.offset, E.extent, Lo, Ext))
+        return true;
+    return false;
+  };
+  auto rankOf = [&](kmp_int32 Node) {
+    const kmp_node_info &Info = tdg->record_map[Node];
+    if (Info.task == nullptr)
+      return -1;
+    auto &Map = *get_schedule_map(tdg->tdg_id);
+    auto It = Map.find(KMP_TASKNODE_TO_TASKID(Info));
+    return It == Map.end() ? -1 : It->second.rank;
+  };
+  auto ownerOf = [&](kmp_uint64 Key, const std::vector<kmp_task_io_entry_t> &R) {
+    auto It = Ctx.IoOwner.find(Key);
+    if (It != Ctx.IoOwner.end())
+      return It->second;
+    for (const kmp_task_io_entry_t &E : R)
+      if (E.path_key == Key && E.owner_rank >= 0)
+        return E.owner_rank;
+    return -1;
+  };
+
+  // Files some task of the graph writes, and the last writer of each. Tasks
+  // are recorded after the tasks they depend on, so node order is a
+  // topological order (and survives the record map moving when memory tasks
+  // grow it, which pointer-keyed HEFT state does not).
+  std::unordered_map<kmp_uint64, kmp_int32> LastWriter;
+  for (kmp_int32 N = 0; N < Normal; ++N) {
+    const auto *R = rangesOf(N);
+    if (R == nullptr || tdg->record_map[N].task == nullptr)
+      continue;
+    for (const kmp_task_io_entry_t &E : *R)
+      if (E.is_write)
+        LastWriter[E.path_key] = N;
+  }
+
+  struct Plan {
+    kmp_int32 Src, Dst, Kind, Device;
+    kmp_uint64 Key;
+    kmp_int64 Offset;
+    kmp_uint64 Extent;
+  };
+  std::vector<Plan> Plans;
+  kmp_uint64 Counts[4] = {0, 0, 0, 0};
+  kmp_uint64 Bytes[4] = {0, 0, 0, 0};
+
+  for (kmp_int32 T = 0; T < Normal; ++T) {
+    const kmp_node_info &Node = tdg->record_map[T];
+    if (Node.task == nullptr || !Node.is_target_task ||
+        isTargetDataTask(&Node))
+      continue;
+    const kmp_int32 Rank = rankOf(T);
+    const auto *R = rangesOf(T);
+    if (Rank < 1 || R == nullptr || R->empty())
+      continue;
+    const kmp_int32 Dev = Rank - 1;
+    // The task's read span per file.
+    std::unordered_map<kmp_uint64, std::pair<kmp_int64, kmp_int64>> Reads;
+    for (const kmp_task_io_entry_t &E : *R) {
+      if (E.is_write || E.offset < 0 || E.extent == 0)
+        continue;
+      const kmp_int64 End = E.offset + static_cast<kmp_int64>(E.extent);
+      auto It = Reads.find(E.path_key);
+      if (It == Reads.end())
+        Reads[E.path_key] = {E.offset, End};
+      else {
+        It->second.first = std::min(It->second.first, E.offset);
+        It->second.second = std::max(It->second.second, End);
+      }
+    }
+    for (const auto &KV : Reads) {
+      const kmp_uint64 Key = KV.first;
+      const kmp_int64 Lo = KV.second.first;
+      const kmp_uint64 Ext = static_cast<kmp_uint64>(KV.second.second - Lo);
+      // A task that also writes the range it reads keeps its own order.
+      if (writes(T, Key, Lo, Ext))
+        continue;
+      kmp_int32 WriterEdge = -1, WriterEdges = 0;
+      for (kmp_int32 I = 0; I < Node.npredecessors; ++I) {
+        const kmp_int32 P = Node.predecessors[I];
+        const kmp_int32 W =
+            P < Normal ? P : tdg->record_map[P].predecessors[0];
+        if (writes(W, Key, Lo, Ext)) {
+          ++WriterEdges;
+          WriterEdge = P;
+        }
+      }
+      const kmp_int32 Owner = ownerOf(Key, *R);
+      if (WriterEdges == 1 && (Kinds & (1u << IoTaskPrefetch)) && Owner >= 0 &&
+          Owner != Dev) {
+        Plans.push_back({WriterEdge, T, IoTaskPrefetch, Dev, Key, Lo, Ext});
+      } else if (WriterEdges == 0 && LastWriter.count(Key) == 0 &&
+                 (Kinds & (1u << IoTaskStage)) && Owner >= 0 &&
+                 Node.npredecessors > 0) {
+        Plans.push_back(
+            {Node.predecessors[0], T, IoTaskStage, Owner, Key, Lo, Ext});
+      }
+    }
+  }
+  if (Kinds & (1u << IoTaskFlush)) {
+    for (const auto &KV : LastWriter) {
+      const kmp_int32 W = KV.second;
+      const kmp_node_info &Node = tdg->record_map[W];
+      if (Node.nsuccessors < 1)
+        continue; // nothing to hang it on; the proxy syncs at shutdown
+      const auto *R = rangesOf(W);
+      kmp_int32 Owner = R != nullptr ? ownerOf(KV.first, *R) : -1;
+      if (Owner < 0)
+        Owner = rankOf(W) - 1;
+      if (Owner < 0)
+        continue;
+      Plans.push_back({W, Node.successors[0], IoTaskFlush, Owner, KV.first, 0,
+                       0});
+    }
+  }
+
+  // Several tasks on one edge are chained: src -> io1 -> io2 -> dst.
+  const kmp_int32 Gtid = __kmp_get_gtid();
+  std::map<std::pair<kmp_int32, kmp_int32>, kmp_int32> Chain;
+  for (const Plan &P : Plans) {
+    auto &Src = Chain.emplace(std::make_pair(P.Src, P.Dst), P.Src).first->second;
+    kmp_task_t *Inserted = __kmp_create_io_task(
+        Gtid, tdg->record_map[Src].task, tdg->record_map[P.Dst].task, P.Kind,
+        P.Device, P.Key, P.Offset, P.Extent);
+    if (Inserted == nullptr)
+      continue;
+    Src = KMP_TASK_TO_TASKDATA(Inserted)->td_tdg_task_id;
+    ++Counts[P.Kind];
+    Bytes[P.Kind] += P.Extent;
+  }
+  if (Ctx.IoLog)
+    fprintf(stderr,
+            "[heft-io] io-tasks tdg=%d prefetch=%llu prefetch_bytes=%llu "
+            "stage=%llu stage_bytes=%llu flush=%llu\n",
+            tdg->tdg_id, static_cast<unsigned long long>(Counts[IoTaskPrefetch]),
+            static_cast<unsigned long long>(Bytes[IoTaskPrefetch]),
+            static_cast<unsigned long long>(Counts[IoTaskStage]),
+            static_cast<unsigned long long>(Bytes[IoTaskStage]),
+            static_cast<unsigned long long>(Counts[IoTaskFlush]));
 }
 
 /// Reset context and recompute upward ranks for the new graph
@@ -1152,6 +1557,7 @@ void HEFTScheduler::acquireNewGraphPost() {
   KG_TRACE(10, ("[HEFT]: AcquireNewGraphPost (start)\n"));
   Ctx.clear();
   Ctx.setTaskMap(__kmpc_curr_tdg_idx());
+  Ctx.loadIoModel();
   dumpTaskGraph();
   Ctx.interpolateCompCost(scheduling_iteration_counter, initial_schedule_policy,
                           initial_iteration);

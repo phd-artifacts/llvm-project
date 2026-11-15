@@ -29,6 +29,26 @@ typedef struct ompfile_graph_write {
 // the plan is off (nothing is sent), or -1 with errno set.
 int ompfile_graph_plan_writes(const ompfile_graph_write *writes, int count);
 
+// File I/O tasks libomp's HEFT scheduler inserts on graph edges
+// (OMPCLUSTER_HEFT_IO_TASKS). libomp mirrors the kinds in kmp_target_heft.cpp.
+enum {
+  OMPFILE_IO_TASK_PREFETCH = 1, // read a range into the device's prefetch cache
+  OMPFILE_IO_TASK_STAGE = 2,    // the same, on the file's owner
+  OMPFILE_IO_TASK_FLUSH = 3,    // commit the file on its owner
+  OMPFILE_IO_TASK_RESET = 4,    // clear every device's prefetch cache
+};
+
+// Origin: run one I/O task on `device` (-1 with RESET: every device). The path
+// comes from the application's declarations and opens; returns 0, or -1 with
+// errno set (ENOENT: no path known for the key).
+int ompfile_sched_io_task(int kind, int device, uint64_t path_key,
+                          int64_t offset, uint64_t extent);
+
+// Proxy: what the plugin calls for an OMPFILE_IO_TASK event. Returns 0, or -1
+// with errno set.
+int ompfile_io_task_run(int kind, const char *path, int64_t offset,
+                        uint64_t extent);
+
 #ifdef __cplusplus
 }
 

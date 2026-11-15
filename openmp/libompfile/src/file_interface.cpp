@@ -15,6 +15,12 @@
 #include <mutex>
 #include <vector>
 
+namespace ompfile::io_tasks {
+void rememberPath(const char *path);
+bool takePrefetched(int file_handle, int64_t offset, void *data, size_t size);
+void dropOverlapping(int file_handle, int64_t offset, size_t size);
+} // namespace ompfile::io_tasks
+
 // One range per public call, on the calling thread (thread-local, so
 // push/pop). Payload = the request size where there is one.
 #define OMPFILE_API_TRACE(Name, Size)                                          \
@@ -71,6 +77,7 @@ int omp_file_declare_next_task_io(const char *path, long offset, size_t size,
     errno = EINVAL;
     return -1;
   }
+  ompfile::io_tasks::rememberPath(path);
   return ompfile::mpp::declareNextTaskIo(ompfile::keys::pathKey(path), offset,
                                          offset < 0 ? 0 : size, is_write != 0);
 }
@@ -156,6 +163,9 @@ int omp_file_open(const char *filename) {
   const int rc = with_task_io(ompfile::mpp::TaskIoMeta, -1, 0, 0, [&] {
     return ctx.openFile(filename);
   });
+  // The origin keeps the paths it opens for the scheduler's I/O tasks.
+  if (rc >= 0 && !ompfile::mpp::taskIoNoteAvailable())
+    ompfile::io_tasks::rememberPath(filename);
   io_trace("omp_file_open api exit rc=%d\n", rc);
   return rc;
 }
@@ -163,6 +173,7 @@ int omp_file_open(const char *filename) {
 int omp_file_write(int file_handle, const void *data, size_t size, int async) {
   auto &ctx = OmpFileClientContext::getInstance();
   return with_task_io(ompfile::mpp::TaskIoWrite, file_handle, -1, size, [&] {
+    ompfile::io_tasks::dropOverlapping(file_handle, -1, size);
     return ctx.submitWrite(file_handle, /*offset=*/0, /*has_offset=*/false,
                            data, size, /*hint=*/nullptr, async != 0);
   });
@@ -173,6 +184,7 @@ int omp_file_pwrite(int file_handle, long offset, const void *data, size_t size,
   OMPFILE_API_TRACE("omp_file_pwrite", size);
   auto &ctx = OmpFileClientContext::getInstance();
   return with_task_io(ompfile::mpp::TaskIoWrite, file_handle, offset, size, [&] {
+    ompfile::io_tasks::dropOverlapping(file_handle, offset, size);
     return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
                            /*hint=*/nullptr, async != 0);
   });
@@ -184,6 +196,7 @@ int omp_file_pwrite_hint(int file_handle, long offset, const void *data,
   OMPFILE_API_TRACE("omp_file_pwrite_hint", size);
   auto &ctx = OmpFileClientContext::getInstance();
   return with_task_io(ompfile::mpp::TaskIoWrite, file_handle, offset, size, [&] {
+    ompfile::io_tasks::dropOverlapping(file_handle, offset, size);
     return ctx.submitWrite(file_handle, offset, /*has_offset=*/true, data, size,
                            hint, async != 0);
   });
@@ -198,6 +211,7 @@ int omp_file_pwrite_owned(int file_handle, long offset, void *data,
   auto &ctx = OmpFileClientContext::getInstance();
   const int rc =
       with_task_io(ompfile::mpp::TaskIoWrite, file_handle, offset, size, [&] {
+        ompfile::io_tasks::dropOverlapping(file_handle, offset, size);
         return ctx.submitWriteOwned(file_handle, offset, data, size,
                                     release ? release : &::free,
                                     /*hint=*/nullptr);
@@ -216,6 +230,7 @@ int omp_file_pwrite_owned_hint(int file_handle, long offset, void *data,
   auto &ctx = OmpFileClientContext::getInstance();
   const int rc =
       with_task_io(ompfile::mpp::TaskIoWrite, file_handle, offset, size, [&] {
+        ompfile::io_tasks::dropOverlapping(file_handle, offset, size);
         return ctx.submitWriteOwned(file_handle, offset, data, size,
                                     release ? release : &::free, hint);
       });
@@ -266,6 +281,8 @@ int omp_file_pread(int file_handle, long offset, void *data, size_t size,
   auto &ctx = OmpFileClientContext::getInstance();
   const int rc =
       with_task_io(ompfile::mpp::TaskIoRead, file_handle, offset, size, [&] {
+        if (ompfile::io_tasks::takePrefetched(file_handle, offset, data, size))
+          return 0;
         return ctx.readFileAt(file_handle, data, size, offset);
       });
   io_trace("omp_file_pread api exit rc=%d\n", rc);
@@ -278,6 +295,8 @@ int omp_file_pread_hint(int file_handle, long offset, void *data, size_t size,
   note_async_read_synchronous(async);
   auto &ctx = OmpFileClientContext::getInstance();
   return with_task_io(ompfile::mpp::TaskIoRead, file_handle, offset, size, [&] {
+    if (ompfile::io_tasks::takePrefetched(file_handle, offset, data, size))
+      return 0;
     return ctx.readFileAtHint(file_handle, data, size, offset, hint);
   });
 }

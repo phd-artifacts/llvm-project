@@ -81,7 +81,8 @@ public:
     } else if (file_handle < 0 && open_plan_ptr) {
       // The headnode counted this open and nothing will close it.
       const int saved_errno = errno;
-      (void)scheduleClose(/*file_handle=*/-1, open_plan_ptr->AggregatorRank);
+      (void)scheduleClose(/*file_handle=*/-1, open_plan_ptr->AggregatorRank,
+                          filename);
       errno = saved_errno;
     }
     return file_handle;
@@ -117,8 +118,11 @@ public:
     bool schedule_ok = true;
     if (!ensureSchedulerReady("close", /*log_once=*/true))
       schedule_ok = false;
-    if (mpp_sched_active)
-      schedule_ok = scheduleClose(file_handle, takePlannedRank(file_handle));
+    if (mpp_sched_active) {
+      const std::string path = trackedPath(file_handle);
+      schedule_ok = scheduleClose(file_handle, takePlannedRank(file_handle),
+                                  path.empty() ? nullptr : path.c_str());
+    }
     const int rc = backend.close(file_handle);
     if (rc == 0)
       forgetOpenPath(file_handle);
@@ -310,6 +314,12 @@ private:
     tracked_file_map[file_handle] = std::move(metadata);
   }
 
+  std::string trackedPath(int file_handle) {
+    const std::lock_guard<std::mutex> lock(tracked_file_mutex);
+    auto it = tracked_file_map.find(file_handle);
+    return it == tracked_file_map.end() ? std::string() : it->second.Path;
+  }
+
   void forgetOpenPath(int file_handle) {
     const std::lock_guard<std::mutex> lock(tracked_file_mutex);
     tracked_file_map.erase(file_handle);
@@ -488,13 +498,22 @@ private:
     return schedRequest(req, path, plan_out);
   }
 
-  bool scheduleClose(int file_handle, int planned_rank) {
+  // path, when given, names the file whose open this close ends, so the
+  // headnode can count the file's live opens (a writer bind needs it to be the
+  // only one). A release of a bound handle's old owner passes none: the
+  // handle is still open.
+  bool scheduleClose(int file_handle, int planned_rank,
+                     const char *path = nullptr) {
     ompfile::OmpFileIORequest req{};
     req.RequestId = request_id.fetch_add(1, std::memory_order_relaxed);
     req.Op = ompfile::OmpFileIOOp::CLOSE;
     req.ClientRank = client_rank;
     req.FileHandle = file_handle;
     req.AggregatorRank = planned_rank;
+    if (path != nullptr && path[0] != '\0') {
+      req.PathSize = static_cast<uint32_t>(std::strlen(path) + 1);
+      return schedRequest(req, path, nullptr);
+    }
     io_trace("HeadnodeScheduler::scheduleClose scheduler=%p req_id=%llu "
              "file=%d planned_rank=%d\n",
              static_cast<void *>(this),

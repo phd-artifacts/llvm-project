@@ -760,6 +760,15 @@ int OmpFileHeadnodeManager::pickRankForPathKeyUnlocked(uint64_t PathKey,
 // has been opened exactly once (so this is the only handle, and it has done no
 // I/O), the test hook did not fix it, and the client names the owner its handle
 // is on. Otherwise the plan names the owner unchanged.
+void OmpFileHeadnodeManager::releaseLiveOpenUnlocked(
+    const OmpFileIORequest &Request, const char *Path) {
+  if (Request.PathSize == 0 || Path == nullptr)
+    return;
+  auto It = GlobalFileTable.find(std::string(Path, Request.PathSize - 1));
+  if (It != GlobalFileTable.end() && It->second.LiveOpens > 0)
+    It->second.LiveOpens -= 1;
+}
+
 void OmpFileHeadnodeManager::planWriterBindUnlocked(
     const OmpFileIORequest &Request, std::string_view PathView,
     OmpFileIOPlan &Plan) {
@@ -774,7 +783,7 @@ void OmpFileHeadnodeManager::planWriterBindUnlocked(
   GlobalFileEntry &Entry = It->second;
   Plan.RemoteHandle = static_cast<int32_t>(Entry.GlobalFileId & 0x7fffffffU);
   const int From = Entry.PreferredAggregatorRank;
-  const bool Moves = Entry.OpenRequests == 1 && !Entry.OwnerFixed &&
+  const bool Moves = Entry.LiveOpens == 1 && !Entry.OwnerFixed &&
                      From == Request.AggregatorRank &&
                      isWorkerRankUnlocked(Request.ClientRank) &&
                      Request.ClientRank != From;
@@ -790,10 +799,11 @@ void OmpFileHeadnodeManager::planWriterBindUnlocked(
   if (SchedTraceEnabled)
     fprintf(stderr,
             "[ompfile-mpp][sched] writer-bind path_key=%llu from=%d to=%d "
-            "moved=%d open_requests=%llu owner_fixed=%d\n",
+            "moved=%d open_requests=%llu live_opens=%llu owner_fixed=%d\n",
             static_cast<unsigned long long>(Entry.PathKey), From,
             Request.ClientRank, static_cast<int>(Moves),
             static_cast<unsigned long long>(Entry.OpenRequests),
+            static_cast<unsigned long long>(Entry.LiveOpens),
             static_cast<int>(Entry.OwnerFixed));
 }
 
@@ -828,6 +838,7 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
     // handle back and plan nothing: no PlansIssued or PlannedTotal count, no
     // tie-breaker step. The reply is Status 0 with AggregatorRank -1.
     releaseOpenHandleUnlocked(Request.AggregatorRank);
+    releaseLiveOpenUnlocked(Request, Path);
     return Plan;
   }
 
@@ -881,6 +892,8 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
       Entry.GlobalFileId = NextGlobalFileId++;
 
     Entry.OpenRequests += 1;
+    if ((Request.Flags & OMPFILE_IO_REQUEST_PLACEMENT_ONLY) == 0)
+      Entry.LiveOpens += 1;
     Entry.PathKey = PathKey;
     Entry.HasPathKey = true;
 
@@ -972,6 +985,7 @@ OmpFileIOPlan OmpFileHeadnodeManager::planRequest(const OmpFileIORequest &Reques
     // -1 (nothing planned) changes nothing. The close itself is still planned
     // and counted below, as before.
     releaseOpenHandleUnlocked(Request.AggregatorRank);
+    releaseLiveOpenUnlocked(Request, Path);
   }
 
   if (!isWorkerRankUnlocked(HandlerRank)) {

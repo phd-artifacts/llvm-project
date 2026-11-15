@@ -1267,6 +1267,7 @@ struct ProxyDevice {
       case OMPFILE_FLUSH_DIRTY_TILE:
       case OMPFILE_SCHED_REQUEST:
       case OMPFILE_SCHED_REQUEST_BATCH:
+      case OMPFILE_IO_TASK:
         // File-I/O events (isFileIoEvent): the libompfile server
         // (ProxyOmpFile.h).
         NewEvent =

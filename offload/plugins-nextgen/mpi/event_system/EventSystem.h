@@ -180,6 +180,7 @@ enum class EventTypeTy : unsigned int {
   OMPFILE_DIRTY_OWNER_PREAD = 43, // Read dirty staged bytes from owner proxy.
   OMPFILE_DIRTY_OWNER_QUERY = 44, // Classify dirty staged bytes without reading.
   OMPFILE_DIRTY_OWNER_PREAD_BATCH = 45, // Batched dirty staged reads.
+  OMPFILE_IO_TASK = 46, // A scheduler-inserted file I/O task (io_tasks.cpp).
 
   // Internal event system commands.
   EXIT = 35, // Stops the event system execution at the remote process.
@@ -212,6 +213,7 @@ static_assert(
     41);
 static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_FLUSH_DIRTY_TILE) ==
               42);
+static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_IO_TASK) == 46);
 static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD) ==
               43);
 static_assert(static_cast<unsigned int>(EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY) ==

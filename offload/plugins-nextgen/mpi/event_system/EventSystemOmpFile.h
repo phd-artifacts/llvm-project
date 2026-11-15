@@ -48,6 +48,9 @@ constexpr bool isFileIoEvent(EventTypeTy Type) {
   case EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD:
   case EventTypeTy::OMPFILE_DIRTY_OWNER_QUERY:
   case EventTypeTy::OMPFILE_DIRTY_OWNER_PREAD_BATCH:
+  // The proxy's handler hands the work to a thread of its own and yields, so
+  // it never holds an io handler while the proxy's client waits on one.
+  case EventTypeTy::OMPFILE_IO_TASK:
     return true;
   default:
     return false;
@@ -209,6 +212,9 @@ EventTy ompfileOpen(MPIRequestManagerTy RequestManager, const char *Path,
                     int *RemoteErrno);
 EventTy ompfileClose(MPIRequestManagerTy RequestManager, int RemoteHandle,
                      int *CloseRet, int *RemoteErrno);
+EventTy ompfileIoTask(MPIRequestManagerTy RequestManager, int Kind,
+                      const char *Path, int64_t Offset, uint64_t Extent,
+                      int *RemoteRc, int *RemoteErrno);
 EventTy ompfilePread(MPIRequestManagerTy RequestManager, int RemoteHandle,
                      int64_t Offset, void *Buffer, uint64_t Size,
                      int *IoRet, int *RemoteErrno, uint64_t *Bytes);

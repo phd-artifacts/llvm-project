@@ -920,30 +920,105 @@ kmp_task_t *__kmp_insert_legacy_memory_task(kmp_int32 gtid, kmp_task_t *source,
   return memory_task;
 }
 
+static kmp_task_t *__kmp_insert_edge_task(kmp_int32 gtid,
+                                          kmp_task_t *memory_task,
+                                          kmp_task_t *source,
+                                          kmp_task_t *target,
+                                          bool is_taskgraph);
+
 kmp_task_t *__kmp_create_memory_task(kmp_int32 gtid, kmp_task_t *source,
                                      kmp_task_t *target, int source_device,
                                      int target_device, void *dep_addr,
                                      size_t size_addr, bool is_taskgraph) {
   KG_TRACE(20, ("[SCHEDULER-MT] __kmp_create_memory_task (begin)\n"));
-
-  kmp_info_t *thread = __kmp_threads[gtid];
-
   KG_TRACE(10, ("(create_memory_task) dep_addr=%p\n", dep_addr));
+  if (!KMP_TASK_TO_TASKDATA(source)->tdg)
+    return nullptr;
+  kmp_task_t *memory_task = __kmp_alloc_memory_task(
+      gtid, source_device, target_device, dep_addr, size_addr, source, target);
+  if (!memory_task)
+    return nullptr;
+  return __kmp_insert_edge_task(gtid, memory_task, source, target,
+                                is_taskgraph);
+}
 
+// File I/O tasks the scheduler inserts on a graph edge (prefetch, stage,
+// flush). Like a memory task they run on a hidden helper thread of the origin
+// and block it until the proxy has done the work; libompfile does the work
+// (ompfile_sched_io_task, resolved with dlsym).
+typedef struct kmp_io_task_args {
+  kmp_int32 kind;
+  kmp_int32 device;
+  kmp_uint64 path_key;
+  kmp_int64 offset;
+  kmp_uint64 extent;
+} kmp_io_task_args_t;
+
+static void io_task_entry(int gtid, kmp_task_t *task) {
+  auto *args = reinterpret_cast<kmp_io_task_args_t *>(task->shareds);
+  using IoTaskFn = int (*)(int, int, kmp_uint64, kmp_int64, kmp_uint64);
+  static const IoTaskFn run =
+      reinterpret_cast<IoTaskFn>(KMP_DLSYM("ompfile_sched_io_task"));
+  // OMPCLUSTER_HEFT_IO_TASKS_NOOP=1 keeps the inserted tasks and their edges
+  // but skips the I/O: the control for what the extra graph tasks alone do.
+  static const bool noop = [] {
+    const char *v = getenv("OMPCLUSTER_HEFT_IO_TASKS_NOOP");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  if (run == nullptr || noop)
+    return;
+  // A failed prefetch or stage only costs the read it meant to hide; a failed
+  // flush leaves durability to the next commit, close or proxy shutdown.
+  // libompfile counts and reports both.
+  (void)run(args->kind, args->device, args->path_key, args->offset,
+            args->extent);
+}
+
+kmp_task_t *__kmp_create_io_task(kmp_int32 gtid, kmp_task_t *source,
+                                 kmp_task_t *target, kmp_int32 kind,
+                                 kmp_int32 device, kmp_uint64 path_key,
+                                 kmp_int64 offset, kmp_uint64 extent) {
+  if (!KMP_TASK_TO_TASKDATA(source)->tdg)
+    return nullptr;
+  int32_t Flags = 0;
+  kmp_tasking_flags_t *InputFlags =
+      reinterpret_cast<kmp_tasking_flags_t *>(&Flags);
+  InputFlags->hidden_helper = 1;
+  kmp_info_t *thread = __kmp_threads[gtid];
+#if USE_FAST_MEMORY
+  auto *args = static_cast<kmp_io_task_args_t *>(
+      __kmp_fast_allocate(thread, sizeof(kmp_io_task_args_t)));
+#else
+  auto *args = static_cast<kmp_io_task_args_t *>(
+      __kmp_thread_malloc(thread, sizeof(kmp_io_task_args_t)));
+#endif
+  args->kind = kind;
+  args->device = device;
+  args->path_key = path_key;
+  args->offset = offset;
+  args->extent = extent;
+  kmp_task_t *io_task = __kmpc_omp_target_task_alloc(
+      nullptr, gtid, Flags, sizeof(kmp_task_t), 0,
+      reinterpret_cast<kmp_routine_entry_t>(io_task_entry), -1, nullptr, 0,
+      nullptr, nullptr, nullptr, nullptr);
+  if (!io_task)
+    return nullptr;
+  io_task->shareds = static_cast<void *>(args);
+  return __kmp_insert_edge_task(gtid, io_task, source, target, true);
+}
+
+// Puts an allocated scheduler task (memory or file I/O) on the source ->
+// target edge of the source's graph: source -> task -> target.
+static kmp_task_t *__kmp_insert_edge_task(kmp_int32 gtid,
+                                          kmp_task_t *memory_task,
+                                          kmp_task_t *source,
+                                          kmp_task_t *target,
+                                          bool is_taskgraph) {
+  kmp_info_t *thread = __kmp_threads[gtid];
   kmp_taskdata_t *source_td = KMP_TASK_TO_TASKDATA(source);
   kmp_taskdata_t *target_td = KMP_TASK_TO_TASKDATA(target);
   kmp_tdg_info_t *tdg = source_td->tdg;
-
-  if (!tdg)
-    return nullptr;
-
   const bool IsRecording = __kmp_tdg_is_recording(tdg->tdg_status);
-
-  kmp_task_t *memory_task = __kmp_alloc_memory_task(
-      gtid, source_device, target_device, dep_addr, size_addr, source, target);
-
-  if (!memory_task)
-    return nullptr;
 
   kmp_taskdata_t *memory_taskdata = KMP_TASK_TO_TASKDATA(memory_task);
   memory_taskdata->is_taskgraph = is_taskgraph;
@@ -1096,8 +1171,8 @@ kmp_task_t *__kmp_create_memory_task(kmp_int32 gtid, kmp_task_t *source,
   memory_info->successors[0] = target_tdg_id;
   memory_info->nsuccessors = 1;
 
-  KG_TRACE(50, ("(create_memory_task) tdg = %p\n", tdg));
-  KG_TRACE(10, ("__kmp_create_memory_task (exit)\n"));
+  KG_TRACE(50, ("(insert_edge_task) tdg = %p\n", tdg));
+  KG_TRACE(10, ("__kmp_insert_edge_task (exit)\n"));
   return memory_task;
 }
 

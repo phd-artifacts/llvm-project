@@ -14,6 +14,33 @@
 
 #include "ProxyOmpFile.h"
 
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
+namespace {
+// Scheduler flush tasks that returned before their fdatasync finished
+// (LIBOMPFILE_IO_TASK_ASYNC_FLUSH). The open-cache drain waits for them.
+std::atomic<int> AsyncFlushesInFlight{0};
+
+bool asyncFlushEnabled() {
+  static const bool Enabled = [] {
+    const char *V = std::getenv("LIBOMPFILE_IO_TASK_ASYNC_FLUSH");
+    return V != nullptr && V[0] != '\0' && V[0] != '0';
+  }();
+  return Enabled;
+}
+
+void waitAsyncFlushes() {
+  while (AsyncFlushesInFlight.load(std::memory_order_acquire) > 0)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+} // namespace
+
 EventTy ProxyOmpFile::ompfilePing(MPIRequestManagerTy RequestManager) {
   uint64_t Token = 0;
 
@@ -304,7 +331,12 @@ int ProxyOmpFile::closeWithOptionalCache(int Fd, int &ErrnoOut) {
   // whether the open-cache keeps the physical fd alive afterwards. This
   // runs before the cache-defer logic so a later cache eviction never
   // closes an fd with uncommitted data.
-  if (Fd >= 0) {
+  // Policy "deferred" keeps the writes unsynced while the open cache keeps
+  // the descriptor open, for a later commit (the scheduler's flush task)
+  // or shutdown (drainOmpFileOpenCache) to sync.
+  const bool KeepUnsynced = writethroughFsyncDeferred() &&
+                            OmpFileOpenCacheEnable && OmpFileOpenCacheKeepOpen;
+  if (Fd >= 0 && !KeepUnsynced) {
     bool NeedDeferredSync = false;
     {
       const std::lock_guard<std::mutex> UnsyncedLock(
@@ -381,6 +413,7 @@ int ProxyOmpFile::closeWithOptionalCache(int Fd, int &ErrnoOut) {
 }
 
 void ProxyOmpFile::drainOmpFileOpenCache() {
+  waitAsyncFlushes();
   std::vector<int> FdsToClose;
   {
     const std::lock_guard<std::mutex> Lock(OmpFileOpenCacheMutex);
@@ -395,6 +428,16 @@ void ProxyOmpFile::drainOmpFileOpenCache() {
   }
 
   for (int Fd : FdsToClose) {
+    // Writes a "deferred" close left unsynced are synced before the
+    // descriptor goes.
+    bool Unsynced = false;
+    {
+      const std::lock_guard<std::mutex> UnsyncedLock(
+          OmpFileUnsyncedWriteFdMutex);
+      Unsynced = OmpFileUnsyncedWriteFds.erase(Fd) > 0;
+    }
+    if (Unsynced)
+      (void)fdatasyncSourceTimed(Fd);
     OmpFileStatsCloseSyscalls.fetch_add(1, std::memory_order_relaxed);
     (void)::close(Fd);
     eraseTrackedOmpFileFd(Fd);
@@ -452,6 +495,86 @@ EventTy ProxyOmpFile::ompfileOpen(MPIRequestManagerTy RequestManager) {
   }
 
   RequestManager.send(&Fd, 1, MPI_INT);
+  RequestManager.send(&Errno, 1, MPI_INT);
+  RequestManager.send(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ProxyOmpFile::ompfileIoTask(MPIRequestManagerTy RequestManager) {
+  int Kind = 0;
+  int64_t Offset = 0;
+  uint64_t Extent = 0;
+  uint32_t PathSize = 0;
+  RequestManager.receive(&Kind, 1, MPI_INT);
+  RequestManager.receive(&Offset, 1, MPI_INT64_T);
+  RequestManager.receive(&Extent, 1, MPI_UINT64_T);
+  RequestManager.receive(&PathSize, 1, MPI_UINT32_T);
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+  std::string Path;
+  if (PathSize > 0) {
+    Path.resize(PathSize, '\0');
+    RequestManager.receive(Path.data(), PathSize, MPI_CHAR);
+    if (auto Error = co_await RequestManager; Error)
+      co_return Error;
+  }
+  if (!Path.empty() && Path.back() == '\0')
+    Path.pop_back();
+
+  // libompfile is loaded with the application's image; its client talks to
+  // the file's owner through this same event system, possibly this proxy's
+  // own io queue, so the work runs on a thread of its own while this handler
+  // yields.
+  using RunFn = int (*)(int, const char *, int64_t, uint64_t);
+  static const RunFn Run = [] {
+    void *Sym = dlsym(RTLD_DEFAULT, "ompfile_io_task_run");
+    if (Sym == nullptr)
+      if (void *Lib = dlopen("libompfile.so", RTLD_NOW | RTLD_NOLOAD))
+        Sym = dlsym(Lib, "ompfile_io_task_run");
+    return reinterpret_cast<RunFn>(Sym);
+  }();
+  struct Result {
+    std::atomic<bool> Done{false};
+    int Rc = 0;
+    int Errno = 0;
+  };
+  auto Shared = std::make_shared<Result>();
+  // An asynchronous flush answers at once and syncs the file on a thread of
+  // its own, so the consumer behind it in the graph does not wait for the
+  // fdatasync. fdatasync on any descriptor of the file writes back all of its
+  // dirty pages, including the open cache's unsynced descriptor; this proxy
+  // owns the file (the scheduler sends a flush to the owner). A stage keeps
+  // dirty data outside the page cache, so with one the flush stays a commit.
+  constexpr int FlushKind = 3; // OMPFILE_IO_TASK_FLUSH
+  if (Kind == FlushKind && !Path.empty() && asyncFlushEnabled() &&
+      !isStageEnabled()) {
+    AsyncFlushesInFlight.fetch_add(1, std::memory_order_acq_rel);
+    std::thread([Path] {
+      const int Fd = ::open(Path.c_str(), O_RDONLY | O_CLOEXEC);
+      if (Fd >= 0) {
+        (void)::fdatasync(Fd);
+        (void)::close(Fd);
+      }
+      AsyncFlushesInFlight.fetch_sub(1, std::memory_order_acq_rel);
+    }).detach();
+    Shared->Done = true;
+  } else if (Run == nullptr) {
+    Shared->Rc = -1;
+    Shared->Errno = ENOSYS;
+    Shared->Done = true;
+  } else {
+    std::thread([Shared, Kind, Path, Offset, Extent] {
+      errno = 0;
+      Shared->Rc = Run(Kind, Path.c_str(), Offset, Extent);
+      Shared->Errno = Shared->Rc != 0 ? errno : 0;
+      Shared->Done.store(true, std::memory_order_release);
+    }).detach();
+  }
+  while (!Shared->Done.load(std::memory_order_acquire))
+    co_await std::suspend_always{};
+
+  int Rc = Shared->Rc, Errno = Shared->Errno;
+  RequestManager.send(&Rc, 1, MPI_INT);
   RequestManager.send(&Errno, 1, MPI_INT);
   RequestManager.send(nullptr, 0, MPI_BYTE);
   co_return (co_await RequestManager);
@@ -1008,6 +1131,8 @@ EventTy ProxyOmpFile::createFileIoEvent(EventTypeTy Type,
     return ompfilePing(std::move(RequestManager));
   case OMPFILE_OPEN:
     return ompfileOpen(std::move(RequestManager));
+  case OMPFILE_IO_TASK:
+    return ompfileIoTask(std::move(RequestManager));
   case OMPFILE_CLOSE:
     return ompfileClose(std::move(RequestManager));
   case OMPFILE_PREAD:

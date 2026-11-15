@@ -80,6 +80,7 @@ VERS1.0 {
     ompfile_mpp_submit;
     ompfile_mpp_open;
     ompfile_mpp_open_on_rank;
+    ompfile_mpp_io_task;
     ompfile_mpp_sched_request;
     ompfile_mpp_sched_request_batch;
     ompfile_mpp_freshness_query;

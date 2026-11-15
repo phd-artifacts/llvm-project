@@ -30,6 +30,12 @@ libompfile backend behavior and MPP shim usage.
     through `createHeadnodeScheduler` (the only scheduler since
     `LIBOMPFILE_SCHEDULER` and the `LocalScheduler` went, Oct 2026);
   - `async_write_engine.h`: the header-only `AsyncWriteEngine`.
+  - `io_tasks.cpp`: the graph I/O tasks HEFT inserts
+    (`OMPCLUSTER_HEFT_IO_TASKS`): `ompfile_sched_io_task` on the origin sends
+    them through `ompfile_mpp_io_task`; on the proxy, prefetch fills a
+    consume-once cache that `omp_file_pread` hits
+    (`LIBOMPFILE_PREFETCH_CACHE_MB`), stage reads the range, flush commits;
+    `IO task stats:` is printed with `LIBOMPFILE_OPT_STATS=1`.
 - Backend: `src/mpp_backend.h` and the twelve `src/mpp_backend_*.cpp`
   (`MppBackend`, renamed from `MPIIOBackend` in Oct 2026; the test accessor is
   `MppBackendTestAccess`). It opens no file through MPI. The `io_trace`
@@ -201,6 +207,9 @@ libompfile backend behavior and MPP shim usage.
   `preadNoStageEx` falls back to `preadEx`, the others fail with ENOSYS
   (`include/ompfile_mpp_abi.h`).
 - Scheduler requests use `ompfile_mpp_sched_request` via shim API.
+- Graph I/O tasks use `ompfile_mpp_io_task`; the symbol is listed in
+  `offload/libomptarget/exports`, and a missing export makes every task send
+  fail (`sent_failed=` in `IO task stats:`) rather than abort.
 
 ## Handle model
 

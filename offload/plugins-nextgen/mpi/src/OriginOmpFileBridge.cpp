@@ -184,6 +184,36 @@ int ompfile_mpp_open(const char *Path, int Flags, int Mode, int *Handle) {
   return OFFLOAD_SUCCESS;
 }
 
+// One scheduler-inserted file I/O task on Device's proxy (io_tasks.cpp in
+// libompfile); blocks until the proxy has done it.
+int ompfile_mpp_io_task(int Device, int Kind, const char *Path, int64_t Offset,
+                        uint64_t Extent, int *RemoteRc, int *RemoteErrno) {
+  using namespace llvm::omp::target::plugin;
+  if (!Path || !RemoteRc || !RemoteErrno || Device < 0)
+    return OFFLOAD_FAIL;
+  MPIPluginTy *Plugin = ActiveMPIPlugin.load();
+  if (!Plugin)
+    return OFFLOAD_FAIL;
+  if (auto Err = ompfileInitMPIPlugin(*Plugin))
+    return OFFLOAD_FAIL;
+  if (!ompfileEnsureEventSystem(*Plugin))
+    return OFFLOAD_FAIL;
+  *RemoteRc = 0;
+  *RemoteErrno = 0;
+  EventTy Event = ompfileEventSystem(*Plugin).createEvent(
+      OriginEvents::ompfileIoTask, EventTypeTy::OMPFILE_IO_TASK,
+      /*DstDeviceID=*/Device, Kind, Path, Offset, Extent, RemoteRc,
+      RemoteErrno);
+  if (Event.empty())
+    return OFFLOAD_FAIL;
+  Event.wait();
+  if (auto Error = Event.getError()) {
+    llvm::consumeError(std::move(Error));
+    return OFFLOAD_FAIL;
+  }
+  return OFFLOAD_SUCCESS;
+}
+
 int ompfile_mpp_open_on_rank(const char *Path, int Flags, int Mode, int Rank,
                              int *Handle) {
   using namespace llvm::omp::target::plugin;

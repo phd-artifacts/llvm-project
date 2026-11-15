@@ -18,6 +18,8 @@
 #include "kmp.h"
 
 #include <deque>
+#include <unordered_map>
+#include <vector>
 
 // Forward declaration
 class HEFTScheduler;
@@ -194,6 +196,28 @@ public:
   /// Set a new task map.
   void setTaskMap(kmp_int32 tdg_idx);
 
+  /// Load every task's file ranges and the I/O rates for this pass, and forget
+  /// the owners predicted by the previous pass.
+  void loadIoModel();
+
+  /// Predicted time a task spends in file I/O on a device: each range costs
+  /// the local or the remote rate depending on whether the device will own
+  /// the file. Zero when the I/O term is off.
+  ///
+  /// \param RemoteBytes if not null, receives the bytes predicted remote.
+  /// File I/O of the task at the local rate (0 with the term off).
+  double localIoCost(TaskPtr Task) const;
+  double computeIoCost(TaskPtr Task, DeviceId Device,
+                       kmp_uint64 *RemoteBytes = nullptr) const;
+
+  /// Record where a scheduled task's files will be owned: a file the task
+  /// writes before reading it moves its owner to the writer (libompfile binds
+  /// a new file's owner to its first writing proxy).
+  void noteIoPlacement(TaskPtr Task, DeviceId Device);
+
+  /// Print the per-graph I/O summary when OMPCLUSTER_HEFT_IO_LOG is set.
+  void reportIoModel(kmp_int32 TdgId) const;
+
   // Dump internal HEFT information to a file.
   void dump(kmp_int32 NumDevices);
 
@@ -294,6 +318,33 @@ private:
   std::unordered_map<int, std::vector<int>> restricted_to_device_map;
   std::vector<ComputationMap> device_restricted_CompCost;
   kmp_int32 maxIteration = 100;
+
+  /// File-locality term (OMPCLUSTER_HEFT_IO, on by default).
+  bool IoEnabled = true;
+  bool IoLog = false;
+  /// Microseconds per byte for a range on the owner and away from it, and
+  /// where each value came from ("measured", "default" or "env").
+  double IoLocalUsPerByte = 0.0;
+  double IoRemoteUsPerByte = 0.0;
+  const char *IoLocalSource = "default";
+  const char *IoRemoteSource = "default";
+  /// Values set through the environment, or -1.
+  double IoLocalUsPerByteEnv = -1.0;
+  double IoRemoteUsPerByteEnv = -1.0;
+  /// Lowest remote/local ratio a measured remote rate may take
+  /// (OMPCLUSTER_HEFT_IO_REMOTE_MIN_RATIO, 0 disables the floor). The rate
+  /// measured on the requester misses the owner proxy's service time and the
+  /// interference with the owner's own tasks.
+  double IoRemoteMinRatio = 3.0;
+  /// File ranges of every node, indexed by the node's TDG task id.
+  std::vector<std::vector<kmp_task_io_entry_t>> IoRanges;
+  /// Owner predicted for each file (path key) by the tasks scheduled so far.
+  std::unordered_map<kmp_uint64, kmp_int32> IoOwner;
+  /// Totals of the chosen placement, for the summary line.
+  kmp_uint64 IoTasks = 0;
+  kmp_uint64 IoBytes = 0;
+  kmp_uint64 IoRemoteBytes = 0;
+  double IoCostUs = 0.0;
 };
 
 } // namespace detail
@@ -323,6 +374,10 @@ private:
   void preScheduleTask(kmp_int32 task_id, kmp_int32) override {}
 
   void resetWeight() override;
+
+  /// Insert the file I/O tasks OMPCLUSTER_HEFT_IO_TASKS asks for (prefetch,
+  /// stage, flush) on the edges of the scheduled graph.
+  void addIoTasks();
 
 public:
   /// Dump the task graph with HEFT-specific information.

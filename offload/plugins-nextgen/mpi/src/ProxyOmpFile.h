@@ -222,7 +222,15 @@ struct ProxyOmpFile {
   }
 
   bool writethroughFsyncEachEnabled() const {
-    return OmpFileWritethroughFsyncPolicy != "close";
+    return OmpFileWritethroughFsyncPolicy != "close" &&
+           OmpFileWritethroughFsyncPolicy != "deferred";
+  }
+
+  /// Policy "deferred": like "close", but a logical close whose descriptor the
+  /// open cache keeps open leaves the sync to the next commit (the scheduler's
+  /// flush task) or to shutdown.
+  bool writethroughFsyncDeferred() const {
+    return OmpFileWritethroughFsyncPolicy == "deferred";
   }
 
   bool isWritethroughStageEnabled() const {
@@ -438,6 +446,9 @@ struct ProxyOmpFile {
   int closeWithOptionalCache(int Fd, int &ErrnoOut);
   void drainOmpFileOpenCache();
   EventTy ompfileOpen(MPIRequestManagerTy RequestManager);
+  /// A scheduler-inserted file I/O task: runs libompfile's
+  /// ompfile_io_task_run on a thread of its own and replies when it is done.
+  EventTy ompfileIoTask(MPIRequestManagerTy RequestManager);
   EventTy ompfileClose(MPIRequestManagerTy RequestManager);
   EventTy ompfilePread(MPIRequestManagerTy RequestManager,
                        bool AllowStage = true);

@@ -12,6 +12,7 @@ set(OMPFILE_FRONTEND_SOURCES_REL
     src/file_interface.cpp
     src/client_context.cpp
     src/io_scheduler.cpp
+    src/io_tasks.cpp
     src/test_hooks.cpp
 )
 

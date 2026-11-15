@@ -251,6 +251,24 @@ int declareNextTaskIo(uint64_t path_key, int64_t offset, uint64_t extent,
   return fn ? fn(path_key, offset, extent, is_write) : 0;
 }
 
+bool ioTask(int device, int kind, const char *path, int64_t offset,
+            uint64_t extent, int &remote_rc, int &remote_errno) {
+  remote_rc = 0;
+  remote_errno = 0;
+  if (!init())
+    return false;
+  using IoTaskFn = int (*)(int, int, const char *, int64_t, uint64_t, int *,
+                           int *);
+  static const IoTaskFn fn = reinterpret_cast<IoTaskFn>(
+      dlsym(RTLD_DEFAULT, "ompfile_mpp_io_task"));
+  if (fn == nullptr) {
+    errno = ENOSYS;
+    return false;
+  }
+  return fn(device, kind, path, offset, extent, &remote_rc, &remote_errno) ==
+         0;
+}
+
 bool handleOwnerRank(int handle, int &rank_out) {
   rank_out = -1;
   if (!init())

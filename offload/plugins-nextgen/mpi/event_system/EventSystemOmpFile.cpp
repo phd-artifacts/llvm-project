@@ -30,6 +30,7 @@ const char *ompfileEventTypeName(EventTypeTy eventType) {
   switch (eventType) {
     case EventTypeTy::OMPFILE_PING: return "OMPFILE_PING";
     case EventTypeTy::OMPFILE_OPEN: return "OMPFILE_OPEN";
+    case EventTypeTy::OMPFILE_IO_TASK: return "OMPFILE_IO_TASK";
     case EventTypeTy::OMPFILE_CLOSE: return "OMPFILE_CLOSE";
     case EventTypeTy::OMPFILE_PREAD: return "OMPFILE_PREAD";
     case EventTypeTy::OMPFILE_PWRITE: return "OMPFILE_PWRITE";
@@ -185,6 +186,27 @@ EventTy ompfileOpen(MPIRequestManagerTy RequestManager, const char *Path,
   RequestManager.send(Path, PathSize, MPI_CHAR);
 
   RequestManager.receive(RemoteHandle, 1, MPI_INT);
+  RequestManager.receive(RemoteErrno, 1, MPI_INT);
+
+  if (auto Error = co_await RequestManager; Error)
+    co_return Error;
+
+  // Event completion notification
+  RequestManager.receive(nullptr, 0, MPI_BYTE);
+  co_return (co_await RequestManager);
+}
+
+EventTy ompfileIoTask(MPIRequestManagerTy RequestManager, int Kind,
+                      const char *Path, int64_t Offset, uint64_t Extent,
+                      int *RemoteRc, int *RemoteErrno) {
+  uint32_t PathSize = std::strlen(Path) + 1;
+  RequestManager.send(&Kind, 1, MPI_INT);
+  RequestManager.send(&Offset, 1, MPI_INT64_T);
+  RequestManager.send(&Extent, 1, MPI_UINT64_T);
+  RequestManager.send(&PathSize, 1, MPI_UINT32_T);
+  RequestManager.send(Path, PathSize, MPI_CHAR);
+
+  RequestManager.receive(RemoteRc, 1, MPI_INT);
   RequestManager.receive(RemoteErrno, 1, MPI_INT);
 
   if (auto Error = co_await RequestManager; Error)

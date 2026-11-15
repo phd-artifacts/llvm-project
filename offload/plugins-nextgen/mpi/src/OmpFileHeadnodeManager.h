@@ -55,7 +55,10 @@ public:
 
   struct GlobalFileEntry {
     uint64_t GlobalFileId = 0;
-    uint64_t OpenRequests = 0;
+    uint64_t OpenRequests = 0; // every OPEN of the path, monotonic
+    // OPENs whose CLOSE has not arrived (a CLOSE names its path). A writer
+    // bind moves the owner only while this is 1: the bind's own handle.
+    uint64_t LiveOpens = 0;
     int PreferredAggregatorRank = -1;
     uint64_t PathKey = 0;
     bool HasPathKey = false;
@@ -183,6 +186,8 @@ private:
                                  int ClientRank, bool &AffinityHit,
                                  bool &Rebalanced);
   int pickLeastLoadedRankUnlocked(int ClientRank);
+  void releaseLiveOpenUnlocked(const OmpFileIORequest &Request,
+                               const char *Path);
   void planWriterBindUnlocked(const OmpFileIORequest &Request,
                               std::string_view PathView, OmpFileIOPlan &Plan);
   void ensureHandlersUnlocked();
