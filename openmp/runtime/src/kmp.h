@@ -2671,6 +2671,9 @@ typedef struct kmp_taskgraph_flags { /*This needs to be exactly 32 bits */
 typedef struct kmp_recorded_task_time {
   kmp_int32 mean_time;
   kmp_int32 iteration_number;
+  // Smallest sample so far: a task that waited behind another on its proxy
+  // records the wait too, so the delay only ever inflates a sample.
+  kmp_int32 min_time;
 } kmp_recorded_task_time_t;
 
 /// One range of a target task's file I/O. Mirrors TaskIoEntryTy in the MPI

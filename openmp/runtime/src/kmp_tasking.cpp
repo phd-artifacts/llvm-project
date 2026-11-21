@@ -1067,6 +1067,8 @@ void __kmp_add_task_time(kmp_int32 gtid, kmp_taskdata_t *taskdata) {
            .iteration_number) {
     tdg->record_map[taskdata->td_tdg_task_id].task_time[device_id].mean_time =
         recorded_time;
+    tdg->record_map[taskdata->td_tdg_task_id].task_time[device_id].min_time =
+        recorded_time;
     tdg->record_map[taskdata->td_tdg_task_id]
         .task_time[device_id]
         .iteration_number = 1;
@@ -1083,6 +1085,10 @@ void __kmp_add_task_time(kmp_int32 gtid, kmp_taskdata_t *taskdata) {
                                    .iteration_number;
   tdg->record_map[taskdata->td_tdg_task_id].task_time[device_id].mean_time =
       (recorded_time + iteration_number * mean_time) / (iteration_number + 1);
+  kmp_int32 &min_time =
+      tdg->record_map[taskdata->td_tdg_task_id].task_time[device_id].min_time;
+  if (min_time < 0 || recorded_time < min_time)
+    min_time = recorded_time;
   tdg->record_map[taskdata->td_tdg_task_id]
       .task_time[device_id]
       .iteration_number++;

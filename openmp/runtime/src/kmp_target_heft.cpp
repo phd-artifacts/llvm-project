@@ -15,8 +15,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <vector>
 #include <set>
@@ -48,6 +50,8 @@ HEFTContext::HEFTContext(kmp_tdg_info *tdg)
     computeUpwardRanks();
   if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_COMM_COEF"))
     CommMultiplier = std::stod(EnvStr);
+  if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_COMP_ESTIMATOR"))
+    CompEstimatorMin = std::string(EnvStr) == "min";
   if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_COMP_COST"))
     DefaultCompCost = std::stod(EnvStr);
   if (char *EnvStr = std::getenv("OMPCLUSTER_HEFT_COMM_COST"))
@@ -362,9 +366,15 @@ double HEFTContext::scheduleTask(TaskPtr Task, DeviceId Device) {
 double HEFTContext::scheduleTaskOnBestRank(TaskPtr Task) {
   const auto &EFTs = EFT.at(Task);
 
-  auto BestRank = std::min_element(
-      EFTs.begin(), EFTs.end(),
-      [](const auto &L, const auto &R) { return L.second < R.second; });
+  // A NaN EFT compares false both ways, so std::min_element keeps it when it
+  // is visited first; rank non-finite values last instead.
+  auto Key = [](double V) {
+    return std::isfinite(V) ? V : std::numeric_limits<double>::infinity();
+  };
+  auto BestRank = std::min_element(EFTs.begin(), EFTs.end(),
+                                   [&Key](const auto &L, const auto &R) {
+                                     return Key(L.second) < Key(R.second);
+                                   });
 
   DeviceAvail[BestRank->first] = scheduleTask(Task, BestRank->first);
   return DeviceAvail[BestRank->first];
@@ -555,8 +565,13 @@ void HEFTContext::linearInterpolation() {
             !ComputationCost[Taskptr].count(device_0) ||
             !ComputationCost[Taskptr].count(device_1))
           continue;
-        sum += std::log(ComputationCost[Taskptr][device_1] /
-                        ComputationCost[Taskptr][device_0]);
+        const double c0 = ComputationCost[Taskptr][device_0];
+        const double c1 = ComputationCost[Taskptr][device_1];
+        // Samples are floored at 1 us where they are recorded; this guard
+        // keeps log(c1 / c0) finite if a zero ever reaches the matrix.
+        if (!(c0 > 0.0) || !(c1 > 0.0))
+          continue;
+        sum += std::log(c1 / c0);
         size++;
         if (size > maxIteration)
           break;
@@ -584,7 +599,8 @@ void HEFTContext::linearInterpolation() {
     }
   }
 
-  double geomean_b0 = std::exp(sum_b0 / size_b0);
+  // No ratio against device 0 at all: assume equal speeds rather than 0/0.
+  double geomean_b0 = size_b0 ? std::exp(sum_b0 / size_b0) : 1.0;
 
   std::deque<kmp_int32> devices_to_visite;
   for (kmp_int32 i = 0; i < device_number; ++i) {
@@ -653,7 +669,15 @@ void HEFTContext::linearInterpolation() {
         if (size > maxIteration)
           break;
       }
-      beta[device_0][device_1] = std::exp(sum / size);
+      // device_list only holds higher-numbered devices with a known beta, so
+      // it is often empty for the last devices: sum / size would be 0/0 and
+      // the NaN beta makes every interpolated cost on device_1 NaN, which
+      // then wins scheduleTaskOnBestRank and draws every task to it. Take the
+      // path through the pivot instead; it is set for every device by now.
+      if (!size)
+        ++InterpFallbackPairs;
+      beta[device_0][device_1] =
+          size ? std::exp(sum / size) : beta[device_0][0] * beta[0][device_1];
       beta[device_1][device_0] = 1 / beta[device_0][device_1];
     }
   }
@@ -722,8 +746,12 @@ void HEFTContext::restrictedLinearInterpolation(
             !restrictedComputationCost[Taskptr].count(actual_device_0) ||
             !restrictedComputationCost[Taskptr].count(actual_device_1))
           continue;
-        sum += std::log(restrictedComputationCost[Taskptr][actual_device_1] /
-                        restrictedComputationCost[Taskptr][actual_device_0]);
+        const double c0 = restrictedComputationCost[Taskptr][actual_device_0];
+        const double c1 = restrictedComputationCost[Taskptr][actual_device_1];
+        // Same zero-charge guard as linearInterpolation.
+        if (!(c0 > 0.0) || !(c1 > 0.0))
+          continue;
+        sum += std::log(c1 / c0);
         size++;
         if (size > maxIteration)
           break;
@@ -751,7 +779,8 @@ void HEFTContext::restrictedLinearInterpolation(
     }
   }
 
-  double geomean_b0 = std::exp(sum_b0 / size_b0);
+  // No ratio against device 0 at all: assume equal speeds rather than 0/0.
+  double geomean_b0 = size_b0 ? std::exp(sum_b0 / size_b0) : 1.0;
 
   std::deque<kmp_int32> devices_to_visite;
   for (kmp_int32 i = 0; i < device_number; ++i) {
@@ -820,7 +849,15 @@ void HEFTContext::restrictedLinearInterpolation(
         if (size > maxIteration)
           break;
       }
-      beta[device_0][device_1] = std::exp(sum / size);
+      // device_list only holds higher-numbered devices with a known beta, so
+      // it is often empty for the last devices: sum / size would be 0/0 and
+      // the NaN beta makes every interpolated cost on device_1 NaN, which
+      // then wins scheduleTaskOnBestRank and draws every task to it. Take the
+      // path through the pivot instead; it is set for every device by now.
+      if (!size)
+        ++InterpFallbackPairs;
+      beta[device_0][device_1] =
+          size ? std::exp(sum / size) : beta[device_0][0] * beta[0][device_1];
       beta[device_1][device_0] = 1 / beta[device_0][device_1];
     }
   }
@@ -1014,6 +1051,8 @@ void HEFTContext::interpolateCompCost(kmp_int32 scheduling_iteration_counter,
       typeMap.clear();
   }
 
+  InterpKind = "none";
+  InterpFallbackPairs = 0;
   bool is_incomplete_profile = false;
   for (auto Taskptr : TopologicalOrder(tdg)) {
     for (kmp_int32 device = 0; device < __kmpc_get_num_devices(); device++) {
@@ -1039,16 +1078,21 @@ void HEFTContext::interpolateCompCost(kmp_int32 scheduling_iteration_counter,
           KG_TRACE(10,
                    ("[Inter HEFT]: Adding task %d , device %d to CompCost\n",
                     KMP_TASKPTR_TO_TDG_TASKID(Taskptr), device));
-          ComputationCost[Taskptr][device] = static_cast<double>(
+          const kmp_recorded_task_time_t &Time =
               tdg->record_map[KMP_TASKPTR_TO_TDG_TASKID(Taskptr)]
-                  .task_time[device]
-                  .mean_time);
+                  .task_time[device];
+          // min_time is -1 until a sample exists. Times are whole us and a
+          // task's I/O is subtracted from its own (__kmp_task_io_complete), so
+          // a short or I/O-bound task records 0; every interpolation takes a
+          // log of these costs, so floor them at 1 us.
+          const double Sample = std::max(
+              1.0, static_cast<double>(CompEstimatorMin && Time.min_time >= 0
+                                           ? Time.min_time
+                                           : Time.mean_time));
+          ComputationCost[Taskptr][device] = Sample;
           if (heterogeneousInterpolation && deviceTypeNumber > 1) {
             device_restricted_CompCost[deviceTypeMap[device]][Taskptr][device] =
-                static_cast<double>(
-                    tdg->record_map[KMP_TASKPTR_TO_TDG_TASKID(Taskptr)]
-                        .task_time[device]
-                        .mean_time);
+                Sample;
           }
         } else {
           KG_TRACE(10, ("[Inter HEFT]: Task %d , device %d : no profile\n",
@@ -1074,6 +1118,7 @@ void HEFTContext::interpolateCompCost(kmp_int32 scheduling_iteration_counter,
   }
 
   if (scheduling_iteration_counter == 1) {
+    InterpKind = "homogeneous";
     homogeneousInterpolation();
     computeAvgCompCosts();
     KG_TRACE(10, ("[Inter HEFT] interpolateCompCost (end): iteration %d "
@@ -1084,6 +1129,7 @@ void HEFTContext::interpolateCompCost(kmp_int32 scheduling_iteration_counter,
 
   if (heterogeneousInterpolation && deviceTypeNumber > 1 &&
       scheduling_iteration_counter > 3) {
+    InterpKind = "heterogeneous";
     heterogeneousLinearInterpolation();
     computeAvgCompCosts();
     KG_TRACE(10, ("[Inter HEFT] interpolateCompCost (end): iteration %d "
@@ -1093,12 +1139,31 @@ void HEFTContext::interpolateCompCost(kmp_int32 scheduling_iteration_counter,
   }
 
   // general case
+  InterpKind = "linear";
   linearInterpolation();
   computeAvgCompCosts();
 
   KG_TRACE(10, ("[Inter HEFT] interpolateCompCost (end): iteration %d "
                 "homogeneous devices interpolation\n",
                 scheduling_iteration_counter));
+}
+
+void HEFTContext::printInterpolation(kmp_int32 iteration) const {
+  // A non-finite cost wins scheduleTaskOnBestRank's comparison or poisons
+  // DeviceAvail; the gate fails on any (test-heft-comm-cost).
+  kmp_int32 Costs = 0, NonFinite = 0;
+  for (const auto &Row : ComputationCost)
+    for (const auto &Cell : Row.second) {
+      ++Costs;
+      if (!std::isfinite(Cell.second))
+        ++NonFinite;
+    }
+  fprintf(stderr,
+          "[heft-io] interp tdg=%d iter=%d kind=%s fallback_pairs=%d "
+          "costs=%d nonfinite_costs=%d\n",
+          tdg ? tdg->tdg_id : -1, iteration, InterpKind, InterpFallbackPairs,
+          Costs, NonFinite);
+  fflush(stderr);
 }
 
 void HEFTContext::buildDeviceTypeMap() {
@@ -1613,6 +1678,8 @@ void HEFTScheduler::acquireNewGraphPost() {
   dumpTaskGraph();
   Ctx.interpolateCompCost(scheduling_iteration_counter, initial_schedule_policy,
                           initial_iteration);
+  if (Ctx.IoLog)
+    Ctx.printInterpolation(scheduling_iteration_counter);
   Ctx.computeUpwardRanks();
   KG_TRACE(10, ("[HEFT]: AcquireNewGraphPost (end)\n"));
 }

@@ -231,6 +231,8 @@ private:
   void restrictedLinearInterpolation(ComputationMap, int);
   void completeheterogeneousInterpolation();
   void printCompCostMatrices();
+  /// One [heft-io] interp line per placement (OMPCLUSTER_HEFT_IO_LOG).
+  void printInterpolation(kmp_int32 iteration) const;
   /// Compute the earliest start time for a specific (task, rank) pair.
   ///
   /// \returns the computed EST.
@@ -319,6 +321,12 @@ private:
   std::unordered_map<int, std::vector<int>> restricted_to_device_map;
   std::vector<ComputationMap> device_restricted_CompCost;
   kmp_int32 maxIteration = 100;
+  /// Set by interpolateCompCost for the [heft-io] interp line: which
+  /// interpolation ran ("none", "homogeneous", "linear", "heterogeneous") and
+  /// how many device pairs had no ratio through a higher-numbered device and
+  /// took the path through device 0 (the pairs that were 0/0 = NaN before).
+  const char *InterpKind = "none";
+  kmp_int32 InterpFallbackPairs = 0;
 
   /// File-locality term (OMPCLUSTER_HEFT_IO, on by default).
   bool IoEnabled = true;
@@ -347,6 +355,12 @@ private:
   /// (OMPCLUSTER_HEFT_IO_PREFETCH_PRICING, on by default; it applies only
   /// when OMPCLUSTER_HEFT_IO_TASKS includes prefetch).
   bool IoPrefetchPricing = true;
+  /// Use each (task, device)'s smallest profiled time instead of the running
+  /// mean (OMPCLUSTER_HEFT_COMP_ESTIMATOR=min; default mean). The profile is
+  /// measured from the task's start on the origin, so a task that waited
+  /// behind another on its proxy books the wait as compute and the mean
+  /// steers later replays away from that device.
+  bool CompEstimatorMin = false;
   /// Per node, the files it reads that exactly one predecessor writes and it
   /// does not write itself: the reads addIoTasks prefetches when remote.
   std::unordered_map<kmp_int32, std::unordered_set<kmp_uint64>> IoPrefetched;

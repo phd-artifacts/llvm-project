@@ -1131,6 +1131,9 @@ static kmp_task_t *__kmp_insert_edge_task(kmp_int32 gtid,
     tdg->record_map[memory_taskdata->td_tdg_task_id]
         .task_time[device]
         .iteration_number = 0;
+    tdg->record_map[memory_taskdata->td_tdg_task_id]
+        .task_time[device]
+        .min_time = -1;
   }
   // KMP_ATOMIC_INC(&tdg->num_tasks);
 
@@ -1421,6 +1424,9 @@ kmp_int32 __kmpc_omp_task_with_deps(ident_t *loc_ref, kmp_int32 gtid,
       tdg->record_map[new_taskdata->td_tdg_task_id]
           .task_time[device]
           .iteration_number = 0;
+      tdg->record_map[new_taskdata->td_tdg_task_id]
+          .task_time[device]
+          .min_time = -1;
     }
     __kmpc_set_deps(&tdg->record_map[new_taskdata->td_tdg_task_id], ndeps,
                     dep_list, ndeps_noalias, noalias_dep_list);
